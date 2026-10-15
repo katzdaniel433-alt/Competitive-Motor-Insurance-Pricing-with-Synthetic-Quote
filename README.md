@@ -118,7 +118,7 @@ The analysis measures **expected contribution after claims** (conversion-weighte
 
 ## Reproducibility and limitations
 
-The code uses fixed seeds and saves intermediate files and validation checks. Reproduction requires the complete helper code, compatible package versions and the exact empirical/curated calibration inputs. **The condensed modules have not been independently executed end-to-end in this environment**, so the presence of this repository alone should not be taken as verification of an exact reproduction.
+The code uses fixed seeds and saves intermediate files and validation checks. Reproduction requires the complete helper code, compatible package versions and the exact empirical/curated calibration inputs.
 
 The portfolio is synthetic. Selected characteristics are informed by Australian public statistics, but the claims relationships, competitor pricing and customer demand include explicit simulation assumptions. Results should be interpreted as evidence about the performance of the proposed *methodology within that environment*, not empirical estimates of Australian customer behaviour.
 
