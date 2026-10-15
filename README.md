@@ -121,13 +121,3 @@ The analysis measures **expected contribution after claims** (conversion-weighte
 The code uses fixed seeds and saves intermediate files and validation checks. Reproduction requires the complete helper code, compatible package versions and the exact empirical/curated calibration inputs.
 
 The portfolio is synthetic. Selected characteristics are informed by Australian public statistics, but the claims relationships, competitor pricing and customer demand include explicit simulation assumptions. Results should be interpreted as evidence about the performance of the proposed *methodology within that environment*, not empirical estimates of Australian customer behaviour.
-
-## Dissertation and citation
-
-The associated dissertation is **“Competitive Motor Insurance Pricing with Synthetic Quote Markets: Conversion Modelling and Price Optimisation”** (Actuarial Science Honours, Curtin University, 2026). Bibliographic source entries are maintained in `references.bib`.
-
-**Suggested citation:** Katz, D. F. (2026). *Competitive Motor Insurance Pricing with Synthetic Quote Markets: Conversion Modelling and Price Optimisation*. Honours thesis, Curtin University.
-
-## Data and licensing
-
-Raw or curated third-party datasets should only be redistributed when permitted by their respective providers. A public code repository can include source descriptions and preparation scripts without publishing restricted source files. No software licence is implied unless a `LICENSE` file is added.
