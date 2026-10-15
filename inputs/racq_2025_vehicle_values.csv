@@ -1,0 +1,49 @@
+make,model,vehicle_segment,on_road_price,residual_value_5yr,source_basis,residual_ratio_5yr,calibration_status
+Suzuki,Swift Hybrid,Small Passenger,28350.05,13500.0,RACQ 2025 Light Passenger,0.47618963634984773,Empirical RACQ 2025 model-level observation
+Hyundai,Venue,Small/Medium SUV,28865.05,12100.0,RACQ 2025 Light Passenger,0.4191920679160438,Empirical RACQ 2025 model-level observation
+Toyota,Yaris,Small Passenger,33770.05,15400.0,RACQ 2025 Light Passenger,0.45602538343887555,Empirical RACQ 2025 model-level observation
+MG,MG3,Small Passenger,29895.05,14400.0,RACQ 2025 Light Passenger,0.4816850950240926,Empirical RACQ 2025 model-level observation
+Mazda,Mazda2,Small Passenger,30925.05,14400.0,RACQ 2025 Light Passenger,0.4656419310558916,Empirical RACQ 2025 model-level observation
+Toyota,Yaris Cross,Small/Medium SUV,36105.05,16200.0,RACQ 2025 Light Passenger,0.4486906956229114,Empirical RACQ 2025 model-level observation
+Mazda,CX-3,Small/Medium SUV,34015.05,15200.0,RACQ 2025 Light Passenger,0.4468610218124036,Empirical RACQ 2025 model-level observation
+Suzuki,Jimny,Small/Medium SUV,40195.05,25300.0,RACQ 2025 Light Passenger,0.629430738362062,Empirical RACQ 2025 model-level observation
+BYD,Dolphin,Small Passenger,32508.85,14500.0,RACQ 2025 Small Passenger/SUV,0.44603238810354723,Empirical RACQ 2025 model-level observation
+Chery,Tiggo 4,Small/Medium SUV,30925.05,13900.0,RACQ 2025 Small Passenger/SUV,0.44947380844978424,Empirical RACQ 2025 model-level observation
+Hyundai,i30,Small Passenger,31955.05,15500.0,RACQ 2025 Small Passenger/SUV,0.4850563525952862,Empirical RACQ 2025 model-level observation
+GWM Haval,Jolion,Small/Medium SUV,34015.05,13500.0,RACQ 2025 Small Passenger/SUV,0.39688314437285843,Empirical RACQ 2025 model-level observation
+MG,ZS,Small/Medium SUV,34089.05,14500.0,RACQ 2025 Small Passenger/SUV,0.4253565294427389,Empirical RACQ 2025 model-level observation
+Mitsubishi,ASX,Small/Medium SUV,32470.05,14300.0,RACQ 2025 Small Passenger/SUV,0.44040585093031887,Empirical RACQ 2025 model-level observation
+MG,MG4,Small Passenger,38785.05,15800.0,RACQ 2025 Small Passenger/SUV,0.40737345961910576,Empirical RACQ 2025 model-level observation
+Toyota,Corolla,Small Passenger,37110.05,17900.0,RACQ 2025 Small Passenger/SUV,0.48234912106019795,Empirical RACQ 2025 model-level observation
+Mazda,Mazda3,Small Passenger,35045.05,17100.0,RACQ 2025 Small Passenger/SUV,0.4879433757406538,Empirical RACQ 2025 model-level observation
+Kia,K4,Small Passenger,34015.05,16600.0,RACQ 2025 Small Passenger/SUV,0.4880192738214408,Empirical RACQ 2025 model-level observation
+Hyundai,Kona,Small/Medium SUV,41430.65,18800.0,RACQ 2025 Small Passenger/SUV,0.45377033669517614,Empirical RACQ 2025 model-level observation
+Kia,EV3,Small/Medium SUV,50005.05,21200.0,RACQ 2025 Small Passenger/SUV,0.4239571803247872,Empirical RACQ 2025 model-level observation
+Mazda,CX-5,Small/Medium SUV,39165.05,17900.0,RACQ 2025 Medium Passenger/SUV,0.4570401416569109,Empirical RACQ 2025 model-level observation
+BYD,Sealion 6,Small/Medium SUV,44315.05,21400.0,RACQ 2025 Medium Passenger/SUV,0.48290592022349066,Empirical RACQ 2025 model-level observation
+Nissan,X-Trail,Small/Medium SUV,41225.05,18000.0,RACQ 2025 Medium Passenger/SUV,0.43662772998456034,Empirical RACQ 2025 model-level observation
+GWM Haval,H6,Small/Medium SUV,42255.05,14900.0,RACQ 2025 Medium Passenger/SUV,0.35262057434555155,Empirical RACQ 2025 model-level observation
+Toyota,Camry,Medium/Large Passenger,44783.05,22000.0,RACQ 2025 Medium Passenger/SUV,0.49125729489170566,Empirical RACQ 2025 model-level observation
+BYD,Seal,Medium/Large Passenger,50196.85,22500.0,RACQ 2025 Medium Passenger/SUV,0.448235297633218,Empirical RACQ 2025 model-level observation
+Toyota,RAV4,Small/Medium SUV,47171.05,25800.0,RACQ 2025 Medium Passenger/SUV,0.546945637207567,Empirical RACQ 2025 model-level observation
+Kia,Sportage,Small/Medium SUV,43218.05,17500.0,RACQ 2025 Medium Passenger/SUV,0.40492340584547426,Empirical RACQ 2025 model-level observation
+Leapmotor,C10,Small/Medium SUV,49502.05,23200.0,RACQ 2025 Medium Passenger/SUV,0.46866745922643605,Empirical RACQ 2025 model-level observation
+Mitsubishi,Outlander,Small/Medium SUV,45694.05,20000.0,RACQ 2025 Medium Passenger/SUV,0.4376937478730819,Empirical RACQ 2025 model-level observation
+BYD,Sealion 7,Small/Medium SUV,56125.05,28100.0,RACQ 2025 Medium Passenger/SUV,0.5006677054185252,Empirical RACQ 2025 model-level observation
+Subaru,Forester,Small/Medium SUV,52026.05,24600.0,RACQ 2025 Medium Passenger/SUV,0.4728400483988309,Empirical RACQ 2025 model-level observation
+Tesla,Model 3,Medium/Large Passenger,59910.05,28400.0,RACQ 2025 Medium Passenger/SUV,0.4740440043031177,Empirical RACQ 2025 model-level observation
+Tesla,Model Y,Small/Medium SUV,65437.05,30500.0,RACQ 2025 Medium Passenger/SUV,0.4660968060143298,Empirical RACQ 2025 model-level observation
+Hyundai,Staria,People Mover/Other Passenger,55708.05,24000.0,RACQ 2025 People Movers,0.43081744918373555,Empirical RACQ 2025 model-level observation
+Kia,Carnival,People Mover/Other Passenger,57467.55,24800.0,RACQ 2025 People Movers,0.43154789094019147,Empirical RACQ 2025 model-level observation
+Ford,Tourneo Custom,People Mover/Other Passenger,73912.05,34400.0,RACQ 2025 People Movers,0.4654180204716281,Empirical RACQ 2025 model-level observation
+Subaru,Outback,Large SUV/4WD,50065.05,24900.0,RACQ 2025 Large SUV,0.49735294382009004,Empirical RACQ 2025 model-level observation
+Kia,Sorento,Large SUV/4WD,59609.05,27500.0,RACQ 2025 Large SUV,0.4613393436063819,Empirical RACQ 2025 model-level observation
+Isuzu,MU-X,Large SUV/4WD,62559.05,32600.0,RACQ 2025 Large SUV,0.5211076574852079,Empirical RACQ 2025 model-level observation
+Ford,Everest,Large SUV/4WD,67016.05,30700.0,RACQ 2025 Large SUV,0.4580992165309653,Empirical RACQ 2025 model-level observation
+Toyota,Kluger,Large SUV/4WD,68340.05,32200.0,RACQ 2025 Large SUV,0.47117319931723783,Empirical RACQ 2025 model-level observation
+Toyota,LandCruiser Prado,Large SUV/4WD,79685.05,42300.0,RACQ 2025 Large SUV,0.5308398501350002,Empirical RACQ 2025 model-level observation
+Toyota,LandCruiser LC300,Large SUV/4WD,108516.05,73100.0,RACQ 2025 Large SUV,0.6736330708683186,Empirical RACQ 2025 model-level observation
+Nissan,Patrol,Large SUV/4WD,107774.05,55700.0,RACQ 2025 Large SUV,0.5168219993588438,Empirical RACQ 2025 model-level observation
+SEGMENT PROXY,Sports/Performance Low,Sports/Performance,43200.0,20100.0,Scenario proxy derived from RACQ 2025 passenger-vehicle distribution,0.4654180204716281,Scenario proxy - RACQ 2025 contains no dedicated sports/performance category
+SEGMENT PROXY,Sports/Performance Mid,Sports/Performance,56100.0,26100.0,Scenario proxy derived from RACQ 2025 passenger-vehicle distribution,0.4654180204716281,Scenario proxy - RACQ 2025 contains no dedicated sports/performance category
+SEGMENT PROXY,Sports/Performance High,Sports/Performance,67800.0,31600.0,Scenario proxy derived from RACQ 2025 passenger-vehicle distribution,0.4654180204716281,Scenario proxy - RACQ 2025 contains no dedicated sports/performance category
