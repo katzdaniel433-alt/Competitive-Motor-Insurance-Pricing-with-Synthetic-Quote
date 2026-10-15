@@ -1,0 +1,1904 @@
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# Select uniform and targeted premiums using fitted conversion probabilities.
+# Enforce rate-level, contribution and claims-ratio constraints; assess fixed decisions using DGP probabilities.
+
+required_packages <- c( "tidyverse", "mgcv", "lpSolve" )
+missing_packages <- required_packages[ !required_packages %in% rownames( installed.packages() ) ]
+if ( length( missing_packages ) > 0L
+) {
+  stop( paste0( "Install the following packages before running Module 6: ", paste( missing_packages,
+        collapse = ", " ) ) )
+}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(mgcv)
+  library(lpSolve)
+})
+options( dplyr.summarise.inform = FALSE, scipen = 999 )
+config <- list( seed = 20260817L,
+  conversion_model_dir = file.path("outputs", "conversion_models"),
+  quote_market_dir = file.path("outputs", "quote_market"),
+  conversion_generation_dir = file.path("outputs", "conversion_generation"),
+  output_dir = file.path("outputs", "pricing_simulation"),
+  
+  market_scenario_id = "baseline",
+   
+  demand_scenario_id = "baseline",
+   expected_policy_year = 2025L,
+  expected_profiles = 10000L, expected_conversion_train_rows = 6000L, expected_conversion_validation_rows = 2000L,
+  expected_conversion_test_rows = 2000L, 
+  multiplier_lower = 0.95,
+   
+  multiplier_upper = 1.05,
+   multiplier_step = 0.01,
+  
+  maximum_admissible_claim_ratio = 0.800,
+   minimum_portfolio_margin_retention = 1.00,
+  
+  minimum_unit_margin_retention = 0.90,
+   
+  targeted_rate_level_lower = 0.995,
+   targeted_rate_level_upper = 1.005,
+  # Minimum validation profiles required in a targeting segment. Rare levels
+  # of categorical variables are collapsed into "Other" where appropriate.
+  minimum_targeted_segment_profiles = 50L,
+  # Continuous targeting variables are grouped using validation-derived
+  # quartiles. These cut-points are frozen before the test set is opened.
+  targeted_numeric_quantiles = 4L,
+  # If several segmentation bases are within this absolute validation
+  # conversion-rate tolerance of the best result, prefer the more parsimonious
+  # segmentation (fewer pricing segments).
+  targeted_segmentation_selection_tolerance = 0.0005,
+  # Uniform strategies maximise model-expected underwriting margin subject to
+  # retaining at least this share of technical-benchmark expected conversion.
+  minimum_uniform_conversion_retention = 0.95,
+  # Targeted strategy explicitly seeks conversion improvement while preserving
+  # margin and rate level.
+  minimum_targeted_conversion_retention = 1.00,
+  # Development-only probability recalibration.
+  probability_clip = 1e-6, write_plots = TRUE,
+  # Optional audit-only Module 1 truth. This variable is NEVER used to select
+  # prices; it is opened only after strategy evaluation.
+  module1_truth_file = file.path( "outputs", "synthetic_generator_multiyear", "synthetic_motor_full_truth.rds" ) )
+set.seed(
+  config$seed )
+dir.create(
+  config$output_dir, recursive = TRUE, showWarnings = FALSE )
+multiplier_grid <- seq( from = config$multiplier_lower, to = config$multiplier_upper, by = config$multiplier_step )
+multiplier_grid <- round( multiplier_grid, 10 )
+if ( !1 %in% multiplier_grid
+) {
+  stop( "The candidate multiplier grid must contain 1.00." )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 1. UTILITY FUNCTIONS
+safe_divide <- function( numerator, denominator
+) {
+  result <- numerator / denominator
+  result[ !is.finite( result ) ] <- NA_real_
+  result
+}
+clip_probability <- function( probability, epsilon = config$probability_clip
+) {
+  pmin( pmax( as.numeric( probability ), epsilon ), 1 - epsilon )
+}
+assert_file <- function( path, description
+) {
+  if ( !file.exists( path )
+  ) {
+    stop( paste0( "Missing ", description, ": ", path ) )
+  }
+}
+safe_read_rds <- function( path, description = basename( path ), attempts = 3L
+) {
+  assert_file( path, description )
+  last_error <- NULL
+  for ( attempt in seq_len( attempts )
+  ) {
+    result <- tryCatch(
+        {
+          base::readRDS( path )
+        },
+        error = function(e) {
+          last_error <<- e
+          NULL
+        } )
+    if ( !is.null( result )
+    ) {
+      return( result )
+    }
+    # Repeated sensitivity runs can leave large model objects awaiting garbage
+    # collection. Clear unreachable objects before retrying an RDS connection.
+    invisible( gc( verbose = FALSE ) )
+    Sys.sleep( 0.25 * attempt )
+  }
+  stop( paste0( "Could not read ", description, " after ", attempts, " attempt(s): ", conditionMessage( last_error
+      ), ". File: ", path ) )
+}
+assert_columns <- function( data, required_columns, data_name
+) {
+  missing_columns <- setdiff( required_columns, names( data ) )
+  if ( length( missing_columns ) > 0L
+  ) {
+    stop( paste0( data_name, " is missing required columns: ", paste( missing_columns, collapse = ", " ) ) )
+  }
+}
+read_and_assert_validation <- function( path, description, required_only = FALSE
+) {
+  assert_file( path, description )
+  checks <- readr::read_csv( path, show_col_types = FALSE )
+  assert_columns( checks, "pass", description )
+  checks_to_enforce <- checks
+  if ( isTRUE( required_only ) && "required_for_progress" %in% names( checks )
+  ) {
+    checks_to_enforce <- checks %>% filter( required_for_progress )
+  }
+  failed <- checks_to_enforce %>% filter( is.na( pass ) | !pass )
+  if ( nrow( failed ) > 0L
+  ) {
+    failed_names <- if ( "check_name" %in% names( failed )
+      ) {
+        paste( failed$check_name, collapse = "; " )
+      } else {
+        paste0( nrow( failed ), " failed check(s)" )
+      }
+    stop( paste0( description, " contains failed required validation checks: ", failed_names ) )
+  }
+  checks
+}
+log_sum_exp <- function( x
+) {
+  maximum_x <- max( x )
+  maximum_x + log( sum( exp( x - maximum_x ) ) )
+}
+fit_probability_calibration <- function( outcome, raw_probability, model_name
+) {
+  raw_probability <- clip_probability( raw_probability )
+  calibration_data <- tibble( outcome = as.integer( outcome ), raw_logit = qlogis( raw_probability ) )
+  fit <- tryCatch( suppressWarnings( glm( outcome ~ raw_logit, data = calibration_data, family = binomial(
+              link = "logit" ) ) ),
+      error = function(e) {
+        NULL
+      } )
+  if ( is.null( fit ) || length( coef( fit ) ) < 2L || any( !is.finite( coef( fit ) ) )
+  ) {
+    warning( paste0( "Validation recalibration failed for ", model_name, "; identity calibration will be used." ) )
+    return( tibble( calibration_intercept = 0, calibration_slope = 1 ) )
+  }
+  tibble( calibration_intercept = unname( coef( fit )[ 1 ] ), calibration_slope = unname( coef( fit )[ 2 ] ) )
+}
+apply_probability_calibration <- function( raw_probability, calibration_intercept, calibration_slope
+) {
+  raw_probability <- clip_probability( raw_probability )
+  clip_probability( plogis( calibration_intercept + calibration_slope * qlogis( raw_probability ) ) )
+}
+model_family_from_object <- function( model, metadata_type = NULL
+) {
+  if ( !is.null( metadata_type ) && length( metadata_type ) == 1L && !is.na( metadata_type ) && metadata_type %in%
+        c( "glm", "gam" )
+  ) {
+    return( metadata_type )
+  }
+  if ( inherits( model, "gam" )
+  ) {
+    return( "gam" )
+  }
+  if ( inherits( model, "glm" )
+  ) {
+    return( "glm" )
+  }
+  stop( paste0( "Unsupported conversion-model class under the final GLM/GAM framework: ", paste( class( model ),
+        collapse = ", " ) ) )
+}
+predict_probability <- function( model, new_data, model_name, model_type = NULL
+) {
+  resolved_model_type <- model_family_from_object( model = model, metadata_type = model_type )
+  prediction <- tryCatch(
+      {
+        as.numeric( stats::predict( model, newdata = new_data, type = "response" ) )
+      },
+      error = function(e) {
+        stop( paste0( "Prediction failed for ", model_name, " [", resolved_model_type, "]: ", conditionMessage( e )
+          ) )
+      } )
+  if ( length( prediction ) != nrow( new_data ) || any( !is.finite( prediction ) )
+  ) {
+    stop( paste0( "Invalid prediction vector generated by ", model_name, "." ) )
+  }
+  clip_probability( prediction )
+}
+extract_single_calibration <- function( calibration_table, model_name
+) {
+  row <- calibration_table %>% filter( model == model_name )
+  if ( nrow( row ) != 1L
+  ) {
+    stop( paste0( "Expected exactly one calibration row for ", model_name, "." ) )
+  }
+  list( intercept = row$calibration_intercept[ 1 ], slope = row$calibration_slope[ 1 ] )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 2. INPUT PATHS
+development_models_path <- file.path( config$conversion_model_dir, "development_conversion_models.rds" )
+final_models_path <- file.path( config$conversion_model_dir, "final_conversion_models.rds" )
+selected_model_path <- file.path( config$conversion_model_dir, "final_selected_conversion_model.rds" )
+own_price_model_path <- file.path( config$conversion_model_dir, "final_own_price_conversion_model.rds" )
+prepared_data_path <- file.path( config$conversion_model_dir, "prepared_conversion_data.rds" )
+development_predictions_path <- file.path( config$conversion_model_dir, "development_model_predictions.rds" )
+selected_metadata_path <- file.path( config$conversion_model_dir, "selected_model_metadata.rds" )
+module5_validation_path <- file.path( config$conversion_model_dir, "model_validation_checks.csv" )
+module3_validation_path <- file.path( config$quote_market_dir, "quote_market_validation_checks.csv" )
+module4_validation_path <- file.path( config$conversion_generation_dir,
+  "conversion_generation_validation_checks.csv" )
+competitor_quotes_path <- file.path( config$quote_market_dir, "competitor_quotes.csv" )
+truth_path <- file.path( config$conversion_generation_dir, "conversion_truth.rds" )
+alternative_truth_path <- file.path( config$conversion_generation_dir, "conversion_alternative_truth.rds" )
+demand_metadata_path <- file.path( config$conversion_generation_dir, "demand_scenario_metadata.rds" )
+required_paths <- list( "Module 5 development models" = development_models_path, "Module 5 final models" =
+    final_models_path, "Module 5 selected model" = selected_model_path, "Module 5 own-price model" =
+    own_price_model_path, "Module 5 prepared conversion data" = prepared_data_path,
+  "Module 5 development predictions" = development_predictions_path, "Module 5 selected-model metadata" =
+    selected_metadata_path, "Module 5 validation checks" = module5_validation_path, "Module 3 validation checks" =
+    module3_validation_path, "Module 4 validation checks" = module4_validation_path, "Module 3 competitor quotes" =
+    competitor_quotes_path, "Module 4 conversion truth" = truth_path, "Module 4 alternative truth" =
+    alternative_truth_path, "Module 4 demand metadata" = demand_metadata_path )
+purrr::iwalk( required_paths, function( path, description
+  ) {
+    assert_file( path, description )
+  } )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 3. READ MODULE 5 AND MODULE 3 OBSERVABLE INPUTS
+# Frozen upstream validation is enforced before optimisation starts. Module 5
+# contains one explicitly optional model-complexity check, so only checks marked
+# required_for_progress are enforced there. Modules 3 and 4 require all checks
+# to pass. Reading these validation summaries does not expose Module 4 truth.
+module5_validation_checks <- read_and_assert_validation( module5_validation_path,
+  "Module 5 model_validation_checks.csv", required_only = TRUE )
+module3_validation_checks <- read_and_assert_validation( module3_validation_path,
+  "Module 3 quote_market_validation_checks.csv" )
+module4_validation_checks <- read_and_assert_validation( module4_validation_path,
+  "Module 4 conversion_generation_validation_checks.csv" )
+development_models <- safe_read_rds( development_models_path )
+final_models <- safe_read_rds( final_models_path )
+final_selected_model <- safe_read_rds( selected_model_path )
+final_own_price_model <- safe_read_rds( own_price_model_path )
+prepared_data <- safe_read_rds( prepared_data_path )
+development_predictions <- safe_read_rds( development_predictions_path )
+selected_model_metadata <- safe_read_rds( selected_metadata_path )
+# Enforce the revised Module 5 sample contract before optimisation begins.
+required_module5_metadata_fields <- c( "module_version", "model_family_scope", "candidate_models",
+  "selected_model_name", "selected_model_type", "gam_selection_rule", "quote_market_policy_year",
+  "quote_market_profiles", "technical_data_split", "conversion_split_counts", "development_test_overlap",
+  "development_test_predictions_generated" )
+missing_module5_metadata_fields <- setdiff( required_module5_metadata_fields, names( selected_model_metadata ) )
+if ( length( missing_module5_metadata_fields ) > 0L
+) {
+  stop( paste0( "selected_model_metadata.rds is missing revised Module 5 field(s): ", paste(
+        missing_module5_metadata_fields, collapse = ", " ) ) )
+}
+expected_module5_version <- "M5-GLMGAM-OOT-2026-09-18"
+expected_module5_families <- c( "glm", "gam" )
+expected_module5_candidates <- c( "Technical-only GLM", "Own-price GLM", "Relative-price GLM", "Rank GLM",
+    "Market-position GLM", "Market-position GAM" )
+if ( !identical( as.character( selected_model_metadata$module_version ), expected_module5_version )
+) {
+  stop( paste0( "Module 6 requires final Module 5 version ", expected_module5_version, "; observed ", as.character(
+        selected_model_metadata$module_version ), "." ) )
+}
+if ( !setequal( as.character( selected_model_metadata$model_family_scope ), expected_module5_families ) || length(
+      selected_model_metadata$model_family_scope ) != length( expected_module5_families )
+) {
+  stop( "Module 6 requires the final Module 5 GLM/GAM-only model-family scope." )
+}
+if ( !identical( as.character( selected_model_metadata$candidate_models ), expected_module5_candidates )
+) {
+  stop( "Module 5 candidate-model register does not match the final six-model GLM/GAM framework." )
+}
+if ( !as.character( selected_model_metadata$selected_model_name ) %in% c( "Market-position GLM",
+      "Market-position GAM" )
+) {
+  stop( "The final Module 5 selected model must be Market-position GLM or Market-position GAM." )
+}
+if ( !as.character( selected_model_metadata$selected_model_type ) %in% c( "glm", "gam" )
+) {
+  stop( "The final Module 5 selected model type must be 'glm' or 'gam'." )
+}
+module5_split_counts <- selected_model_metadata$conversion_split_counts
+if ( as.integer( selected_model_metadata$quote_market_policy_year ) != config$expected_policy_year || as.integer(
+      selected_model_metadata$quote_market_profiles ) != config$expected_profiles || !identical( as.character(
+        selected_model_metadata$technical_data_split ), "test" ) || as.integer( module5_split_counts[["train"]]
+    ) != config$expected_conversion_train_rows || as.integer( module5_split_counts[["validation"]] ) !=
+      config$expected_conversion_validation_rows || as.integer( module5_split_counts[["test"]] ) !=
+      config$expected_conversion_test_rows || as.integer( selected_model_metadata$development_test_overlap ) !=
+      0L || isTRUE( selected_model_metadata$development_test_predictions_generated )
+) {
+  stop( "Module 5 metadata does not match the frozen 2025 / 6000-2000-2000 no-TEST-development architecture." )
+}
+assert_columns( development_predictions, c( "policy_id", "quote_profile_id", "policy_year", "technical_data_split",
+    "conversion_data_split", "data_split", "focal_conversion", "model", "predicted_probability" ),
+  "development_model_predictions.rds" )
+if ( any( as.character( development_predictions$conversion_data_split ) == "test" ) || any( as.character(
+        development_predictions$data_split ) == "test" )
+) {
+  stop( "Module 5 development predictions unexpectedly contain TEST rows." )
+}
+competitor_quotes <- readr::read_csv( competitor_quotes_path, show_col_types = FALSE )
+selected_model_name <- selected_model_metadata$selected_model_name
+if ( is.null( selected_model_name ) || length( selected_model_name ) != 1L || is.na( selected_model_name )
+) {
+  stop( "selected_model_metadata.rds does not contain one valid selected_model_name." )
+}
+if ( !selected_model_name %in% names( development_models )
+) {
+  stop( paste0( "Selected development model not found in development_conversion_models.rds: ", selected_model_name
+    ) )
+}
+if ( !selected_model_name %in% names( final_models )
+) {
+  stop( paste0( "Selected final model not found in final_conversion_models.rds: ", selected_model_name ) )
+}
+if ( !"Own-price GLM" %in% names( development_models )
+) {
+  stop( "Own-price GLM is missing from development_conversion_models.rds." )
+}
+development_selected_model <- development_models[[ selected_model_name ]]
+development_own_price_model <- development_models[[ "Own-price GLM" ]]
+selected_model_type <- selected_model_metadata$selected_model_type
+if ( is.null( selected_model_type ) || length( selected_model_type ) != 1L || is.na( selected_model_type ) ||
+    !selected_model_type %in% c( "glm", "gam" )
+) {
+  selected_model_type <- model_family_from_object( final_selected_model )
+}
+actual_development_selected_type <- model_family_from_object( development_selected_model )
+actual_final_selected_type <- model_family_from_object( final_selected_model )
+if ( !identical( actual_development_selected_type, selected_model_type ) || !identical( actual_final_selected_type,
+      selected_model_type )
+) {
+  stop( paste0( "Module 5 selected-model metadata says '", selected_model_type,
+      "', but the saved development/final model objects resolve to '", actual_development_selected_type, "' and '",
+      actual_final_selected_type, "'." ) )
+}
+selected_model_interface <- tibble( module5_version = as.character( selected_model_metadata$module_version ),
+  model_family_scope = paste( selected_model_metadata$model_family_scope, collapse = ";" ), candidate_model_count =
+    length( selected_model_metadata$candidate_models ), quote_market_policy_year = config$expected_policy_year,
+  quote_market_profiles = config$expected_profiles, technical_data_split = "test", conversion_validation_profiles =
+    config$expected_conversion_validation_rows, conversion_test_profiles = config$expected_conversion_test_rows,
+  selected_model_name = selected_model_name, selected_model_type = selected_model_type, development_model_class =
+    paste( class( development_selected_model ), collapse = ";" ), final_model_class = paste( class(
+        final_selected_model ), collapse = ";" ), gam_minimum_relative_logloss_improvement =
+    selected_model_metadata$gam_selection_rule$minimum_relative_logloss_improvement,
+  gam_validation_relative_logloss_improvement_vs_glm =
+    selected_model_metadata$gam_selection_rule$validation_relative_logloss_improvement_vs_glm,
+  gam_validation_calibration_acceptable =
+    selected_model_metadata$gam_selection_rule$validation_calibration_acceptable, gam_selected =
+    selected_model_metadata$gam_selection_rule$selected )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 4. VALIDATE PREPARED DATA AND SCENARIO
+required_prepared_columns <- c( "scenario_id", "demand_scenario_id", "policy_id", "quote_profile_id",
+  "policy_year", "technical_data_split", "conversion_data_split", "data_split", "state", "remoteness_area",
+  "driver_age", "age_band", "licence_years", "vehicle_age", "vehicle_segment", "motive_power", "engine_capacity_l",
+  "cylinder_count", "power_kw", "torque_nm", "unladen_weight_kg", "transmission", "vehicle_value", "annual_km",
+  "voluntary_excess", "prior_claims_5yr", "claim_free_years", "technical_premium", "estimated_expected_claim_cost",
+  "focal_quote", "n_competitor_quotes", "within_profile_competitor_spread_ratio", "log_competitor_spread",
+  "focal_conversion" )
+assert_columns( prepared_data, required_prepared_columns, "prepared_conversion_data.rds" )
+explicit_forbidden_prepared_columns <- c( "claim_count", "pricing_claim_count", "incurred_claim_cost",
+  "reconstructed_incurred_claim_cost", "gross_claim_cost", "average_paid_claim_cost",
+  "pricing_average_paid_claim_cost", "largest_paid_claim", "total_loss_claim_count", "any_total_loss",
+  "reconstructed_reported_claim_count", "incurred_claim_cost_nominal", "gross_claim_cost_nominal",
+  "average_paid_claim_cost_nominal", "largest_paid_claim_nominal", "driver_sex_audit" )
+pattern_forbidden_prepared_columns <- names( prepared_data )[ stringr::str_detect( names( prepared_data ),
+    stringr::regex( paste( c( "^true_", "^latent_", "price_sensitivity_z", "taste_shock", "utility",
+          "purchase_uniform", "choice_uniform", "participation_intercept", "calibrated_focal_brand_utility",
+          "focal_selected_if_purchase", "^market_purchase$" ), collapse = "|" ), ignore_case = TRUE ) ) ]
+forbidden_prepared_columns <- union( intersect( explicit_forbidden_prepared_columns, names( prepared_data ) ),
+  pattern_forbidden_prepared_columns )
+if ( length( forbidden_prepared_columns ) > 0L
+) {
+  stop( paste0( "Module 6 prepared-data leakage check failed: ", paste( forbidden_prepared_columns, collapse = ", "
+      ) ) )
+}
+assert_columns( competitor_quotes, c( "policy_id", "quote_profile_id", "competitor_id", "competitor_archetype",
+    "competitor_quote" ), "competitor_quotes.csv" )
+pricing_data <- prepared_data %>% filter( scenario_id == config$market_scenario_id, demand_scenario_id ==
+      config$demand_scenario_id ) %>% mutate( policy_year = as.integer( policy_year ), technical_data_split =
+      tolower( trimws( as.character( technical_data_split ) ) ), conversion_data_split = tolower( trimws(
+          as.character( conversion_data_split ) ) ), data_split = tolower( trimws( as.character( data_split ) ) ) )
+if ( nrow( pricing_data ) != config$expected_profiles
+) {
+  stop( paste0( "Module 6 requires exactly ", config$expected_profiles,
+      " rows for the selected 2025 scenario; observed ", nrow( pricing_data ), "." ) )
+}
+if ( anyDuplicated( pricing_data$policy_id ) > 0L || anyDuplicated( pricing_data$quote_profile_id ) > 0L
+) {
+  stop( "Pricing data must contain unique policy_id and quote_profile_id values." )
+}
+if ( !all( pricing_data$policy_year == config$expected_policy_year )
+) {
+  stop( "Module 6 must receive the 2025 quote cohort only." )
+}
+if ( !all( pricing_data$technical_data_split == "test" )
+) {
+  stop( "technical_data_split must remain 'test' for every Module 6 row." )
+}
+if ( !all( pricing_data$data_split == pricing_data$conversion_data_split )
+) {
+  stop( "data_split must remain an exact alias of conversion_data_split." )
+}
+pricing_split_summary <- pricing_data %>% count( conversion_data_split, name = "profiles" ) %>% mutate( share =
+      profiles / sum( profiles ) )
+pricing_split_count <- function( split_name
+) {
+  value <- pricing_split_summary %>% filter( conversion_data_split == split_name ) %>% pull( profiles )
+  if ( length( value ) != 1L
+  ) {
+    stop( paste0( "Unable to recover exactly one Module 6 row count for split ", split_name, "." ) )
+  }
+  as.integer( value )
+}
+if ( pricing_split_count( "train" ) != config$expected_conversion_train_rows || pricing_split_count( "validation"
+    ) != config$expected_conversion_validation_rows || pricing_split_count( "test" ) !=
+      config$expected_conversion_test_rows
+) {
+  stop( paste0( "Module 6 split does not match the frozen 6000/2000/2000 design. ",
+      "Observed train/validation/test = ", pricing_split_count( "train" ), "/", pricing_split_count( "validation"
+      ), "/", pricing_split_count( "test" ), "." ) )
+}
+pricing_sample_architecture <- tibble( policy_year = config$expected_policy_year, total_profiles = nrow(
+      pricing_data ), technical_data_split = "test", conversion_train_profiles = pricing_split_count( "train" ),
+  conversion_validation_profiles = pricing_split_count( "validation" ), conversion_test_profiles =
+    pricing_split_count( "test" ), pricing_rule_selection_sample = "conversion VALIDATION only",
+  pricing_rule_evaluation_sample = "conversion TEST only", test_outcome_used_for_strategy_selection = FALSE,
+  latent_truth_used_for_strategy_selection = FALSE )
+pricing_vehicle_specification_audit <- tibble( market_scenario_id = config$market_scenario_id, demand_scenario_id =
+    config$demand_scenario_id, policy_year = config$expected_policy_year, profiles = nrow( pricing_data ),
+  conversion_validation_profiles = pricing_split_count( "validation" ), conversion_test_profiles =
+    pricing_split_count( "test" ), valid_engine_capacity_share = mean( is.finite( pricing_data$engine_capacity_l
+      ) & pricing_data$engine_capacity_l >= 0 ), valid_cylinder_count_share = mean( is.finite(
+        pricing_data$cylinder_count ) & pricing_data$cylinder_count >= 0 ), positive_power_share = mean( is.finite(
+        pricing_data$power_kw ) & pricing_data$power_kw > 0 ), positive_torque_share = mean( is.finite(
+        pricing_data$torque_nm ) & pricing_data$torque_nm > 0 ), positive_unladen_weight_share = mean( is.finite(
+        pricing_data$unladen_weight_kg ) & pricing_data$unladen_weight_kg > 0 ), nonblank_transmission_share =
+    mean( !is.na( pricing_data$transmission ) & nzchar( trimws( as.character( pricing_data$transmission ) ) ) ),
+  used_as_direct_pricing_constraint_variable = FALSE, tested_as_targeting_segmentation = TRUE, rationale = paste(
+      "Vehicle specifications are retained from the frozen upstream pipeline",
+      "and tested as alternative one-variable targeting bases. No directional",
+      "effect is hard-coded: they can influence the selected commercial action",
+      "only through validation-sample pricing response and upstream technical", "pricing economics." ) )
+if ( any( pricing_vehicle_specification_audit %>% dplyr::select( valid_engine_capacity_share,
+        valid_cylinder_count_share, positive_power_share, positive_torque_share, positive_unladen_weight_share,
+        nonblank_transmission_share ) %>% unlist( use.names = FALSE ) < 1 )
+) {
+  stop( "Frozen vehicle-specification fields are incomplete in prepared_conversion_data.rds." )
+}
+validation_data <- pricing_data %>% filter( conversion_data_split == "validation" )
+# The TEST working table is deliberately outcome-blind. focal_conversion is not
+# required for counterfactual pricing evaluation and is therefore removed here.
+test_data <- pricing_data %>% filter( conversion_data_split == "test" ) %>% dplyr::select( -focal_conversion )
+if ( nrow( validation_data ) != config$expected_conversion_validation_rows || nrow( test_data ) !=
+      config$expected_conversion_test_rows
+) {
+  stop( "Module 6 requires exactly 2,000 validation and 2,000 test pricing profiles." )
+}
+if ( "focal_conversion" %in% names( test_data )
+) {
+  stop( "TEST outcomes must not be present in the Module 6 TEST working table." )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 5. BUILD FIXED COMPETITOR QUOTE LISTS
+competitor_lists <- competitor_quotes %>% group_by( policy_id, quote_profile_id ) %>% summarise(
+    competitor_quote_vector = list( sort( competitor_quote ) ), competitor_count_from_file = n(), .groups = "drop"
+  )
+competitor_reconciliation <- pricing_data %>% dplyr::select( policy_id, quote_profile_id, n_competitor_quotes ) %>%
+  left_join( competitor_lists %>% dplyr::select( policy_id, quote_profile_id, competitor_count_from_file ), by = c(
+      "policy_id", "quote_profile_id" ) )
+if ( anyNA( competitor_reconciliation$competitor_count_from_file ) || any(
+      competitor_reconciliation$n_competitor_quotes != competitor_reconciliation$competitor_count_from_file )
+) {
+  stop( "Competitor quote counts do not reconcile with the Module 5 pricing data." )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 6. CANDIDATE-PRICE FEATURE ENGINEERING
+construct_candidate_data <- function( base_data, multiplier
+) {
+  if ( length( multiplier ) == 1L
+  ) {
+    multiplier_vector <- rep( multiplier, nrow( base_data ) )
+  } else if ( length( multiplier ) == nrow( base_data )
+  ) {
+    multiplier_vector <- as.numeric( multiplier )
+  } else {
+    stop( "Candidate multiplier must be scalar or have one value per base-data row." )
+  }
+  candidate <- base_data %>% mutate( strategy_multiplier = multiplier_vector, candidate_price = technical_premium *
+          strategy_multiplier ) %>% left_join( competitor_lists, by = c( "policy_id", "quote_profile_id" ) )
+  if ( anyNA( candidate$competitor_quote_vector )
+  ) {
+    stop( "At least one candidate profile is missing its competitor quote vector." )
+  }
+  candidate <- candidate %>% mutate( cheapest_competitor_quote = purrr::map_dbl( competitor_quote_vector, min ),
+      mean_competitor_quote = purrr::map_dbl( competitor_quote_vector, mean ), median_competitor_quote =
+        purrr::map_dbl( competitor_quote_vector, median ), sd_competitor_quote = purrr::map_dbl(
+          competitor_quote_vector, sd ), focal_rank = purrr::map2_int( competitor_quote_vector, candidate_price,
+          ~ 1L + sum( .x < .y ) ), market_median_quote = purrr::map2_dbl( competitor_quote_vector, candidate_price,
+          ~ median( c( .x, .y ) ) ), focal_quote = candidate_price, focal_price = candidate_price,
+      focal_price_multiplier = strategy_multiplier, relative_price = safe_divide( candidate_price,
+          cheapest_competitor_quote ), relative_price_to_cheapest_competitor = relative_price,
+      price_gap_to_cheapest = candidate_price - cheapest_competitor_quote, gap_to_cheapest = price_gap_to_cheapest,
+      percentage_gap_to_cheapest_competitor = relative_price_to_cheapest_competitor - 1,
+      relative_price_to_market_median = safe_divide( candidate_price, market_median_quote ),
+      relative_to_market_median = relative_price_to_market_median, distance_to_market_median = candidate_price -
+          market_median_quote, focal_rank_percentile = safe_divide( focal_rank - 1, n_competitor_quotes ),
+      log_focal_to_technical = log( candidate_price / technical_premium ), log_relative_price_to_cheapest = log(
+          relative_price_to_cheapest_competitor ), gap_above_market_threshold = pmax(
+          percentage_gap_to_cheapest_competitor - selected_model_metadata$market_gap_threshold, 0 ),
+      log_relative_price_to_market_median = log( relative_price_to_market_median ),
+      # Competitor dispersion and comparison-set size do not change when only
+      # the focal insurer reprices.
+      log_competitor_spread = log( within_profile_competitor_spread_ratio ) )
+  numeric_check_columns <- c( "candidate_price", "cheapest_competitor_quote", "market_median_quote",
+    "relative_price_to_cheapest_competitor", "relative_price_to_market_median", "focal_rank_percentile",
+    "log_focal_to_technical", "log_relative_price_to_cheapest", "log_relative_price_to_market_median" )
+  if ( any( !is.finite( as.matrix( candidate[ numeric_check_columns ] ) ) )
+  ) {
+    stop( "Candidate-price feature engineering produced non-finite values." )
+  }
+  candidate %>% dplyr::select( -competitor_quote_vector, -competitor_count_from_file )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 7. DEVELOPMENT-ONLY PROBABILITY RECALIBRATION
+# Recalibration parameters are estimated from Module 5 train-only model
+# predictions on VALIDATION. No TEST outcome is used.
+validation_development_predictions <- development_predictions %>% filter( conversion_data_split == "validation",
+    model %in% c( "Own-price GLM", selected_model_name ) )
+required_calibration_models <- c( "Own-price GLM", selected_model_name )
+missing_calibration_models <- setdiff( required_calibration_models, unique(
+    validation_development_predictions$model ) )
+validation_calibration_counts <- validation_development_predictions %>% count( model, name = "profiles" )
+if ( any( validation_calibration_counts$profiles != config$expected_conversion_validation_rows )
+) {
+  stop( "Module 5 validation prediction interface does not contain exactly 2,000 rows per required model." )
+}
+if ( length( missing_calibration_models ) > 0L
+) {
+  stop( paste0( "Missing validation development predictions for: ", paste( missing_calibration_models,
+        collapse = ", " ) ) )
+}
+probability_calibration <- validation_development_predictions %>% group_by( model ) %>% nest() %>% mutate(
+    calibration = purrr::map2( data, model, function( model_data, model_name
+        ) {
+          fit_probability_calibration( outcome = model_data$focal_conversion, raw_probability =
+              model_data$predicted_probability, model_name = model_name )
+        } ) ) %>% dplyr::select( -data ) %>% unnest( calibration ) %>% ungroup() %>% dplyr::select( model,
+    calibration_intercept, calibration_slope )
+own_calibration <- extract_single_calibration( probability_calibration, "Own-price GLM" )
+market_calibration <- extract_single_calibration( probability_calibration, selected_model_name )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 8. CANDIDATE PREDICTION FUNCTION
+add_candidate_predictions <- function( candidate_data, model_stage = c( "development", "final" )
+) {
+  model_stage <- match.arg( model_stage )
+  if ( model_stage == "development"
+  ) {
+    own_model <- development_own_price_model
+    market_model <- development_selected_model
+  } else {
+    own_model <- final_own_price_model
+    market_model <- final_selected_model
+  }
+  own_raw <- predict_probability( model = own_model, new_data = candidate_data, model_name = paste( model_stage,
+          "Own-price GLM" ), model_type = "glm" )
+  market_raw <- predict_probability( model = market_model, new_data = candidate_data, model_name = paste(
+          model_stage, selected_model_name ), model_type = selected_model_type )
+  candidate_data %>% mutate( own_price_model_probability_raw = own_raw, own_price_model_probability =
+        apply_probability_calibration( raw_probability = own_raw, calibration_intercept =
+            own_calibration$intercept, calibration_slope = own_calibration$slope ), market_model_probability_raw =
+        market_raw, market_model_probability = apply_probability_calibration( raw_probability = market_raw,
+          calibration_intercept = market_calibration$intercept, calibration_slope = market_calibration$slope ),
+      own_price_expected_margin = own_price_model_probability * ( candidate_price - estimated_expected_claim_cost
+          ), market_model_expected_margin = market_model_probability * ( candidate_price -
+              estimated_expected_claim_cost ), own_price_expected_written_premium = own_price_model_probability *
+          candidate_price, market_model_expected_written_premium = market_model_probability * candidate_price,
+      own_price_expected_claim_cost = own_price_model_probability * estimated_expected_claim_cost,
+      market_model_expected_claim_cost = market_model_probability * estimated_expected_claim_cost )
+}
+# 8.1 MODULE 5 ORIGINAL-QUOTE PREDICTION RECONSTRUCTION
+# Module 5 was fitted and evaluated at the ORIGINAL focal quotes generated by
+# Module 3. Those quotes are not generally equal to the actuarial technical
+# premium:
+#   original_focal_multiplier_i =
+#       focal_quote_i / technical_premium_i
+# Therefore a valid interface audit must reconstruct every validation profile
+# at its own original focal multiplier.
+# This is deliberately different from the Module 6 "technical-pricing
+# benchmark", which sets the candidate multiplier to exactly 1.00.
+# At the original focal multipliers, all reconstructed price-position variables
+# should match Module 5 and the raw predicted probabilities should therefore
+# agree to numerical precision. This provides a high-value GLM/GAM
+# interface check before any optimisation is performed.
+validation_original_quote_multiplier <- validation_data$focal_quote / validation_data$technical_premium
+if ( any( !is.finite( validation_original_quote_multiplier ) ) || any( validation_original_quote_multiplier <= 0 )
+) {
+  stop( "Invalid original focal-quote multiplier in Module 5 reconstruction audit." )
+}
+validation_original_quote_reconstruction <- construct_candidate_data( base_data = validation_data, multiplier =
+      validation_original_quote_multiplier )
+# Verify that the reconstructed candidate price itself returns to the Module 3
+# focal quote before comparing model predictions.
+original_quote_price_reconstruction_audit <- validation_original_quote_reconstruction %>% transmute(
+    quote_profile_id, stored_focal_quote = validation_data$focal_quote, reconstructed_focal_quote = focal_quote,
+    absolute_price_difference = abs( reconstructed_focal_quote - stored_focal_quote ) )
+validation_original_own_raw <- predict_probability( model = development_own_price_model, new_data =
+      validation_original_quote_reconstruction, model_name =
+      "development Own-price GLM original-quote reconstruction", model_type = "glm" )
+validation_original_market_raw <- predict_probability( model = development_selected_model, new_data =
+      validation_original_quote_reconstruction, model_name = paste( "development", selected_model_name,
+        "original-quote reconstruction" ), model_type = selected_model_type )
+stored_validation_original_predictions <- development_predictions %>% filter( data_split == "validation",
+    model %in% c( "Own-price GLM", selected_model_name ) ) %>% dplyr::select( quote_profile_id, model,
+    predicted_probability )
+own_stored_validation <- stored_validation_original_predictions %>% filter( model == "Own-price GLM" ) %>%
+  dplyr::select( quote_profile_id, stored_probability = predicted_probability )
+market_stored_validation <- stored_validation_original_predictions %>% filter( model == selected_model_name ) %>%
+  dplyr::select( quote_profile_id, stored_probability = predicted_probability )
+own_reconstruction_audit <- validation_original_quote_reconstruction %>% transmute( quote_profile_id,
+    reconstructed_probability = validation_original_own_raw ) %>% left_join( own_stored_validation, by =
+      "quote_profile_id" )
+market_reconstruction_audit <- validation_original_quote_reconstruction %>% transmute( quote_profile_id,
+    reconstructed_probability = validation_original_market_raw ) %>% left_join( market_stored_validation, by =
+      "quote_profile_id" )
+if ( anyNA( own_reconstruction_audit$stored_probability ) || anyNA( market_reconstruction_audit$stored_probability
+    )
+) {
+  stop( "Module 5 original-quote prediction reconciliation is missing validation profiles." )
+}
+prediction_interface_reconstruction <- tibble( model = c( "Original focal quote", "Own-price GLM",
+      selected_model_name ), model_type = c( "price reconstruction", "glm", selected_model_type ), profiles = c(
+      nrow( original_quote_price_reconstruction_audit ), nrow( own_reconstruction_audit ), nrow(
+        market_reconstruction_audit ) ), max_absolute_difference = c( max(
+        original_quote_price_reconstruction_audit$absolute_price_difference ), max( abs(
+          own_reconstruction_audit$reconstructed_probability - own_reconstruction_audit$stored_probability ) ),
+      max( abs( market_reconstruction_audit$reconstructed_probability -
+            market_reconstruction_audit$stored_probability ) ) ), difference_scale = c( "currency", "probability",
+      "probability" ) )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 9. DEVELOPMENT UNIFORM MULTIPLIER GRID
+development_uniform_grid <- purrr::map_dfr( multiplier_grid, function( multiplier
+    ) {
+      candidate <- construct_candidate_data( base_data = validation_data, multiplier = multiplier ) %>%
+        add_candidate_predictions( model_stage = "development" )
+      tibble( multiplier = multiplier, aggregate_rate_level = safe_divide( sum( candidate$candidate_price ), sum(
+              candidate$technical_premium ) ), own_price_model_expected_conversion_rate = mean(
+            candidate$own_price_model_probability ), market_model_expected_conversion_rate = mean(
+            candidate$market_model_probability ), own_price_model_expected_new_business = sum(
+            candidate$own_price_model_probability ), market_model_expected_new_business = sum(
+            candidate$market_model_probability ), own_price_model_expected_underwriting_margin = sum(
+            candidate$own_price_expected_margin ), market_model_expected_underwriting_margin = sum(
+            candidate$market_model_expected_margin ), own_price_model_expected_written_premium = sum(
+            candidate$own_price_expected_written_premium ), market_model_expected_written_premium = sum(
+            candidate$market_model_expected_written_premium ), own_price_model_expected_claim_cost = sum(
+            candidate$own_price_expected_claim_cost ), market_model_expected_claim_cost = sum(
+            candidate$market_model_expected_claim_cost ), own_price_model_claim_ratio = safe_divide( sum(
+              candidate$own_price_expected_claim_cost ), sum( candidate$own_price_expected_written_premium ) ),
+        market_model_claim_ratio = safe_divide( sum( candidate$market_model_expected_claim_cost ), sum(
+              candidate$market_model_expected_written_premium ) ), mean_focal_rank = mean( candidate$focal_rank ),
+        top_three_share = mean( candidate$focal_rank <= 3 ) )
+    } )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 10. TECHNICAL-BENCHMARK DEVELOPMENT METRICS
+development_technical_row <- development_uniform_grid %>% filter( abs( multiplier - 1 ) < 1e-12 )
+if ( nrow( development_technical_row ) != 1L
+) {
+  stop( "Unable to identify multiplier 1.00 in the development grid." )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 11. SELECT OWN-PRICE UNIFORM STRATEGY
+own_price_admissible <- development_uniform_grid %>% mutate( conversion_retention = safe_divide(
+        own_price_model_expected_conversion_rate,
+        development_technical_row$own_price_model_expected_conversion_rate[ 1 ] ), margin_retention = safe_divide(
+        own_price_model_expected_underwriting_margin,
+        development_technical_row$own_price_model_expected_underwriting_margin[ 1 ] ) ) %>% filter(
+    conversion_retention >= config$minimum_uniform_conversion_retention, own_price_model_claim_ratio <=
+      config$maximum_admissible_claim_ratio, margin_retention >= config$minimum_portfolio_margin_retention )
+if ( nrow( own_price_admissible ) == 0L
+) {
+  stop( "No admissible Own-price uniform multiplier was found." )
+}
+selected_own_price_uniform <- own_price_admissible %>% arrange( desc( own_price_model_expected_underwriting_margin
+    ), desc( own_price_model_expected_conversion_rate ), abs( multiplier - 1 ) ) %>% slice( 1 )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 12. SELECT MARKET-POSITION UNIFORM STRATEGY
+market_uniform_admissible <- development_uniform_grid %>% mutate( conversion_retention = safe_divide(
+        market_model_expected_conversion_rate, development_technical_row$market_model_expected_conversion_rate[ 1 ]
+      ), margin_retention = safe_divide( market_model_expected_underwriting_margin,
+        development_technical_row$market_model_expected_underwriting_margin[ 1 ] ) ) %>% filter(
+    conversion_retention >= config$minimum_uniform_conversion_retention, market_model_claim_ratio <=
+      config$maximum_admissible_claim_ratio, margin_retention >= config$minimum_portfolio_margin_retention )
+if ( nrow( market_uniform_admissible ) == 0L
+) {
+  stop( "No admissible market-position uniform multiplier was found." )
+}
+selected_market_uniform <- market_uniform_admissible %>% arrange( desc( market_model_expected_underwriting_margin
+    ), desc( market_model_expected_conversion_rate ), abs( multiplier - 1 ) ) %>% slice( 1 )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 13. TARGETING-SEGMENTATION REGISTER AND VALIDATION-ONLY DEFINITIONS
+# The segmentation exercise is deliberately one-variable-at-a-time. This keeps
+# the commercial interpretation transparent and avoids a sparse high-dimensional
+# pricing-cell design. Continuous characteristics use validation-derived bands;
+# categorical characteristics generally use observed levels. Where a naturally
+# ordered domain structure exists, sparse levels are pooled with adjacent,
+# interpretable categories rather than placed in a generic "Other" cell.
+segmentation_descriptors <- tribble( ~segmentation_id, ~segmentation_name, ~segmentation_category,
+  ~source_variable, ~rule_type, ~rationale, "age_band", "Driver age band", "Driver / experience", "age_band",
+  "categorical",
+  "Pre-specified benchmark segmentation. Age can proxy for both risk and heterogeneous shopping behaviour.",
+  "licence_years_band", "Licence-years band", "Driver / experience", "licence_years", "quantile",
+  "Tests whether driving experience identifies different commercial price responses.", "prior_claims_band",
+  "Prior-claims band", "Driver / experience", "prior_claims_5yr", "prior_claims",
+  "Claims history affects technical risk and may also change the competitiveness of the offered premium.",
+  "claim_free_years_band", "Claim-free-years band", "Driver / experience", "claim_free_years", "claim_free",
+  "Tests whether sustained claim-free experience identifies distinct pricing opportunity.", "state", "State",
+  "Geography", "state", "categorical",
+  "Tests broad geographic differences in risk mix, competitor position and customer response.", "remoteness_area",
+  "Remoteness area", "Geography", "remoteness_area", "remoteness",
+  "Tests whether metropolitan and regional/remote quote opportunities respond differently to repricing.",
+  "vehicle_segment", "Vehicle segment", "Vehicle class / technology", "vehicle_segment", "categorical",
+  "Vehicle classes can differ in repair economics, driver mix and customer price sensitivity.", "motive_power",
+  "Motive power", "Vehicle class / technology", "motive_power", "categorical",
+  "Tests whether petrol, diesel, hybrid and electric vehicle markets exhibit different commercial pricing response.",
+  "transmission", "Transmission", "Vehicle class / technology", "transmission", "categorical",
+  "A diagnostic vehicle-characteristic segmentation that may proxy for vehicle type and driver mix.",
+  "vehicle_age_band", "Vehicle-age band", "Vehicle specification", "vehicle_age", "vehicle_age",
+  "Tests whether newer and older vehicles offer different risk-margin and conversion trade-offs.",
+  "vehicle_value_band", "Vehicle-value band", "Vehicle specification", "vehicle_value", "quantile",
+  "Vehicle value is directly relevant to loss economics and may also proxy for premium affordability and shopping behaviour.",
+  "engine_capacity_band", "Engine-capacity band", "Vehicle specification", "engine_capacity_l", "quantile",
+  "Tests engine displacement as a vehicle-performance/risk marker without imposing a directional effect.",
+  "cylinder_count", "Cylinder count", "Vehicle specification", "cylinder_count", "cylinder_group",
+  "Tests a traditional engine configuration characteristic as a commercial segmentation basis.", "power_band",
+  "Power band", "Vehicle specification", "power_kw", "quantile",
+  "Higher power may be associated with vehicle performance, driver selection and collision dynamics, but no causal direction is imposed.",
+  "torque_band", "Torque band", "Vehicle specification", "torque_nm", "quantile",
+  "Tests whether torque-defined vehicle groups have distinct commercial response after technical pricing has already been estimated.",
+  "unladen_weight_band", "Unladen-weight band", "Vehicle specification", "unladen_weight_kg", "quantile",
+  "Vehicle mass may proxy for vehicle class, repair economics and collision characteristics.", "annual_km_band",
+  "Annual-kilometres band", "Usage / policy choice", "annual_km", "quantile",
+  "Mileage is a direct exposure proxy and may identify customers with different premium and conversion trade-offs.",
+  "voluntary_excess", "Voluntary excess", "Usage / policy choice", "voluntary_excess", "categorical",
+  "Tests whether policyholders choosing different excess levels display different pricing opportunity.",
+  "distribution_channel", "Distribution channel", "Commercial / channel", "distribution_channel", "categorical",
+  "Would test shopping-intensity differences by channel if the field were available in the frozen upstream dataset."
+)
+normalise_segment_character <- function( x
+) {
+  value <- trimws( as.character( x ) )
+  value[ is.na( value ) | value == "" ] <- NA_character_
+  value
+}
+build_segmentation_spec <- function( descriptor_row, validation_frame
+) {
+  segmentation_id <- descriptor_row$segmentation_id[ 1 ]
+  segmentation_name <- descriptor_row$segmentation_name[ 1 ]
+  segmentation_category <- descriptor_row$segmentation_category[ 1 ]
+  source_variable <- descriptor_row$source_variable[ 1 ]
+  rule_type <- descriptor_row$rule_type[ 1 ]
+  rationale <- descriptor_row$rationale[ 1 ]
+  if ( !source_variable %in% names( validation_frame )
+  ) {
+    return( list( eligible = FALSE, segmentation_id = segmentation_id, segmentation_name = segmentation_name,
+        segmentation_category = segmentation_category, source_variable = source_variable, rule_type = rule_type,
+        rationale = rationale, definition = "Not available in frozen Modules 0-5 interface.", reason =
+          "Source variable absent from prepared_conversion_data.rds.", transform = NULL ) )
+  }
+  validation_value <- validation_frame[[ source_variable ]]
+  transform_function <- NULL
+  definition <- NA_character_
+  reason <- NA_character_
+  if ( identical( rule_type, "remoteness" )
+  ) {
+    transform_function <- function( x
+    ) {
+      clean <- normalise_segment_character( x )
+      dplyr::case_when( clean %in% c( "Major Cities", "Major Cities of Australia" ) ~ "Major Cities", clean %in% c(
+            "Inner Regional", "Inner Regional Australia" ) ~ "Inner Regional", clean %in% c( "Outer Regional",
+            "Outer Regional Australia" ) ~ "Outer Regional", clean %in% c( "Remote", "Remote Australia",
+            "Very Remote", "Very Remote Australia" ) ~ "Remote / Very Remote", TRUE ~ NA_character_ )
+    }
+    definition <- paste0( "Major Cities, Inner Regional, Outer Regional and Remote / Very Remote. ",
+        "Remote and Very Remote are pooled because Very Remote alone has fewer than ",
+        config$minimum_targeted_segment_profiles,
+        " validation profiles; the pooling follows the ordinal remoteness hierarchy rather than a generic Other category."
+      )
+  } else if ( identical( rule_type, "cylinder_group" )
+  ) {
+    transform_function <- function( x
+    ) {
+      numeric_x <- as.numeric( x )
+      dplyr::case_when( !is.finite( numeric_x ) ~ NA_character_, numeric_x == 0 ~
+          "0 cylinders (EV / not applicable)", numeric_x <= 3 ~ "1-3 cylinders", numeric_x == 4 ~ "4 cylinders",
+        numeric_x <= 6 ~ "5-6 cylinders", TRUE ~ "7+ cylinders" )
+    }
+    definition <- paste0( "Ordered cylinder groups: 0 (EV / not applicable), 1-3, 4, 5-6 and 7+ cylinders. ",
+        "The rare 5-cylinder configuration is pooled with adjacent 6-cylinder vehicles to satisfy the ",
+        config$minimum_targeted_segment_profiles,
+        "-profile validation-cell rule without creating an uninformative generic Other category." )
+  } else if ( identical( rule_type, "categorical" )
+  ) {
+    clean_validation <- normalise_segment_character( validation_value )
+    if ( anyNA( clean_validation )
+    ) {
+      reason <- "Missing or blank values detected in the validation sample."
+    } else {
+      level_counts <- table( clean_validation )
+      rare_levels <- names( level_counts[ level_counts < config$minimum_targeted_segment_profiles ] )
+      kept_levels <- setdiff( names( level_counts ), rare_levels )
+      has_other <- length( rare_levels ) > 0L
+      transform_function <- local({
+        kept_levels_local <- kept_levels
+        rare_levels_local <- rare_levels
+        has_other_local <- has_other
+        function( x
+        ) {
+          clean <- normalise_segment_character( x )
+          output <- rep( NA_character_, length( clean ) )
+          output[ !is.na( clean ) & clean %in% kept_levels_local ] <- clean[ !is.na( clean ) & clean %in%
+                  kept_levels_local ]
+          if ( has_other_local
+          ) {
+            output[ !is.na( clean ) & clean %in% rare_levels_local ] <- "Other"
+          }
+          output
+        }
+      })
+      definition <- if ( has_other
+        ) {
+          paste0( "Observed validation categories; levels with fewer than ",
+            config$minimum_targeted_segment_profiles, " validation profiles collapsed to Other: ", paste(
+              rare_levels, collapse = ", " ), "." )
+        } else {
+          "Observed validation categories used directly."
+        }
+    }
+  } else if ( identical( rule_type, "quantile" )
+  ) {
+    numeric_validation <- as.numeric( validation_value )
+    if ( any( !is.finite( numeric_validation ) )
+    ) {
+      reason <- "Non-finite values detected in the validation sample."
+    } else {
+      requested_quantiles <- as.integer( config$targeted_numeric_quantiles )
+      raw_quantiles <- as.numeric( stats::quantile( numeric_validation, probs = seq( 0, 1, length.out =
+                  requested_quantiles + 1L ), names = FALSE, type = 8 ) )
+      internal_breaks <- unique( raw_quantiles[ 2:requested_quantiles ] )
+      cut_breaks <- c( -Inf, internal_breaks, Inf )
+      n_intervals <- length( cut_breaks ) - 1L
+      if ( n_intervals < 2L
+      ) {
+        reason <- "Too little numeric variation to construct at least two targeting bands."
+      } else {
+        interval_labels <- paste0( "Q", seq_len( n_intervals ) )
+        if ( n_intervals >= 2L
+        ) {
+          interval_labels[ 1 ] <- paste0( interval_labels[ 1 ], " (lowest)" )
+          interval_labels[ n_intervals ] <- paste0( interval_labels[ n_intervals ], " (highest)" )
+        }
+        transform_function <- local({
+          breaks_local <- cut_breaks
+          labels_local <- interval_labels
+          function( x
+          ) {
+            numeric_x <- as.numeric( x )
+            output <- as.character( cut( numeric_x, breaks = breaks_local, labels = labels_local, include.lowest =
+                    TRUE, right = TRUE ) )
+            output[ !is.finite( numeric_x ) ] <- NA_character_
+            output
+          }
+        })
+        definition <- paste0( "Validation-derived quantile bands using internal cut-points: ", paste( signif(
+                internal_breaks, 6 ), collapse = ", " ), "." )
+      }
+    }
+  } else if ( identical( rule_type, "prior_claims" )
+  ) {
+    transform_function <- function( x
+    ) {
+      numeric_x <- as.numeric( x )
+      dplyr::case_when( !is.finite( numeric_x ) ~ NA_character_, numeric_x <= 0 ~ "0 claims", numeric_x == 1 ~
+          "1 claim", numeric_x == 2 ~ "2 claims", TRUE ~ "3+ claims" )
+    }
+    definition <- "0, 1, 2 and 3+ prior claims over the five-year history."
+  } else if ( identical( rule_type, "claim_free" )
+  ) {
+    transform_function <- function( x
+    ) {
+      numeric_x <- as.numeric( x )
+      dplyr::case_when( !is.finite( numeric_x ) ~ NA_character_, numeric_x <= 0 ~ "0 years", numeric_x <= 2 ~
+          "1-2 years", numeric_x <= 4 ~ "3-4 years", TRUE ~ "5+ years" )
+    }
+    definition <- "0, 1-2, 3-4 and 5+ consecutive claim-free years."
+  } else if ( identical( rule_type, "vehicle_age" )
+  ) {
+    transform_function <- function( x
+    ) {
+      numeric_x <- as.numeric( x )
+      dplyr::case_when( !is.finite( numeric_x ) ~ NA_character_, numeric_x <= 2 ~ "0-2 years", numeric_x <= 5 ~
+          "3-5 years", numeric_x <= 10 ~ "6-10 years", numeric_x <= 15 ~ "11-15 years", TRUE ~ "16+ years" )
+    }
+    definition <- "0-2, 3-5, 6-10, 11-15 and 16+ vehicle-age bands."
+  } else {
+    reason <- paste0( "Unsupported segmentation rule type: ", rule_type )
+  }
+  if ( is.null( transform_function )
+  ) {
+    return( list( eligible = FALSE, segmentation_id = segmentation_id, segmentation_name = segmentation_name,
+        segmentation_category = segmentation_category, source_variable = source_variable, rule_type = rule_type,
+        rationale = rationale, definition = definition, reason = reason, transform = NULL ) )
+  }
+  validation_segments <- transform_function( validation_value )
+  if ( anyNA( validation_segments ) || any( validation_segments == "" )
+  ) {
+    return( list( eligible = FALSE, segmentation_id = segmentation_id, segmentation_name = segmentation_name,
+        segmentation_category = segmentation_category, source_variable = source_variable, rule_type = rule_type,
+        rationale = rationale, definition = definition, reason =
+          "Segmentation transformation produced missing validation labels.", transform = transform_function ) )
+  }
+  validation_counts <- table( validation_segments )
+  if ( length( validation_counts ) < 2L
+  ) {
+    return( list( eligible = FALSE, segmentation_id = segmentation_id, segmentation_name = segmentation_name,
+        segmentation_category = segmentation_category, source_variable = source_variable, rule_type = rule_type,
+        rationale = rationale, definition = definition, reason =
+          "Fewer than two validation segments are available.", transform = transform_function ) )
+  }
+  if ( min( validation_counts ) < config$minimum_targeted_segment_profiles
+  ) {
+    return( list( eligible = FALSE, segmentation_id = segmentation_id, segmentation_name = segmentation_name,
+        segmentation_category = segmentation_category, source_variable = source_variable, rule_type = rule_type,
+        rationale = rationale, definition = definition, reason = paste0(
+            "At least one transformed validation segment has fewer than ",
+            config$minimum_targeted_segment_profiles, " profiles." ), transform = transform_function ) )
+  }
+  list( eligible = TRUE, segmentation_id = segmentation_id, segmentation_name = segmentation_name,
+    segmentation_category = segmentation_category, source_variable = source_variable, rule_type = rule_type,
+    rationale = rationale, definition = definition, reason = NA_character_, transform = transform_function )
+}
+segmentation_specs <- purrr::pmap( segmentation_descriptors, function( segmentation_id, segmentation_name,
+        segmentation_category, source_variable, rule_type, rationale
+    ) {
+      build_segmentation_spec( tibble( segmentation_id = segmentation_id, segmentation_name = segmentation_name,
+          segmentation_category = segmentation_category, source_variable = source_variable, rule_type = rule_type,
+          rationale = rationale ), validation_frame = validation_data )
+    } )
+targeted_segmentation_register <- purrr::map_dfr( segmentation_specs, function( specification
+    ) {
+      tibble( segmentation_id = specification$segmentation_id, segmentation_name = specification$segmentation_name,
+        segmentation_category = specification$segmentation_category, source_variable =
+          specification$source_variable, rule_type = specification$rule_type, eligible = isTRUE(
+            specification$eligible ), definition = specification$definition, rationale = specification$rationale,
+        exclusion_reason = specification$reason )
+    } )
+eligible_segmentation_specs <- purrr::keep( segmentation_specs, ~ isTRUE( .x$eligible ) )
+if ( length( eligible_segmentation_specs ) < 2L
+) {
+  stop( "Fewer than two targeting segmentations are eligible for comparison." )
+}
+if ( !"age_band" %in% purrr::map_chr( eligible_segmentation_specs, "segmentation_id" )
+) {
+  stop( "The pre-specified age-band benchmark is not eligible for targeting comparison." )
+}
+omitted_targeting_candidates <- bind_rows( targeted_segmentation_register %>% filter( !eligible ) %>% transmute(
+        candidate = segmentation_name, source_variable = source_variable, reason = exclusion_reason ), tibble(
+      candidate = c( "Locality ID", "State x remoteness interaction", "Exact vehicle make/model" ),
+      source_variable = c( "locality_id", "state x remoteness_area", "vehicle_make / vehicle_model" ), reason = c(
+          "Deliberately excluded because the synthetic locality identifier is high-cardinality and would create sparse pricing cells.",
+          "Deliberately excluded from the primary comparison to preserve the one-variable-at-a-time design and avoid sparse geographic interactions.",
+          "Not retained in the frozen downstream modelling interface and too granular for a stable primary pricing-cell optimisation."
+        ) ) ) %>% distinct()
+validation_segmentation_membership <- purrr::map_dfr( eligible_segmentation_specs, function( specification
+    ) {
+      tibble( quote_profile_id = validation_data$quote_profile_id, segmentation_id = specification$segmentation_id,
+        segmentation_name = specification$segmentation_name, segmentation_category =
+          specification$segmentation_category, source_variable = specification$source_variable, pricing_segment =
+          specification$transform( validation_data[[ specification$source_variable ]] ) )
+    } )
+# TEST segmentation membership is intentionally deferred until AFTER the
+# validation-only targeting-basis selection. This prevents TEST covariate support
+# from influencing which candidate segmentation is considered or selected.
+targeted_segmentation_definitions <- validation_segmentation_membership %>% count( segmentation_id,
+    segmentation_name, segmentation_category, source_variable, pricing_segment, name = "validation_profiles" ) %>%
+  left_join( targeted_segmentation_register %>% dplyr::select( segmentation_id, rule_type, definition, rationale ),
+    by = "segmentation_id" ) %>% arrange( segmentation_category, segmentation_name, pricing_segment )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 14. COMMON DEVELOPMENT MULTIPLIER RESPONSE GRID
+# Candidate-price predictions are computed only once for each multiplier. The
+# same quote-level response surface is then aggregated under every targeting
+# segmentation. This makes the comparison both computationally efficient and
+# methodologically fair.
+targeted_candidate_profiles <- purrr::map_dfr( multiplier_grid, function( multiplier
+    ) {
+      construct_candidate_data( base_data = validation_data, multiplier = multiplier ) %>%
+        add_candidate_predictions( model_stage = "development" ) %>% mutate( candidate_multiplier = multiplier
+        ) %>% dplyr::select( policy_id, quote_profile_id, candidate_multiplier, technical_premium, candidate_price,
+          estimated_expected_claim_cost, focal_rank, relative_price_to_cheapest_competitor,
+          relative_price_to_market_median, market_model_probability, market_model_expected_margin,
+          market_model_expected_written_premium, market_model_expected_claim_cost )
+    } )
+build_segmentation_candidate_summary <- function( specification
+) {
+  membership <- validation_segmentation_membership %>% filter( segmentation_id == specification$segmentation_id
+    ) %>% dplyr::select( quote_profile_id, segmentation_id, segmentation_name, segmentation_category,
+      source_variable, pricing_segment )
+  summary_table <- targeted_candidate_profiles %>% left_join( membership, by = "quote_profile_id" ) %>% group_by(
+      segmentation_id, segmentation_name, segmentation_category, source_variable, pricing_segment,
+      candidate_multiplier ) %>% summarise( profiles = n(), mean_estimated_claim_cost = mean(
+          estimated_expected_claim_cost ), mean_technical_premium = mean( technical_premium ),
+      mean_candidate_price = mean( candidate_price ), technical_premium_total = sum( technical_premium ),
+      candidate_premium_total = sum( candidate_price ), segment_rate_level = safe_divide( candidate_premium_total,
+          technical_premium_total ), model_expected_conversion_count = sum( market_model_probability ),
+      model_expected_conversion_rate = mean( market_model_probability ), model_expected_underwriting_margin = sum(
+          market_model_expected_margin ), model_expected_written_premium = sum(
+          market_model_expected_written_premium ), model_expected_claim_cost = sum(
+          market_model_expected_claim_cost ), model_expected_claim_ratio = safe_divide( model_expected_claim_cost,
+          model_expected_written_premium ), mean_selected_rank = mean( focal_rank ), top_three_share = mean(
+          focal_rank <= 3 ), mean_relative_price_to_cheapest = mean( relative_price_to_cheapest_competitor ),
+      mean_relative_price_to_market_median = mean( relative_price_to_market_median ), .groups = "drop" )
+  benchmark <- summary_table %>% filter( abs( candidate_multiplier - 1 ) < 1e-12 ) %>% transmute( segmentation_id,
+      pricing_segment, benchmark_expected_margin = model_expected_underwriting_margin,
+      benchmark_expected_conversion_count = model_expected_conversion_count, benchmark_expected_conversion_rate =
+        model_expected_conversion_rate, benchmark_expected_written_premium = model_expected_written_premium,
+      benchmark_expected_claim_cost = model_expected_claim_cost )
+  summary_table %>% left_join( benchmark, by = c( "segmentation_id", "pricing_segment" ) ) %>% mutate(
+      segment_margin_retention = safe_divide( model_expected_underwriting_margin, benchmark_expected_margin ),
+      segment_conversion_retention = safe_divide( model_expected_conversion_count,
+          benchmark_expected_conversion_count ), segment_conversion_uplift = model_expected_conversion_rate -
+          benchmark_expected_conversion_rate, unit_margin_admissible = segment_margin_retention >=
+          config$minimum_unit_margin_retention )
+}
+targeted_segmentation_candidate_summary <- purrr::map_dfr( eligible_segmentation_specs,
+    build_segmentation_candidate_summary )
+if ( anyNA( targeted_segmentation_candidate_summary$benchmark_expected_margin )
+) {
+  stop( "At least one targeting-segmentation benchmark could not be constructed." )
+}
+# Backward-compatible age-only diagnostic retained for the dissertation appendix
+# and for comparison with the original Module 6 design.
+targeted_age_candidate_summary <- targeted_segmentation_candidate_summary %>% filter( segmentation_id == "age_band"
+  ) %>% mutate( pricing_age_band = pricing_segment, age_margin_retention = segment_margin_retention,
+    age_conversion_retention = segment_conversion_retention )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 15. COMMON COMMERCIAL FEASIBILITY AND SEGMENTATION-SPECIFIC OPTIMISATION
+validation_technical_premium_total <- sum( validation_data$technical_premium )
+validation_technical_model_margin <- development_technical_row$market_model_expected_underwriting_margin[ 1 ]
+validation_technical_model_conversion_count <- development_technical_row$market_model_expected_new_business[ 1 ]
+neutral_targeted_feasibility <- tibble( check_name = c( "Neutral rate level lower bound",
+      "Neutral rate level upper bound", "Neutral portfolio margin retention", "Neutral conversion retention",
+      "Neutral expected claim-ratio ceiling" ), value = c( development_technical_row$aggregate_rate_level[ 1 ],
+      development_technical_row$aggregate_rate_level[ 1 ], 1, 1,
+      development_technical_row$market_model_claim_ratio[ 1 ] ), required = c( config$targeted_rate_level_lower,
+      config$targeted_rate_level_upper, config$minimum_portfolio_margin_retention,
+      config$minimum_targeted_conversion_retention, config$maximum_admissible_claim_ratio ), direction = c( ">=",
+      "<=", ">=", ">=", "<=" ) ) %>% mutate( pass = case_when( direction == ">=" ~ value >= required - 1e-10,
+        direction == "<=" ~ value <= required + 1e-10, TRUE ~ FALSE ) )
+if ( !all( neutral_targeted_feasibility$pass )
+) {
+  print( neutral_targeted_feasibility, n = Inf )
+  stop( paste( "The neutral targeted strategy is not feasible under the requested",
+      "commercial constraints. The sensitivity case therefore represents",
+      "genuine infeasibility rather than a segmentation-solver issue." ) )
+}
+solve_targeted_segmentation <- function( specification
+) {
+  segmentation_id <- specification$segmentation_id
+  candidate_summary <- targeted_segmentation_candidate_summary %>% filter( .data$segmentation_id ==
+        !!segmentation_id )
+  segment_levels <- validation_segmentation_membership %>% filter( .data$segmentation_id == !!segmentation_id ) %>%
+    distinct( pricing_segment ) %>% arrange( pricing_segment ) %>% pull( pricing_segment )
+  lp_options <- candidate_summary %>% filter( unit_margin_admissible ) %>% arrange( pricing_segment,
+      candidate_multiplier ) %>% mutate( lp_variable_id = row_number() )
+  option_segment_levels <- sort( unique( lp_options$pricing_segment ) )
+  if ( !setequal( segment_levels, option_segment_levels )
+  ) {
+    stop( paste0( "At least one segment has no admissible multiplier for segmentation: ", segmentation_id ) )
+  }
+  neutral_options <- lp_options %>% filter( abs( candidate_multiplier - 1 ) < 1e-12 )
+  if ( nrow( neutral_options ) != length( segment_levels )
+  ) {
+    stop( paste0( "Neutral 1.00 option missing for at least one segment in segmentation: ", segmentation_id ) )
+  }
+  constraint_rows <- list()
+  constraint_directions <- character()
+  constraint_rhs <- numeric()
+  for ( segment_level in segment_levels
+  ) {
+    constraint_rows[[ length( constraint_rows ) + 1L ]] <- as.numeric( lp_options$pricing_segment == segment_level
+      )
+    constraint_directions <- c( constraint_directions, "=" )
+    constraint_rhs <- c( constraint_rhs, 1 )
+  }
+  # Aggregate rate-level lower bound.
+  constraint_rows[[ length( constraint_rows ) + 1L ]] <- lp_options$candidate_premium_total /
+      validation_technical_premium_total
+  constraint_directions <- c( constraint_directions, ">=" )
+  constraint_rhs <- c( constraint_rhs, config$targeted_rate_level_lower )
+  # Aggregate rate-level upper bound.
+  constraint_rows[[ length( constraint_rows ) + 1L ]] <- lp_options$candidate_premium_total /
+      validation_technical_premium_total
+  constraint_directions <- c( constraint_directions, "<=" )
+  constraint_rhs <- c( constraint_rhs, config$targeted_rate_level_upper )
+  # Portfolio model-expected margin preservation.
+  constraint_rows[[ length( constraint_rows ) + 1L ]] <- lp_options$model_expected_underwriting_margin /
+      validation_technical_model_margin
+  constraint_directions <- c( constraint_directions, ">=" )
+  constraint_rhs <- c( constraint_rhs, config$minimum_portfolio_margin_retention )
+  # Portfolio conversion retention.
+  constraint_rows[[ length( constraint_rows ) + 1L ]] <- lp_options$model_expected_conversion_count /
+      validation_technical_model_conversion_count
+  constraint_directions <- c( constraint_directions, ">=" )
+  constraint_rhs <- c( constraint_rhs, config$minimum_targeted_conversion_retention )
+  # Expected claim-ratio ceiling.
+  constraint_rows[[ length( constraint_rows ) + 1L ]] <- ( lp_options$model_expected_claim_cost -
+        config$maximum_admissible_claim_ratio * lp_options$model_expected_written_premium ) /
+      validation_technical_premium_total
+  constraint_directions <- c( constraint_directions, "<=" )
+  constraint_rhs <- c( constraint_rhs, 0 )
+  constraint_matrix <- do.call( rbind, constraint_rows )
+  lp_solution <- lpSolve::lp( direction = "max", objective.in = lp_options$model_expected_conversion_count /
+          validation_technical_model_conversion_count, const.mat = constraint_matrix, const.dir =
+        constraint_directions, const.rhs = constraint_rhs, all.bin = TRUE )
+  if ( lp_solution$status != 0L
+  ) {
+    stop( paste0( "Targeted optimisation failed for segmentation '", segmentation_id,
+        "' after neutral feasibility had been verified. lpSolve status = ", lp_solution$status, "." ) )
+  }
+  selected_rows <- which( lp_solution$solution > 0.5 )
+  selected_options <- lp_options[ selected_rows, ] %>% arrange( pricing_segment )
+  if ( nrow( selected_options ) != length( segment_levels )
+  ) {
+    stop( paste0( "Targeted optimisation did not select exactly one multiplier per segment for ", segmentation_id,
+        "." ) )
+  }
+  selected_metrics <- candidate_summary %>% inner_join( selected_options %>% dplyr::select( pricing_segment,
+          selected_multiplier = candidate_multiplier ), by = "pricing_segment" ) %>% filter( abs(
+        candidate_multiplier - selected_multiplier ) < 1e-12 )
+  total_candidate_premium <- sum( selected_metrics$candidate_premium_total )
+  total_model_margin <- sum( selected_metrics$model_expected_underwriting_margin )
+  total_conversion_count <- sum( selected_metrics$model_expected_conversion_count )
+  total_written_premium <- sum( selected_metrics$model_expected_written_premium )
+  total_claim_cost <- sum( selected_metrics$model_expected_claim_cost )
+  selected_multiplier_table <- selected_metrics %>% transmute( segmentation_id, segmentation_name,
+      segmentation_category, source_variable, pricing_segment, selected_multiplier = candidate_multiplier,
+      development_profiles = profiles, development_mean_estimated_claim_cost = mean_estimated_claim_cost,
+      development_mean_technical_premium = mean_technical_premium, development_model_expected_conversion_rate =
+        model_expected_conversion_rate, development_model_expected_underwriting_margin =
+        model_expected_underwriting_margin, development_model_expected_claim_ratio = model_expected_claim_ratio,
+      development_segment_margin_retention = segment_margin_retention, development_segment_conversion_retention =
+        segment_conversion_retention, development_mean_selected_rank = mean_selected_rank,
+      development_top_three_share = top_three_share )
+  selection_summary <- tibble( segmentation_id = segmentation_id, segmentation_name =
+        specification$segmentation_name, segmentation_category = specification$segmentation_category,
+      source_variable = specification$source_variable, number_segments = length( segment_levels ),
+      minimum_validation_segment_profiles = min( selected_metrics$profiles ), selected_rate_level = safe_divide(
+          total_candidate_premium, validation_technical_premium_total ), selected_portfolio_margin_retention =
+        safe_divide( total_model_margin, validation_technical_model_margin ),
+      selected_minimum_segment_margin_retention = min( selected_metrics$segment_margin_retention ),
+      selected_model_expected_conversion_rate = safe_divide( total_conversion_count, nrow( validation_data ) ),
+      technical_model_expected_conversion_rate = development_technical_row$market_model_expected_conversion_rate[ 1
+        ], selected_model_conversion_retention = safe_divide( total_conversion_count,
+          validation_technical_model_conversion_count ), selected_model_expected_underwriting_margin =
+        total_model_margin, technical_model_expected_underwriting_margin = validation_technical_model_margin,
+      selected_model_expected_claim_ratio = safe_divide( total_claim_cost, total_written_premium ),
+      selected_multiplier_min = min( selected_multiplier_table$selected_multiplier ), selected_multiplier_max =
+        max( selected_multiplier_table$selected_multiplier ), selected_multiplier_mean = mean(
+          selected_multiplier_table$selected_multiplier ), selected_distinct_multipliers = n_distinct(
+          selected_multiplier_table$selected_multiplier ) )
+  list( multipliers = selected_multiplier_table, summary = selection_summary )
+}
+targeted_segmentation_solutions <- purrr::map( eligible_segmentation_specs, solve_targeted_segmentation )
+all_targeted_segmentation_multipliers <- purrr::map_dfr( targeted_segmentation_solutions, "multipliers" )
+targeted_segmentation_comparison <- purrr::map_dfr( targeted_segmentation_solutions, "summary" ) %>% mutate(
+    validation_conversion_uplift = selected_model_expected_conversion_rate -
+        technical_model_expected_conversion_rate, validation_relative_conversion_uplift =
+      selected_model_conversion_retention - 1, validation_rank = min_rank( desc(
+          selected_model_expected_conversion_rate ) ) )
+best_validation_conversion_rate <- max( targeted_segmentation_comparison$selected_model_expected_conversion_rate )
+targeted_segmentation_comparison <- targeted_segmentation_comparison %>% mutate( within_selection_tolerance =
+      selected_model_expected_conversion_rate >= best_validation_conversion_rate -
+          config$targeted_segmentation_selection_tolerance )
+selected_segmentation_row <- targeted_segmentation_comparison %>% filter( within_selection_tolerance ) %>% arrange(
+    number_segments, desc( selected_model_expected_conversion_rate ), desc( selected_portfolio_margin_retention ),
+    segmentation_id ) %>% slice( 1 )
+selected_segmentation_id <- selected_segmentation_row$segmentation_id[ 1 ]
+selected_segmentation_name <- selected_segmentation_row$segmentation_name[ 1 ]
+selected_segmentation_category <- selected_segmentation_row$segmentation_category[ 1 ]
+selected_segmentation_source_variable <- selected_segmentation_row$source_variable[ 1 ]
+selected_segmentation_spec <- eligible_segmentation_specs[[ which( purrr::map_chr( eligible_segmentation_specs,
+        "segmentation_id" ) == selected_segmentation_id )[ 1 ] ]]
+targeted_segmentation_comparison <- targeted_segmentation_comparison %>% mutate( selected_for_test =
+      segmentation_id == selected_segmentation_id ) %>% arrange( validation_rank, number_segments )
+targeting_segment_risk_response_summary <- targeted_segmentation_candidate_summary %>% filter( abs(
+      candidate_multiplier - 1 ) < 1e-12 ) %>% dplyr::select( segmentation_id, segmentation_name,
+    segmentation_category, source_variable, pricing_segment, profiles, mean_estimated_claim_cost,
+    mean_technical_premium, baseline_model_expected_conversion_rate = model_expected_conversion_rate,
+    baseline_model_expected_claim_ratio = model_expected_claim_ratio, baseline_mean_rank = mean_selected_rank,
+    baseline_relative_price_to_cheapest = mean_relative_price_to_cheapest,
+    baseline_relative_price_to_market_median = mean_relative_price_to_market_median ) %>% mutate(
+    estimated_claim_cost_index = safe_divide( mean_estimated_claim_cost, mean(
+          validation_data$estimated_expected_claim_cost ) ), technical_premium_index = safe_divide(
+        mean_technical_premium, mean( validation_data$technical_premium ) ) ) %>% left_join(
+    all_targeted_segmentation_multipliers %>% dplyr::select( segmentation_id, pricing_segment, selected_multiplier,
+        selected_model_expected_conversion_rate = development_model_expected_conversion_rate,
+        selected_model_expected_claim_ratio = development_model_expected_claim_ratio, segment_margin_retention =
+          development_segment_margin_retention, segment_conversion_retention =
+          development_segment_conversion_retention, selected_mean_rank = development_mean_selected_rank,
+        selected_top_three_share = development_top_three_share ), by = c( "segmentation_id", "pricing_segment" )
+  ) %>% left_join( targeted_segmentation_comparison %>% dplyr::select( segmentation_id, validation_rank,
+        selected_for_test ), by = "segmentation_id" ) %>% arrange( validation_rank, segmentation_name,
+    pricing_segment )
+selected_segment_multipliers <- all_targeted_segmentation_multipliers %>% filter( segmentation_id ==
+      selected_segmentation_id ) %>% mutate(
+    # Backward-compatible aliases retained for Module 7/8 collectors. These
+    # columns should not be interpreted as literal age bands unless age_band is
+    # the selected targeting basis.
+    pricing_age_band = if_else( segmentation_id == "age_band", pricing_segment, NA_character_ ),
+    development_age_margin_retention = development_segment_margin_retention, development_age_conversion_retention =
+      development_segment_conversion_retention ) %>% relocate( pricing_age_band, .after = pricing_segment )
+age_segmentation_summary <- targeted_segmentation_comparison %>% filter( segmentation_id == "age_band" )
+if ( nrow( age_segmentation_summary ) != 1L
+) {
+  stop( "Exactly one age-band targeting benchmark must be present." )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 16. SELECTED TARGETING-BASIS DEVELOPMENT SUMMARY
+targeted_strategy_selection_summary <- selected_segmentation_row %>% transmute( selected_segmentation_id =
+      segmentation_id, selected_segmentation_name = segmentation_name, selected_segmentation_category =
+      segmentation_category, selected_source_variable = source_variable, selected_validation_rank =
+      validation_rank, age_band_validation_rank = age_segmentation_summary$validation_rank[ 1 ],
+    selected_number_segments = number_segments, selected_rate_level = selected_rate_level,
+    selected_portfolio_margin_retention = selected_portfolio_margin_retention,
+    selected_minimum_segment_margin_retention = selected_minimum_segment_margin_retention,
+    # Compatibility alias retained because the existing Module 7 collector
+    # expects this field name. It now represents the minimum margin retention
+    # across the selected segmentation, not necessarily age bands.
+    selected_minimum_age_margin_retention = selected_minimum_segment_margin_retention,
+    selected_model_expected_conversion_rate = selected_model_expected_conversion_rate,
+    technical_model_expected_conversion_rate = technical_model_expected_conversion_rate,
+    selected_model_conversion_retention = selected_model_conversion_retention,
+    selected_model_expected_underwriting_margin = selected_model_expected_underwriting_margin,
+    technical_model_expected_underwriting_margin = technical_model_expected_underwriting_margin,
+    selected_model_expected_claim_ratio = selected_model_expected_claim_ratio, selected_multiplier_min =
+      selected_multiplier_min, selected_multiplier_max = selected_multiplier_max, selected_multiplier_mean =
+      selected_multiplier_mean, selected_distinct_multipliers = selected_distinct_multipliers )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 17. SELECTED STRATEGY REGISTER
+strategy_register <- tibble( strategy = c( "Technical-pricing benchmark", "Own-price uniform strategy",
+    "Market-position uniform strategy", "Market-position targeted strategy" ), strategy_type = c( "Uniform",
+    "Uniform", "Uniform", paste0( selected_segmentation_name, " targeted" ) ), selection_model = c(
+    "None: technical premium", "Own-price GLM", selected_model_name, selected_model_name ),
+  selection_model_type = c( "none", "glm", selected_model_type, selected_model_type ), targeting_basis = c(
+    NA_character_, NA_character_, NA_character_, selected_segmentation_id ), uniform_multiplier = c( 1.00,
+    selected_own_price_uniform$multiplier[ 1 ], selected_market_uniform$multiplier[ 1 ], NA_real_ ) )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 18. BUILD TEST STRATEGY CANDIDATES USING ONLY THE VALIDATION-SELECTED BASIS
+# Only now, after validation-only targeting-basis selection is complete, is the
+# selected segmentation mapped onto TEST.
+selected_validation_membership <- validation_segmentation_membership %>% filter( segmentation_id ==
+      selected_segmentation_id )
+selected_test_membership <- tibble( quote_profile_id = test_data$quote_profile_id, pricing_segment =
+    selected_segmentation_spec$transform( test_data[[ selected_segmentation_source_variable ]] ) )
+if ( anyNA( selected_test_membership$pricing_segment )
+) {
+  stop( "The validation-selected targeting basis produced missing segment labels on TEST." )
+}
+unsupported_selected_test_segments <- selected_test_membership %>% distinct( pricing_segment ) %>% anti_join(
+    selected_validation_membership %>% distinct( pricing_segment ), by = "pricing_segment" )
+if ( nrow( unsupported_selected_test_segments ) > 0L
+) {
+  stop( paste0( "The validation-selected targeting basis produced TEST segment(s) not represented in VALIDATION: ",
+      paste( unsupported_selected_test_segments$pricing_segment, collapse = ", " ) ) )
+}
+targeted_test_multiplier <- test_data %>% dplyr::select( quote_profile_id ) %>% left_join(
+    selected_test_membership, by = "quote_profile_id" ) %>% left_join( selected_segment_multipliers %>%
+      dplyr::select( pricing_segment, selected_multiplier ), by = "pricing_segment" ) %>% pull( selected_multiplier
+  )
+if ( anyNA( targeted_test_multiplier )
+) {
+  stop( paste0( "Unable to map all TEST profiles to selected targeted multipliers for segmentation: ",
+      selected_segmentation_id ) )
+}
+test_strategy_candidates <- list( "Technical-pricing benchmark" = construct_candidate_data( base_data = test_data,
+      multiplier = 1 ), "Own-price uniform strategy" = construct_candidate_data( base_data = test_data,
+      multiplier = selected_own_price_uniform$multiplier[ 1 ] ), "Market-position uniform strategy" =
+    construct_candidate_data( base_data = test_data, multiplier = selected_market_uniform$multiplier[ 1 ] ),
+  "Market-position targeted strategy" = construct_candidate_data( base_data = test_data, multiplier =
+        targeted_test_multiplier ) )
+test_strategy_candidates <- purrr::imap( test_strategy_candidates, function( candidate, strategy_name
+    ) {
+      candidate %>% add_candidate_predictions( model_stage = "final" ) %>% mutate( strategy = strategy_name )
+    } )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 19. READ KNOWN MODULE 4 TRUTH AFTER STRATEGY SELECTION
+# The pricing rules above have already been selected. Truth starts here.
+conversion_truth <- safe_read_rds( truth_path )
+alternative_truth <- safe_read_rds( alternative_truth_path )
+demand_metadata <- safe_read_rds( demand_metadata_path )
+assert_columns( conversion_truth, c( "scenario_id", "demand_scenario_id", "policy_id", "quote_profile_id",
+    "policy_year", "technical_data_split", "conversion_data_split", "data_split", "driver_age", "prior_claims_5yr",
+    "true_choice_price_sensitivity" ), "conversion_truth.rds" )
+assert_columns( alternative_truth, c( "scenario_id", "demand_scenario_id", "policy_id", "quote_profile_id",
+    "alternative_id", "is_focal", "alternative_quote", "base_nonprice_utility", "latent_taste_utility" ),
+  "conversion_alternative_truth.rds" )
+truth_test_profiles <- conversion_truth %>% filter( scenario_id == config$market_scenario_id, demand_scenario_id ==
+      config$demand_scenario_id, policy_year == config$expected_policy_year, technical_data_split == "test",
+    conversion_data_split == "test", data_split == conversion_data_split )
+truth_test_alternatives <- alternative_truth %>% filter( scenario_id == config$market_scenario_id,
+    demand_scenario_id == config$demand_scenario_id, quote_profile_id %in% test_data$quote_profile_id )
+if ( nrow( truth_test_profiles ) != nrow( test_data )
+) {
+  stop( "Known-truth TEST profile count does not match the Module 6 TEST sample." )
+}
+if ( !all( test_data$quote_profile_id %in% truth_test_profiles$quote_profile_id )
+) {
+  stop( "Known-truth TEST profiles do not align with Module 6 TEST profiles." )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 20. EXTRACT MODULE 4 DEMAND PARAMETERS
+demand_parameters <- demand_metadata$demand_parameters
+extract_demand_parameter <- function( parameter_name
+) {
+  value <- demand_parameters[[ parameter_name ]]
+  if ( is.null( value ) || length( value ) == 0L
+  ) {
+    stop( paste0( "Demand metadata is missing parameter: ", parameter_name ) )
+  }
+  as.numeric( value[ 1 ] )
+}
+participation_market_price_sensitivity <- extract_demand_parameter( "participation_market_price_sensitivity" )
+rank_salience_scale <- extract_demand_parameter( "rank_salience_scale" )
+price_threshold_ratio <- extract_demand_parameter( "price_threshold_ratio" )
+price_threshold_strength <- extract_demand_parameter( "price_threshold_strength" )
+rank_threshold <- extract_demand_parameter( "rank_threshold" )
+rank_threshold_strength <- extract_demand_parameter( "rank_threshold_strength" )
+participation_intercept <- as.numeric( demand_metadata$participation_intercept )
+focal_brand_constant <- as.numeric( demand_metadata$calibrated_focal_brand_utility )
+portfolio_market_median <- as.numeric( demand_metadata$portfolio_market_median )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 21. TRUE COUNTERFACTUAL CONVERSION FUNCTION
+evaluate_true_counterfactual <- function( candidate_profile_data
+) {
+  candidate_profile_prices <- candidate_profile_data %>% dplyr::select( policy_id, quote_profile_id,
+      candidate_price, estimated_expected_claim_cost )
+  profile_truth_for_candidate <- truth_test_profiles %>% dplyr::select( policy_id, quote_profile_id, driver_age,
+      prior_claims_5yr, true_choice_price_sensitivity ) %>% inner_join( candidate_profile_prices, by = c(
+        "policy_id", "quote_profile_id" ) )
+  alternative_counterfactual <- truth_test_alternatives %>% dplyr::select( policy_id, quote_profile_id,
+      alternative_id, alternative_archetype, is_focal, alternative_quote, base_nonprice_utility,
+      latent_taste_utility ) %>% inner_join( profile_truth_for_candidate %>% dplyr::select( policy_id,
+          quote_profile_id, true_choice_price_sensitivity, candidate_price ), by = c( "policy_id",
+        "quote_profile_id" ) ) %>% mutate( counterfactual_quote = if_else( is_focal, candidate_price,
+          alternative_quote ) ) %>% group_by( policy_id, quote_profile_id ) %>% mutate(
+      counterfactual_cheapest_quote = min( counterfactual_quote ), counterfactual_market_median = median(
+          counterfactual_quote ), counterfactual_rank = rank( counterfactual_quote, ties.method = "first" ),
+      counterfactual_relative_price = safe_divide( counterfactual_quote, counterfactual_cheapest_quote ),
+      smooth_price_utility = -true_choice_price_sensitivity * log( counterfactual_relative_price ),
+      rank_salience_utility = rank_salience_scale * case_when( counterfactual_rank == 1 ~ 0.55,
+            counterfactual_rank == 2 ~ 0.26, counterfactual_rank == 3 ~ 0.10, TRUE ~ 0 ), price_threshold_excess =
+        pmax( counterfactual_relative_price - price_threshold_ratio, 0 ), price_threshold_penalty =
+        price_threshold_strength * ( price_threshold_excess / 0.05 )^2, rank_threshold_excess = pmax(
+          counterfactual_rank - rank_threshold, 0 ), rank_threshold_penalty = rank_threshold_strength *
+          rank_threshold_excess^2, counterfactual_true_utility = base_nonprice_utility + latent_taste_utility +
+        smooth_price_utility + rank_salience_utility - price_threshold_penalty - rank_threshold_penalty + if_else(
+          is_focal, focal_brand_constant, 0 ), utility_maximum = max( counterfactual_true_utility ),
+      choice_numerator = exp( counterfactual_true_utility - utility_maximum ),
+      true_conditional_choice_probability = choice_numerator / sum( choice_numerator ) ) %>% ungroup()
+  focal_choice_truth <- alternative_counterfactual %>% filter( is_focal ) %>% transmute( policy_id,
+      quote_profile_id, true_counterfactual_focal_rank = counterfactual_rank, true_counterfactual_market_median =
+        counterfactual_market_median, true_counterfactual_focal_choice_probability =
+        true_conditional_choice_probability )
+  profile_truth_counterfactual <- profile_truth_for_candidate %>% left_join( focal_choice_truth, by = c(
+        "policy_id", "quote_profile_id" ) ) %>% mutate( participation_market_price_index = log(
+          true_counterfactual_market_median / portfolio_market_median ), participation_age_effect = case_when(
+          driver_age <= 24 ~ -0.12, driver_age <= 34 ~ 0.02, driver_age <= 69 ~ 0.10, driver_age <= 79 ~ 0.02,
+          TRUE ~ -0.06 ), participation_claim_history_effect = 0.035 * pmin( prior_claims_5yr, 3 ),
+      true_counterfactual_market_purchase_probability = clip_probability( plogis( participation_intercept -
+              participation_market_price_sensitivity * participation_market_price_index +
+              participation_age_effect + participation_claim_history_effect ) ),
+      true_counterfactual_focal_conversion_probability = true_counterfactual_market_purchase_probability *
+          true_counterfactual_focal_choice_probability, true_counterfactual_expected_margin =
+        true_counterfactual_focal_conversion_probability * ( candidate_price - estimated_expected_claim_cost ),
+      true_counterfactual_expected_written_premium = true_counterfactual_focal_conversion_probability *
+          candidate_price, true_counterfactual_expected_claim_cost =
+        true_counterfactual_focal_conversion_probability * estimated_expected_claim_cost )
+  if ( nrow( profile_truth_counterfactual ) != nrow( candidate_profile_data ) || any( !is.finite(
+          profile_truth_counterfactual$true_counterfactual_focal_conversion_probability ) )
+  ) {
+    stop( "True counterfactual conversion reconstruction failed." )
+  }
+  profile_truth_counterfactual
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 22. EVALUATE ALL TEST STRATEGIES AGAINST FITTED MODELS AND TRUTH
+test_strategy_profile_results <- purrr::imap_dfr( test_strategy_candidates, function( candidate, strategy_name
+    ) {
+      truth_candidate <- evaluate_true_counterfactual( candidate )
+      candidate %>% dplyr::select( policy_id, quote_profile_id, age_band, technical_premium,
+          estimated_expected_claim_cost, strategy_multiplier, candidate_price, focal_rank,
+          own_price_model_probability, market_model_probability, own_price_expected_margin,
+          market_model_expected_margin, own_price_expected_written_premium, market_model_expected_written_premium,
+          own_price_expected_claim_cost, market_model_expected_claim_cost ) %>% left_join( truth_candidate %>%
+            dplyr::select( policy_id, quote_profile_id, true_counterfactual_focal_rank,
+              true_counterfactual_market_purchase_probability, true_counterfactual_focal_choice_probability,
+              true_counterfactual_focal_conversion_probability, true_counterfactual_expected_margin,
+              true_counterfactual_expected_written_premium, true_counterfactual_expected_claim_cost ), by = c(
+            "policy_id", "quote_profile_id" ) ) %>% mutate( strategy = strategy_name, .before = 1 )
+    } )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 23. TEST STRATEGY COMPARISON
+test_strategy_comparison_base <- test_strategy_profile_results %>% group_by( strategy ) %>% summarise( profiles =
+      n(), mean_multiplier = mean( strategy_multiplier ), aggregate_rate_level = safe_divide( sum( candidate_price
+        ), sum( technical_premium ) ), mean_selected_rank = mean( focal_rank ), top_three_share = mean(
+        focal_rank <= 3 ), own_price_model_expected_conversion_rate = mean( own_price_model_probability ),
+    market_model_expected_conversion_rate = mean( market_model_probability ),
+    own_price_model_expected_new_business = sum( own_price_model_probability ),
+    market_model_expected_new_business = sum( market_model_probability ),
+    own_price_model_expected_underwriting_margin = sum( own_price_expected_margin ),
+    market_model_expected_underwriting_margin = sum( market_model_expected_margin ),
+    own_price_model_expected_written_premium = sum( own_price_expected_written_premium ),
+    market_model_expected_written_premium = sum( market_model_expected_written_premium ),
+    own_price_model_expected_claim_cost = sum( own_price_expected_claim_cost ), market_model_expected_claim_cost =
+      sum( market_model_expected_claim_cost ), own_price_model_claim_ratio = safe_divide(
+        own_price_model_expected_claim_cost, own_price_model_expected_written_premium ), market_model_claim_ratio =
+      safe_divide( market_model_expected_claim_cost, market_model_expected_written_premium ),
+    true_expected_conversion_rate = mean( true_counterfactual_focal_conversion_probability ),
+    true_expected_new_business = sum( true_counterfactual_focal_conversion_probability ),
+    true_expected_underwriting_margin = sum( true_counterfactual_expected_margin ), true_expected_written_premium =
+      sum( true_counterfactual_expected_written_premium ), true_expected_claim_cost = sum(
+        true_counterfactual_expected_claim_cost ), true_expected_claim_ratio = safe_divide(
+        true_expected_claim_cost, true_expected_written_premium ), .groups = "drop" )
+technical_test_reference <- test_strategy_comparison_base %>% filter( strategy == "Technical-pricing benchmark" )
+if ( nrow( technical_test_reference ) != 1L
+) {
+  stop( "Technical benchmark row missing from TEST strategy comparison." )
+}
+test_strategy_comparison <- test_strategy_comparison_base %>% mutate( true_conversion_uplift =
+      true_expected_conversion_rate - technical_test_reference$true_expected_conversion_rate[ 1 ],
+    true_relative_conversion_uplift = safe_divide( true_expected_conversion_rate -
+          technical_test_reference$true_expected_conversion_rate[ 1 ],
+        technical_test_reference$true_expected_conversion_rate[ 1 ] ), true_margin_retention = safe_divide(
+        true_expected_underwriting_margin, technical_test_reference$true_expected_underwriting_margin[ 1 ] ),
+    market_model_conversion_uplift = market_model_expected_conversion_rate -
+        technical_test_reference$market_model_expected_conversion_rate[ 1 ],
+    market_model_relative_conversion_uplift = safe_divide( market_model_expected_conversion_rate -
+          technical_test_reference$market_model_expected_conversion_rate[ 1 ],
+        technical_test_reference$market_model_expected_conversion_rate[ 1 ] ), market_model_margin_retention =
+      safe_divide( market_model_expected_underwriting_margin,
+        technical_test_reference$market_model_expected_underwriting_margin[ 1 ] ),
+    own_price_model_margin_retention = safe_divide( own_price_model_expected_underwriting_margin,
+        technical_test_reference$own_price_model_expected_underwriting_margin[ 1 ] ) ) %>% arrange( match(
+      strategy, c( "Technical-pricing benchmark", "Own-price uniform strategy", "Market-position uniform strategy",
+        "Market-position targeted strategy" ) ) )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 24. SELECTED TARGETING BASIS: HELD-OUT TEST SEGMENT SUMMARY
+targeted_test_segment_summary <- test_strategy_profile_results %>% filter( strategy ==
+      "Market-position targeted strategy" ) %>% left_join( selected_test_membership, by = "quote_profile_id" ) %>%
+  group_by( pricing_segment ) %>% summarise( profiles = n(), selected_multiplier = first( strategy_multiplier ),
+    model_expected_conversion_rate = mean( market_model_probability ), true_expected_conversion_rate = mean(
+        true_counterfactual_focal_conversion_probability ), model_expected_underwriting_margin = sum(
+        market_model_expected_margin ), true_expected_underwriting_margin = sum(
+        true_counterfactual_expected_margin ), model_expected_claim_ratio = safe_divide( sum(
+          market_model_expected_claim_cost ), sum( market_model_expected_written_premium ) ),
+    true_expected_claim_ratio = safe_divide( sum( true_counterfactual_expected_claim_cost ), sum(
+          true_counterfactual_expected_written_premium ) ), mean_selected_rank = mean( focal_rank ),
+    top_three_share = mean( focal_rank <= 3 ), .groups = "drop" ) %>% mutate( segmentation_id =
+      selected_segmentation_id, segmentation_name = selected_segmentation_name, source_variable =
+      selected_segmentation_source_variable ) %>% relocate( segmentation_id, segmentation_name, source_variable,
+    pricing_segment )
+# Backward-compatible age-band output is retained only when age is the selected
+# targeting basis. The generic selected-segment summary above is authoritative.
+targeted_test_age_summary <- if ( identical( selected_segmentation_id, "age_band" )
+  ) {
+    targeted_test_segment_summary %>% mutate( pricing_age_band = pricing_segment ) %>% relocate( pricing_age_band,
+        .after = source_variable )
+  } else {
+    tibble()
+  }
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 25. OPTIONAL AUDIT-ONLY EQUITY SUMMARY
+# driver_sex_audit was deliberately excluded from all Module 2-6 model fitting
+# and pricing selection. If Module 1 full truth is available, it is joined only
+# now for a descriptive post-selection audit.
+targeted_strategy_equity_audit <- tibble()
+if ( file.exists( config$module1_truth_file )
+) {
+  module1_truth <- safe_read_rds( config$module1_truth_file, description = "Module 1 full truth audit file" )
+  if ( all( c( "policy_id", "driver_sex_audit" ) %in% names( module1_truth ) )
+  ) {
+    module1_truth_2025 <- module1_truth
+    if ( "policy_year" %in% names( module1_truth_2025 )
+    ) {
+      module1_truth_2025 <- module1_truth_2025 %>% filter( as.integer( policy_year ) == config$expected_policy_year
+        )
+    }
+    targeted_strategy_equity_audit <- test_strategy_profile_results %>% filter( strategy ==
+          "Market-position targeted strategy" ) %>% left_join( module1_truth_2025 %>% dplyr::select( policy_id,
+            driver_sex_audit ), by = "policy_id" ) %>% group_by( driver_sex_audit ) %>% summarise( profiles = n(),
+        mean_selected_multiplier = mean( strategy_multiplier ), aggregate_rate_level = safe_divide( sum(
+              candidate_price ), sum( technical_premium ) ), model_expected_conversion_rate = mean(
+            market_model_probability ), true_expected_conversion_rate = mean(
+            true_counterfactual_focal_conversion_probability ), model_expected_underwriting_margin_per_quote =
+          mean( market_model_expected_margin ), true_expected_underwriting_margin_per_quote = mean(
+            true_counterfactual_expected_margin ), mean_selected_rank = mean( focal_rank ), .groups = "drop" )
+  }
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 26. PRICING VALIDATION CHECKS
+targeted_test_row <- test_strategy_comparison %>% filter( strategy == "Market-position targeted strategy" )
+technical_test_row <- test_strategy_comparison %>% filter( strategy == "Technical-pricing benchmark" )
+selected_number_segments <- targeted_strategy_selection_summary$selected_number_segments[ 1 ]
+selected_validation_membership <- validation_segmentation_membership %>% filter( segmentation_id ==
+      selected_segmentation_id )
+selected_validation_segment_counts <- selected_validation_membership %>% count( pricing_segment, name = "profiles"
+  )
+# Commercial validation uses a small numerical tolerance where a constraint
+# boundary can be represented as 0.999999999999999 rather than exactly 1.00.
+# This does not relax the economic constraint; it only prevents floating-point
+# representation from creating a false failure.
+pricing_validation_checks <- tribble( ~check_name, ~observed_value, ~lower_bound, ~upper_bound, ~pass,
+  "Pricing input rows", nrow( pricing_data ), config$expected_profiles, config$expected_profiles, nrow(
+    pricing_data ) == config$expected_profiles, "Policy year is 2025 only", as.numeric( all(
+      pricing_data$policy_year == config$expected_policy_year ) ), 1, 1, all( pricing_data$policy_year ==
+      config$expected_policy_year ), "Technical-pricing provenance is TEST only", as.numeric( all(
+      pricing_data$technical_data_split == "test" ) ), 1, 1, all( pricing_data$technical_data_split == "test" ),
+  "Conversion TRAIN rows", pricing_split_count( "train" ), config$expected_conversion_train_rows,
+  config$expected_conversion_train_rows, pricing_split_count( "train" ) == config$expected_conversion_train_rows,
+  "Conversion VALIDATION rows", nrow( validation_data ), config$expected_conversion_validation_rows,
+  config$expected_conversion_validation_rows, nrow( validation_data ) ==
+    config$expected_conversion_validation_rows, "Conversion TEST rows", nrow( test_data ),
+  config$expected_conversion_test_rows, config$expected_conversion_test_rows, nrow( test_data ) ==
+    config$expected_conversion_test_rows, "data_split matches conversion_data_split", as.numeric( all(
+      pricing_data$data_split == pricing_data$conversion_data_split ) ), 1, 1, all( pricing_data$data_split ==
+      pricing_data$conversion_data_split ),
+  "Forbidden current-outcome or latent fields absent from prepared predictors", length( forbidden_prepared_columns
+  ), 0, 0, length( forbidden_prepared_columns ) == 0L, "Module 5 development predictions contain no TEST rows",
+  sum( as.character( development_predictions$conversion_data_split ) == "test" ), 0, 0, !any( as.character(
+      development_predictions$conversion_data_split ) == "test" ), "Module 6 TEST working table is outcome-blind",
+  as.numeric( !"focal_conversion" %in% names( test_data ) ), 1, 1, !"focal_conversion" %in% names( test_data ),
+  "Final Module 5 GLM/GAM version", as.numeric( identical( as.character( selected_model_metadata$module_version ),
+      expected_module5_version ) ), 1, 1, identical( as.character( selected_model_metadata$module_version ),
+    expected_module5_version ), "Final Module 5 model-family scope is GLM/GAM only", as.numeric( setequal(
+      as.character( selected_model_metadata$model_family_scope ), expected_module5_families ) && length(
+        selected_model_metadata$model_family_scope ) == 2L ), 1, 1, setequal( as.character(
+      selected_model_metadata$model_family_scope ), expected_module5_families ) && length(
+      selected_model_metadata$model_family_scope ) == 2L, "Final Module 5 six-model candidate register",
+  as.numeric( identical( as.character( selected_model_metadata$candidate_models ), expected_module5_candidates ) ),
+  1, 1, identical( as.character( selected_model_metadata$candidate_models ), expected_module5_candidates ),
+  "Selected conversion model type supported", as.numeric( selected_model_type %in% c( "glm", "gam" ) ), 1, 1,
+  selected_model_type %in% c( "glm", "gam" ), "Vehicle specifications retained from Module 5", as.numeric( all(
+      pricing_vehicle_specification_audit %>% dplyr::select( valid_engine_capacity_share,
+          valid_cylinder_count_share, positive_power_share, positive_torque_share, positive_unladen_weight_share,
+          nonblank_transmission_share ) %>% unlist( use.names = FALSE ) == 1 ) ), 1, 1, all(
+    pricing_vehicle_specification_audit %>% dplyr::select( valid_engine_capacity_share, valid_cylinder_count_share,
+        positive_power_share, positive_torque_share, positive_unladen_weight_share, nonblank_transmission_share
+      ) %>% unlist( use.names = FALSE ) == 1 ), "Original focal quote reconstructed from Module 3",
+  prediction_interface_reconstruction$max_absolute_difference[ prediction_interface_reconstruction$model ==
+      "Original focal quote" ][ 1 ], 0, 1e-8, prediction_interface_reconstruction$max_absolute_difference[
+    prediction_interface_reconstruction$model == "Original focal quote" ][ 1 ] <= 1e-8,
+  "Own-price original-quote reconstruction matches Module 5",
+  prediction_interface_reconstruction$max_absolute_difference[ prediction_interface_reconstruction$model ==
+      "Own-price GLM" ][ 1 ], 0, 1e-8, prediction_interface_reconstruction$max_absolute_difference[
+    prediction_interface_reconstruction$model == "Own-price GLM" ][ 1 ] <= 1e-8,
+  "Selected-model original-quote reconstruction matches Module 5",
+  prediction_interface_reconstruction$max_absolute_difference[ prediction_interface_reconstruction$model ==
+      selected_model_name ][ 1 ], 0, 1e-8, prediction_interface_reconstruction$max_absolute_difference[
+    prediction_interface_reconstruction$model == selected_model_name ][ 1 ] <= 1e-8,
+  "Neutral targeted strategy satisfies all commercial constraints", as.numeric( all(
+      neutral_targeted_feasibility$pass ) ), 1, 1, all( neutral_targeted_feasibility$pass ),
+  "At least two targeting bases eligible", length( eligible_segmentation_specs ), 2, Inf, length(
+    eligible_segmentation_specs ) >= 2, "Age-band targeting benchmark eligible", as.numeric( "age_band" %in%
+      targeted_segmentation_comparison$segmentation_id ), 1, 1, "age_band" %in%
+    targeted_segmentation_comparison$segmentation_id, "Exactly one targeting basis selected for TEST", sum(
+    targeted_segmentation_comparison$selected_for_test ), 1, 1, sum(
+    targeted_segmentation_comparison$selected_for_test ) == 1,
+  "Selected targeting basis uses validation-defined segments on all TEST rows", nrow( selected_test_membership ),
+  nrow( test_data ), nrow( test_data ), nrow( selected_test_membership ) == nrow( test_data ) && !anyNA(
+        selected_test_membership$pricing_segment ),
+  "Selected targeting basis has sufficient validation profiles per segment", min(
+    selected_validation_segment_counts$profiles ), config$minimum_targeted_segment_profiles, Inf, min(
+    selected_validation_segment_counts$profiles ) >= config$minimum_targeted_segment_profiles,
+  "Technical benchmark multiplier", technical_test_row$mean_multiplier[ 1 ], 1, 1, abs(
+    technical_test_row$mean_multiplier[ 1 ] - 1 ) < 1e-12, "Own-price selected multiplier inside support",
+  selected_own_price_uniform$multiplier[ 1 ], config$multiplier_lower, config$multiplier_upper,
+  selected_own_price_uniform$multiplier[ 1 ] >= config$multiplier_lower && selected_own_price_uniform$multiplier[ 1
+  ] <= config$multiplier_upper, "Market-uniform selected multiplier inside support",
+  selected_market_uniform$multiplier[ 1 ], config$multiplier_lower, config$multiplier_upper,
+  selected_market_uniform$multiplier[ 1 ] >= config$multiplier_lower && selected_market_uniform$multiplier[ 1 ] <=
+    config$multiplier_upper, "Targeted multipliers inside support", mean(
+    selected_segment_multipliers$selected_multiplier >= config$multiplier_lower &
+      selected_segment_multipliers$selected_multiplier <= config$multiplier_upper ), 1, 1, all(
+    selected_segment_multipliers$selected_multiplier >= config$multiplier_lower &
+      selected_segment_multipliers$selected_multiplier <= config$multiplier_upper ),
+  "Exactly one targeted multiplier per selected segment", nrow( selected_segment_multipliers ),
+  selected_number_segments, selected_number_segments, nrow( selected_segment_multipliers ) ==
+    selected_number_segments && n_distinct( selected_segment_multipliers$pricing_segment ) ==
+        selected_number_segments, "Targeted development rate level",
+  targeted_strategy_selection_summary$selected_rate_level[ 1 ], config$targeted_rate_level_lower,
+  config$targeted_rate_level_upper, targeted_strategy_selection_summary$selected_rate_level[ 1 ] >=
+    config$targeted_rate_level_lower && targeted_strategy_selection_summary$selected_rate_level[ 1 ] <=
+    config$targeted_rate_level_upper, "Targeted development portfolio margin retention",
+  targeted_strategy_selection_summary$selected_portfolio_margin_retention[ 1 ],
+  config$minimum_portfolio_margin_retention, Inf,
+  targeted_strategy_selection_summary$selected_portfolio_margin_retention[ 1 ] >=
+    config$minimum_portfolio_margin_retention, "Targeted minimum selected-segment margin retention",
+  targeted_strategy_selection_summary$selected_minimum_segment_margin_retention[ 1 ],
+  config$minimum_unit_margin_retention, Inf,
+  targeted_strategy_selection_summary$selected_minimum_segment_margin_retention[ 1 ] >=
+    config$minimum_unit_margin_retention, "Targeted development expected claim ratio",
+  targeted_strategy_selection_summary$selected_model_expected_claim_ratio[ 1 ], 0,
+  config$maximum_admissible_claim_ratio, targeted_strategy_selection_summary$selected_model_expected_claim_ratio[ 1
+  ] <= config$maximum_admissible_claim_ratio, "Targeted development conversion retention",
+  targeted_strategy_selection_summary$selected_model_conversion_retention[ 1 ],
+  config$minimum_targeted_conversion_retention, Inf,
+  targeted_strategy_selection_summary$selected_model_conversion_retention[ 1 ] >=
+    config$minimum_targeted_conversion_retention - 1e-10, "All TEST strategy true probabilities finite", mean(
+    is.finite( test_strategy_profile_results$true_counterfactual_focal_conversion_probability ) ), 1, 1, all(
+    is.finite( test_strategy_profile_results$true_counterfactual_focal_conversion_probability ) ),
+  "All TEST strategy fitted probabilities finite", mean( is.finite(
+      test_strategy_profile_results$market_model_probability ) & is.finite(
+        test_strategy_profile_results$own_price_model_probability ) ), 1, 1, all( is.finite(
+      test_strategy_profile_results$market_model_probability ) & is.finite(
+        test_strategy_profile_results$own_price_model_probability ) ), "Four required TEST strategies produced",
+  nrow( test_strategy_comparison ), 4, 4, nrow( test_strategy_comparison ) == 4 )
+# Recompute all numerical validation decisions from their reported bounds using
+# one consistent floating-point tolerance. This prevents values such as
+# 0.999999999999999 from failing a 1.00 boundary while preserving the stated
+# commercial constraint itself.
+pricing_validation_checks <- pricing_validation_checks %>% mutate( numerical_tolerance = 1e-10 * pmax( 1, abs(
+            observed_value ), if_else( is.finite( lower_bound ), abs( lower_bound ), 0 ), if_else( is.finite(
+              upper_bound ), abs( upper_bound ), 0 ) ), pass = is.finite( observed_value ) & ( !is.finite(
+            lower_bound ) | observed_value >= lower_bound - numerical_tolerance ) & ( !is.finite( upper_bound ) |
+            observed_value <= upper_bound + numerical_tolerance ) ) %>% dplyr::select( -numerical_tolerance )
+if ( any( !pricing_validation_checks$pass )
+) {
+  failed_pricing_checks <- pricing_validation_checks %>% filter( !pass ) %>% pull( check_name )
+  readr::write_csv( pricing_validation_checks, file.path( config$output_dir, "pricing_validation_checks.csv" ) )
+  stop( paste0( "Module 6 pricing validation failed: ", paste( failed_pricing_checks, collapse = "; " ) ) )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 27. WRITE OUTPUTS
+readr::write_csv( pricing_sample_architecture, file.path( config$output_dir, "pricing_sample_architecture.csv" ) )
+readr::write_csv( probability_calibration, file.path( config$output_dir, "probability_recalibration.csv" ) )
+readr::write_csv( selected_model_interface, file.path( config$output_dir, "selected_conversion_model_interface.csv"
+  ) )
+readr::write_csv( pricing_vehicle_specification_audit, file.path( config$output_dir,
+    "pricing_vehicle_specification_audit.csv" ) )
+readr::write_csv( neutral_targeted_feasibility, file.path( config$output_dir, "neutral_targeted_feasibility.csv" )
+)
+readr::write_csv( prediction_interface_reconstruction, file.path( config$output_dir,
+    "prediction_interface_reconstruction.csv" ) )
+readr::write_csv( development_uniform_grid, file.path( config$output_dir, "development_uniform_multiplier_grid.csv"
+  ) )
+# Full one-variable-at-a-time targeting audit.
+readr::write_csv( targeted_segmentation_register, file.path( config$output_dir,
+    "targeted_segmentation_register.csv" ) )
+readr::write_csv( targeted_segmentation_definitions, file.path( config$output_dir,
+    "targeted_segmentation_definitions.csv" ) )
+readr::write_csv( omitted_targeting_candidates, file.path( config$output_dir, "omitted_targeting_candidates.csv" )
+)
+readr::write_csv( targeted_segmentation_candidate_summary, file.path( config$output_dir,
+    "segment_multiplier_response_curves.csv" ) )
+readr::write_csv( targeted_segmentation_comparison, file.path( config$output_dir,
+    "targeted_segmentation_comparison.csv" ) )
+readr::write_csv( all_targeted_segmentation_multipliers, file.path( config$output_dir,
+    "all_targeted_segmentation_multipliers.csv" ) )
+readr::write_csv( targeting_segment_risk_response_summary, file.path( config$output_dir,
+    "targeting_segment_risk_response_summary.csv" ) )
+# Retain the original age-band response table as a transparent benchmark.
+readr::write_csv( targeted_age_candidate_summary, file.path( config$output_dir,
+    "development_targeted_age_candidates.csv" ) )
+# Backward-compatible primary output name used by Module 7/8. The rows now
+# correspond to whichever segmentation basis was selected on validation.
+readr::write_csv( selected_segment_multipliers, file.path( config$output_dir, "selected_segment_multipliers.csv" )
+)
+readr::write_csv( targeted_strategy_selection_summary, file.path( config$output_dir,
+    "targeted_strategy_selection_summary.csv" ) )
+readr::write_csv( strategy_register, file.path( config$output_dir, "strategy_register.csv" ) )
+readr::write_csv( test_strategy_comparison, file.path( config$output_dir, "test_strategy_comparison.csv" ) )
+readr::write_csv( test_strategy_profile_results, file.path( config$output_dir, "test_strategy_profile_results.csv"
+  ) )
+readr::write_csv( targeted_test_segment_summary, file.path( config$output_dir, "targeted_test_segment_summary.csv"
+  ) )
+if ( nrow( targeted_test_age_summary ) > 0L
+) {
+  readr::write_csv( targeted_test_age_summary, file.path( config$output_dir, "targeted_test_age_summary.csv" ) )
+}
+if ( nrow( targeted_strategy_equity_audit ) > 0L
+) {
+  readr::write_csv( targeted_strategy_equity_audit, file.path( config$output_dir,
+      "targeted_strategy_equity_audit.csv" ) )
+}
+readr::write_csv( pricing_validation_checks, file.path( config$output_dir, "pricing_validation_checks.csv" ) )
+saveRDS( list( config = config, module_version = "M6-GLMGAM-OOT-2026-09-18", module5_version = as.character(
+        selected_model_metadata$module_version ), conversion_model_family_scope = as.character(
+        selected_model_metadata$model_family_scope ), conversion_candidate_models = as.character(
+        selected_model_metadata$candidate_models ), selected_conversion_model_type = selected_model_type,
+    quote_market_policy_year = config$expected_policy_year, quote_market_profiles = config$expected_profiles,
+    technical_data_split = "test", conversion_split_counts = c( train = config$expected_conversion_train_rows,
+        validation = config$expected_conversion_validation_rows, test = config$expected_conversion_test_rows ),
+    pricing_rule_selection_sample = "conversion VALIDATION only (2,000)", pricing_rule_evaluation_sample =
+      "conversion TEST only (2,000)", selected_conversion_model = selected_model_name,
+    own_price_uniform_multiplier = selected_own_price_uniform$multiplier[ 1 ], market_uniform_multiplier =
+      selected_market_uniform$multiplier[ 1 ], selected_targeting_basis = list( segmentation_id =
+          selected_segmentation_id, segmentation_name = selected_segmentation_name, segmentation_category =
+          selected_segmentation_category, source_variable = selected_segmentation_source_variable ),
+    selected_segment_multipliers = selected_segment_multipliers, targeted_segmentation_comparison =
+      targeted_segmentation_comparison, targeted_strategy_selection_summary = targeted_strategy_selection_summary,
+    probability_calibration = probability_calibration, truth_used_for_strategy_selection = FALSE,
+    test_outcome_used_for_strategy_selection = FALSE ), file.path( config$output_dir,
+    "pricing_strategy_metadata.rds" ) )
+cat( "\nModule 6 sample architecture:\n" )
+print( pricing_sample_architecture, n = Inf )
+cat( "\nSelected Module 5 conversion model: ", selected_model_name, " (", selected_model_type, ")\n", sep = "" )
+cat( "Pricing-rule selection: 2,000-row conversion VALIDATION only\n" )
+cat( "Pricing-rule evaluation: 2,000-row conversion TEST only; TEST outcome excluded\n" )
+cat( "Module 4 latent truth used for strategy selection: FALSE\n" )
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 28. DIAGNOSTIC PLOTS
+if ( isTRUE( config$write_plots )
+) {
+  p_uniform_frontier <- development_uniform_grid %>% ggplot( aes( x = market_model_expected_conversion_rate, y =
+          market_model_expected_underwriting_margin, label = multiplier ) ) + geom_line() + geom_point() +
+    geom_text( check_overlap = TRUE, vjust = -0.5 ) + labs( x = "Validation model-expected conversion rate",
+      y = "Validation expected underwriting margin", title = "Uniform multiplier profit-conversion frontier" ) +
+    theme_minimal()
+  ggsave( file.path( config$output_dir, "01_uniform_profit_conversion_frontier.png" ), p_uniform_frontier,
+    width = 8, height = 5, dpi = 300 )
+  p_selected_multipliers <- selected_segment_multipliers %>% ggplot( aes( x = reorder( pricing_segment,
+            selected_multiplier ), y = selected_multiplier ) ) + geom_col() + geom_hline( yintercept = 1,
+      linetype = 2 ) + coord_flip() + labs( x = selected_segmentation_name,
+      y = "Selected technical-premium multiplier", title = paste0( "Selected targeted multipliers: ",
+          selected_segmentation_name ) ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "02_selected_targeted_segment_multipliers.png" ), p_selected_multipliers,
+    width = 9, height = 5.5, dpi = 300 )
+  p_selected_conversion_response <- targeted_segmentation_candidate_summary %>% filter( segmentation_id ==
+        selected_segmentation_id ) %>% ggplot( aes( x = candidate_multiplier, y = model_expected_conversion_rate,
+        group = pricing_segment, linetype = pricing_segment ) ) + geom_line() + geom_vline( xintercept = 1,
+      linetype = 2 ) + labs( x = "Technical-premium multiplier", y = "Validation model-expected conversion rate",
+      linetype = selected_segmentation_name, title = paste0( "Price-response curves: ", selected_segmentation_name
+        ) ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "03_selected_segment_conversion_response.png" ),
+    p_selected_conversion_response, width = 9, height = 5.5, dpi = 300 )
+  p_segmentation_comparison <- targeted_segmentation_comparison %>% ggplot( aes( x = reorder( segmentation_name,
+            selected_model_conversion_retention ), y = selected_model_conversion_retention, shape =
+          selected_for_test ) ) + geom_point( size = 2.6 ) + geom_hline( yintercept = 1, linetype = 2 ) +
+    coord_flip() + labs( x = NULL, y = "Validation conversion retention vs technical benchmark",
+      shape = "Selected", title = "Targeting-basis comparison on validation data" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "04_targeted_segmentation_comparison.png" ), p_segmentation_comparison,
+    width = 9, height = 7, dpi = 300 )
+  p_true_strategy_conversion <- test_strategy_comparison %>% ggplot( aes( x = reorder( strategy,
+            true_expected_conversion_rate ), y = true_expected_conversion_rate ) ) + geom_col() + coord_flip() +
+    labs( x = NULL, y = "Known true expected conversion rate",
+      title = "True counterfactual conversion by pricing strategy" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "05_true_conversion_by_strategy.png" ), p_true_strategy_conversion,
+    width = 9, height = 5, dpi = 300 )
+  p_true_margin_retention <- test_strategy_comparison %>% ggplot( aes( x = reorder( strategy, true_margin_retention
+          ), y = true_margin_retention ) ) + geom_col() + geom_hline( yintercept = 1, linetype = 2 ) +
+    coord_flip() + labs( x = NULL, y = "True expected margin retention",
+      title = "True underwriting-margin retention by strategy" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "06_true_margin_retention_by_strategy.png" ), p_true_margin_retention,
+    width = 9, height = 5, dpi = 300 )
+}
+```
+
+
+```{r module-6-pricing-optimisation, message=FALSE, warning=TRUE}
+# 29. PRINT KEY RESULTS
+cat( "\n", "============================================================\n", "MODULE 6 COMPLETE\n",
+  "============================================================\n", sep = "" )
+cat( "\nSelected conversion model: ", selected_model_name, " [", selected_model_type, "]\n", sep = "" )
+cat( "\nOriginal-quote prediction-interface reconstruction against Module 5:\n" )
+print( prediction_interface_reconstruction, n = Inf )
+cat( "\nDevelopment-only probability recalibration:\n" )
+print( probability_calibration, n = Inf )
+cat( "\nSelected uniform multipliers:\n" )
+print( tibble( strategy = c( "Own-price uniform strategy", "Market-position uniform strategy" ), multiplier = c(
+      selected_own_price_uniform$multiplier[ 1 ], selected_market_uniform$multiplier[ 1 ] ) ) )
+cat( "\nTargeting-basis validation comparison:\n" )
+print( targeted_segmentation_comparison, n = Inf )
+cat( "\nSelected targeting basis: ", selected_segmentation_name, " [", selected_segmentation_id, "]\n", sep = "" )
+cat( "\nSelected targeted segment multipliers:\n" )
+print( selected_segment_multipliers, n = Inf )
+cat( "\nTargeted development selection summary:\n" )
+print( targeted_strategy_selection_summary, n = Inf )
+cat( "\nOmitted or ineligible targeting candidates:\n" )
+print( omitted_targeting_candidates, n = Inf )
+cat( "\nHeld-out TEST strategy comparison:\n" )
+print( test_strategy_comparison, n = Inf )
+cat( "\nPricing validation checks:\n" )
+print( pricing_validation_checks, n = Inf )
+cat( "\nPrimary Module 7 files:\n", file.path( config$output_dir, "test_strategy_comparison.csv" ), "\n",
+  file.path( config$output_dir, "selected_segment_multipliers.csv" ), "\n", file.path( config$output_dir,
+    "targeted_strategy_selection_summary.csv" ), "\n", file.path( config$output_dir,
+    "pricing_validation_checks.csv" ), "\n", sep = "" )
+```

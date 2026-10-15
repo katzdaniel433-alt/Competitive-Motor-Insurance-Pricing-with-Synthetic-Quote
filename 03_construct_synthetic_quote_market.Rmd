@@ -1,0 +1,680 @@
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# Generate reference and competing insurer quotations for the 2025 cohort.
+# Competitive position is calculated from returned quotation prices.
+
+required_packages <- c( "tidyverse" )
+missing_packages <- required_packages[ !required_packages %in% rownames( installed.packages() ) ]
+if ( length( missing_packages ) > 0L
+) {
+  stop( paste0( "Install the following packages before running Module 3: ", paste( missing_packages,
+        collapse = ", " ) ) )
+}
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+options( dplyr.summarise.inform = FALSE, scipen = 999 )
+config <- list( input_file = file.path( "outputs", "technical_pricing", "technical_pricing_profiles.csv" ),
+  module2_validation_file = file.path( "outputs", "technical_pricing", "technical_pricing_validation_checks.csv" ),
+  output_dir = file.path("outputs", "quote_market"),
+  scenarios_to_run = c("baseline"),
+  # Frozen Module 2 -> Module 3 handoff.
+  expected_policy_year = 2025L, expected_profiles = 10000L,
+  # Independent split for downstream conversion-model development.
+  conversion_split_seed = 20260909L, conversion_train_share = 0.60, conversion_validation_share = 0.20,
+  conversion_test_share = 0.20, focal_seed = 20260817L, competitor_seed_base = 20260900L,
+  focal_multiplier_lower = 0.95, focal_multiplier_upper = 1.05, competitor_multiplier_lower = 0.75,
+  competitor_multiplier_upper = 1.35, minimum_returned_competitors = 2L,
+  # Identification diagnostic:
+  # observable risk variables should explain very little of the commercial
+  # adjustment log(focal_quote / technical_premium).
+  maximum_focal_adjustment_r_squared = 0.05, write_plots = TRUE )
+dir.create(
+  config$output_dir, recursive = TRUE, showWarnings = FALSE )
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 1. UTILITY FUNCTIONS
+safe_divide <- function( numerator, denominator
+) {
+  ifelse( is.na( denominator ) | denominator == 0, NA_real_, numerator / denominator )
+}
+check_required_columns <- function( data, required_columns, data_name
+) {
+  missing_columns <- setdiff( required_columns, names( data ) )
+  if ( length( missing_columns ) > 0L
+  ) {
+    stop( paste0( data_name, " is missing required columns: ", paste( missing_columns, collapse = ", " ) ) )
+  }
+}
+check_finite_numeric_columns <- function( data, columns, data_name
+) {
+  invalid_columns <- columns[ purrr::map_lgl( columns, ~ any( !is.finite( data[[.x]] ) ) ) ]
+  if ( length( invalid_columns ) > 0L
+  ) {
+    stop( paste0( data_name, " contains non-finite values in: ", paste( invalid_columns, collapse = ", " ) ) )
+  }
+}
+clamp <- function( x, lower, upper
+) {
+  pmin( pmax( x, lower ), upper )
+}
+scenario_seed <- function( scenario_id
+) {
+  scenario_offsets <- c( baseline = 1L, high_competition = 2L, low_competition = 3L, fragmented_market = 4L )
+  if ( !scenario_id %in% names( scenario_offsets )
+  ) {
+    stop( paste0( "No random-number seed registered for scenario: ", scenario_id ) )
+  }
+  config$competitor_seed_base + unname( scenario_offsets[ scenario_id ] )
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 2. READ AND VALIDATE MODULE 2 PRICING PROFILES
+# Module 2 validation is mandatory.
+if (!file.exists(config$module2_validation_file)) {
+  stop( "Missing Module 2 validation file: ", config$module2_validation_file, ". Run the revised Module 2 first." )
+}
+module2_validation_checks <- readr::read_csv( config$module2_validation_file, show_col_types = FALSE )
+check_required_columns( module2_validation_checks, c("check_name", "pass"),
+  "technical_pricing_validation_checks.csv" )
+failed_module2_checks <- if ("required_for_progress" %in% names(module2_validation_checks)) {
+  module2_validation_checks %>% filter(required_for_progress, !pass)
+} else {
+  module2_validation_checks %>% filter(!pass)
+}
+if (nrow(failed_module2_checks) > 0L) {
+  stop( "Module 2 contains failed validation checks: ", paste(failed_module2_checks$check_name, collapse = "; ") )
+}
+# Where the revised Module 2 handoff checks are present, require them explicitly.
+module2_handoff_check_names <- c( "Canonical Module 3 pricing-profile rows",
+  "Canonical Module 3 profile contains 2025 only", "Canonical Module 3 profile contains TEST split only",
+  "Current-year outcomes absent from Module 3 profile", "Truth/latent variables absent from Module 3 profile" )
+available_handoff_checks <- module2_validation_checks %>% filter(check_name %in% module2_handoff_check_names)
+if ( nrow(available_handoff_checks) > 0L && any(!available_handoff_checks$pass)
+) {
+  stop( "Module 2 downstream handoff checks failed: ", paste(
+      available_handoff_checks$check_name[!available_handoff_checks$pass], collapse = "; " ) )
+}
+if (!file.exists(config$input_file)) {
+  stop( paste0( "Missing Module 2 pricing-profile file: ", config$input_file, ". Run the revised Module 2 first." )
+  )
+}
+pricing_profiles <- readr::read_csv( config$input_file, show_col_types = FALSE )
+required_columns <- c( "policy_id", "quote_profile_id", "policy_year", "data_split", "state", "remoteness_area",
+  "driver_age", "licence_years", "vehicle_age", "vehicle_segment", "motive_power", "engine_capacity_l",
+  "cylinder_count", "power_kw", "torque_nm", "unladen_weight_kg", "transmission", "vehicle_value", "annual_km",
+  "voluntary_excess", "exposure", "prior_claims_5yr", "claim_free_years", "estimated_claim_frequency",
+  "estimated_claim_severity", "estimated_expected_claim_cost", "technical_loading", "technical_premium" )
+check_required_columns( pricing_profiles, required_columns, "technical_pricing_profiles.csv" )
+if (nrow(pricing_profiles) != config$expected_profiles) {
+  stop( "Module 3 requires exactly ", config$expected_profiles, " 2025 quote profiles from Module 2; observed ",
+    nrow(pricing_profiles), "." )
+}
+if (anyDuplicated(pricing_profiles$policy_id) > 0L) {
+  stop("policy_id is not unique in technical_pricing_profiles.csv.")
+}
+if (anyDuplicated(pricing_profiles$quote_profile_id) > 0L) {
+  stop("quote_profile_id is not unique in technical_pricing_profiles.csv.")
+}
+pricing_profiles <- pricing_profiles %>% mutate( policy_year = as.integer(policy_year),
+    data_split = tolower(trimws(as.character(data_split))) )
+if (!all(pricing_profiles$policy_year == config$expected_policy_year)) {
+  stop( "Module 3 must receive the 2025 out-of-time technical-pricing cohort only." )
+}
+if (!all(pricing_profiles$data_split == "test")) {
+  stop( paste( "The Module 2 handoff must contain technical-pricing TEST rows only.", "Observed labels:",
+      paste(sort(unique(pricing_profiles$data_split)), collapse = ", ") ) )
+}
+numeric_pricing_fields <- c( "estimated_claim_frequency", "estimated_claim_severity",
+  "estimated_expected_claim_cost", "technical_loading", "technical_premium" )
+check_finite_numeric_columns( pricing_profiles, numeric_pricing_fields, "technical_pricing_profiles.csv" )
+if ( any(pricing_profiles$estimated_claim_frequency <= 0) || any(pricing_profiles$estimated_claim_severity <= 0) ||
+    any(pricing_profiles$estimated_expected_claim_cost <= 0) || any(pricing_profiles$technical_premium <= 0)
+) {
+  stop( paste( "Estimated frequency, severity, expected claims cost and technical premium",
+      "must all be strictly positive." ) )
+}
+vehicle_spec_numeric_fields <- c( "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm",
+  "unladen_weight_kg" )
+check_finite_numeric_columns( pricing_profiles, vehicle_spec_numeric_fields, "technical_pricing_profiles.csv" )
+if ( any(pricing_profiles$engine_capacity_l < 0) || any(pricing_profiles$cylinder_count < 0) ||
+    any(pricing_profiles$power_kw <= 0) || any(pricing_profiles$torque_nm <= 0) ||
+    any(pricing_profiles$unladen_weight_kg <= 0)
+) {
+  stop( paste( "Invalid CarExpert vehicle specification values detected.",
+      "Engine capacity/cylinders may be zero only where not applicable;",
+      "power, torque and unladen weight must be strictly positive." ) )
+}
+if ( anyNA(pricing_profiles$transmission) || any(trimws(as.character(pricing_profiles$transmission)) == "")
+) {
+  stop("transmission contains missing or blank values.")
+}
+# Preserve the technical-pricing provenance before assigning a new split for the
+# conversion-modelling stage.
+pricing_profiles <- pricing_profiles %>% rename( technical_data_split = data_split )
+conversion_split_shares <- c( train = config$conversion_train_share,
+  validation = config$conversion_validation_share, test = config$conversion_test_share )
+if ( any(!is.finite(conversion_split_shares)) || any(conversion_split_shares <= 0) ||
+    abs(sum(conversion_split_shares) - 1) > 1e-12
+) {
+  stop("Conversion split shares must be positive and sum exactly to 1.")
+}
+conversion_split_counts <- c( train = as.integer(round(config$expected_profiles * config$conversion_train_share)),
+  validation = as.integer(round(config$expected_profiles * config$conversion_validation_share)) )
+conversion_split_counts <- c( conversion_split_counts,
+  test = config$expected_profiles - sum(conversion_split_counts) )
+if (any(conversion_split_counts <= 0L)) {
+  stop("Conversion split configuration produced an empty partition.")
+}
+set.seed(config$conversion_split_seed)
+split_order <- sample(seq_len(nrow(pricing_profiles)))
+split_labels <- c( rep("train", conversion_split_counts[["train"]]),
+  rep("validation", conversion_split_counts[["validation"]]), rep("test", conversion_split_counts[["test"]]) )
+conversion_data_split <- character(nrow(pricing_profiles))
+conversion_data_split[split_order] <- split_labels
+pricing_profiles <- pricing_profiles %>% mutate( conversion_data_split = factor( conversion_data_split,
+      levels = c("train", "validation", "test") ),
+    # Stable downstream alias. Modules 4-6 can continue using data_split while
+    # technical_data_split preserves the separate Module 2 provenance.
+    data_split = conversion_data_split )
+conversion_split_summary <- pricing_profiles %>% count( conversion_data_split, name = "profiles" ) %>% mutate(
+    share = profiles / sum(profiles) )
+observed_conversion_split_counts <- setNames( conversion_split_summary$profiles,
+  as.character(conversion_split_summary$conversion_data_split) )
+if ( !identical( as.integer(observed_conversion_split_counts[c("train", "validation", "test")]),
+    as.integer(conversion_split_counts[c("train", "validation", "test")]) )
+) {
+  stop("Conversion split did not reproduce the configured exact row counts.")
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 3. LEAKAGE CHECK
+# Historical predictors such as prior_claims_5yr and claim_free_years are allowed.
+# Current-period outcomes, latent truth and Module 1 audit-only variables are not.
+explicit_forbidden_columns <- c( "claim_count", "pricing_claim_count", "incurred_claim_cost",
+  "reconstructed_incurred_claim_cost", "gross_claim_cost", "average_paid_claim_cost",
+  "pricing_average_paid_claim_cost", "largest_paid_claim", "total_loss_claim_count", "any_total_loss",
+  "reconstructed_reported_claim_count", "incurred_claim_cost_nominal", "gross_claim_cost_nominal",
+  "average_paid_claim_cost_nominal", "largest_paid_claim_nominal", "driver_sex_audit" )
+pattern_forbidden_columns <- names(pricing_profiles)[ str_detect( names(pricing_profiles), regex( paste( c(
+          "^true_", "frailty", "^latent_" ), collapse = "|" ), ignore_case = TRUE ) ) ]
+forbidden_columns <- union( intersect(explicit_forbidden_columns, names(pricing_profiles)),
+  pattern_forbidden_columns )
+if (length(forbidden_columns) > 0L) {
+  stop( paste0( "Module 3 leakage check failed. Forbidden columns detected: ",
+      paste(forbidden_columns, collapse = ", ") ) )
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 4. MARKET-SCENARIO REGISTER
+# Scenario parameters below are stress assumptions, not estimates of actual
+# Australian insurer behaviour.
+# stance_shift:
+#   parallel shift in competitor log-price stance.
+# stance_scale:
+#   widens/narrows differences between the six competitor archetypes.
+# availability_shift:
+#   shifts the probability that a competitor returns a quote.
+# noise_sd:
+#   residual within-profile quote dispersion.
+# appetite_scale:
+#   scales segment-specific competitive appetite.
+market_scenario_register <- tribble( ~scenario_id, ~scenario_label, ~scenario_description, ~stance_shift,
+  ~stance_scale, ~availability_shift, ~noise_sd, ~appetite_scale, "baseline", "Baseline market", paste(
+    "Six stylised competitors with heterogeneous price stance,",
+    "quote availability, segment appetite and moderate quote dispersion." ), 0.000, 1.00, 0.00, 0.045, 1.00,
+  "high_competition", "High competition", paste(
+    "Competitors are more price-aggressive and more likely to return quotes,",
+    "increasing the intensity of the comparison set." ), -0.025, 1.00, 0.04, 0.050, 1.10, "low_competition",
+  "Low competition", paste( "Competitors are less price-aggressive and less likely to return quotes,",
+    "creating a thinner comparison set." ), 0.025, 0.90, -0.16, 0.035, 0.85, "fragmented_market",
+  "Fragmented market", paste( "Competitor pricing stances and segment appetites are more dispersed",
+    "and residual quote variation is materially larger." ), 0.000, 1.55, -0.02, 0.080, 1.50 )
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 5. SIX BASELINE COMPETITOR ARCHETYPES
+# These are stylised competitors, not named firms.
+# log_stance is measured relative to the Module 2 technical premium:
+# exp(-0.055) ~= 0.946
+# exp( 0.065) ~= 1.067
+competitor_assumptions <- tribble( ~competitor_id, ~competitor_archetype, ~log_stance, ~quote_return_probability,
+  "C01", "Value Direct", -0.055, 0.96, "C02", "Mainstream Alpha", -0.015, 0.98, "C03", "Mainstream Beta", 0.010,
+  0.96, "C04", "Premium Brand", 0.065, 0.90, "C05", "Young Driver Specialist", 0.025, 0.92, "C06",
+  "Low-Risk Specialist", 0.015, 0.91 )
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 6. VALIDATE REQUESTED MARKET SCENARIOS
+registered_scenarios <- market_scenario_register$scenario_id
+unknown_scenarios <- setdiff( config$scenarios_to_run, registered_scenarios )
+if ( length( unknown_scenarios ) > 0L
+) {
+  stop( paste0( "Unknown market scenario(s): ", paste( unknown_scenarios, collapse = ", " ) ) )
+}
+if ( length( config$scenarios_to_run ) == 0L
+) {
+  stop( "scenarios_to_run contains no scenarios." )
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 7. GENERATE THE FOCAL COMMERCIAL QUOTE
+# The focal commercial multiplier is deliberately independent of observable
+# policy risk characteristics.
+set.seed(
+  config$focal_seed )
+focal_multiplier <- runif( n = nrow( pricing_profiles ), min = config$focal_multiplier_lower, max =
+    config$focal_multiplier_upper )
+focal_profiles <- pricing_profiles %>% mutate( focal_price_multiplier = focal_multiplier, focal_quote =
+      technical_premium * focal_price_multiplier,
+    # Stable aliases retained for downstream compatibility.
+    focal_benchmark_quote = focal_quote, focal_price = focal_quote, focal_technical_premium = technical_premium,
+    fitted_annual_loss_cost = estimated_expected_claim_cost, commercial_log_adjustment = log( focal_quote /
+          technical_premium ) )
+if ( any( focal_profiles$focal_price_multiplier < config$focal_multiplier_lower ) | any(
+      focal_profiles$focal_price_multiplier > config$focal_multiplier_upper )
+) {
+  stop( "Generated focal price multiplier fell outside configured support." )
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 8. FOCAL-PRICE IDENTIFICATION DIAGNOSTIC
+# The focal quote itself should be risk-correlated because it contains the
+# technical premium. The correct diagnostic is therefore whether risk variables
+# explain the residual commercial adjustment around technical premium.
+risk_diagnostic_data <- focal_profiles %>% mutate( state = factor( state ), remoteness_area = factor(
+        remoteness_area ), vehicle_segment = factor( vehicle_segment ), motive_power = factor( motive_power ),
+    transmission = factor( transmission ) )
+focal_adjustment_risk_model <- lm( commercial_log_adjustment ~ driver_age + licence_years + vehicle_age + log(
+      pmax( vehicle_value, 1 ) ) + log( pmax( annual_km, 1 ) ) + prior_claims_5yr + claim_free_years +
+    voluntary_excess + state + remoteness_area + vehicle_segment + motive_power + engine_capacity_l +
+    cylinder_count + log( pmax( power_kw, 1 ) ) + log( pmax( torque_nm, 1 ) ) + log( pmax( unladen_weight_kg, 1 )
+    ) + transmission, data = risk_diagnostic_data )
+risk_model_r_squared <- summary( focal_adjustment_risk_model )$r.squared
+risk_model_adjusted_r_squared <- summary( focal_adjustment_risk_model )$adj.r.squared
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 9. COMPETITOR SEGMENT-APPETITE FUNCTION
+calculate_segment_adjustment <- function( competitor_archetype, vehicle_segment, vehicle_value, driver_age,
+    prior_claims_5yr, claim_free_years, appetite_scale
+) {
+  raw_adjustment <- case_when( competitor_archetype == "Mainstream Beta" & vehicle_segment == "Small Passenger" ~
+      -0.020, competitor_archetype == "Mainstream Beta" & vehicle_segment == "Sports/Performance" ~ 0.020,
+    competitor_archetype == "Premium Brand" & vehicle_value >= 45000 & driver_age >= 35 & driver_age <= 69 ~
+      -0.020, competitor_archetype == "Premium Brand" & driver_age <= 24 ~ 0.025, competitor_archetype ==
+      "Young Driver Specialist" & driver_age <= 29 ~ -0.055, competitor_archetype == "Young Driver Specialist" &
+      driver_age >= 55 ~ 0.018, competitor_archetype == "Low-Risk Specialist" & prior_claims_5yr == 0 &
+      claim_free_years >= 3 ~ -0.045, competitor_archetype == "Low-Risk Specialist" & prior_claims_5yr >= 2 ~
+      0.030, TRUE ~ 0 )
+  raw_adjustment * appetite_scale
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 10. GENERATE ONE MARKET SCENARIO
+generate_market_scenario <- function( requested_scenario_id
+) {
+  scenario_row <- market_scenario_register %>% filter( .data$scenario_id == .env$requested_scenario_id )
+  if ( nrow( scenario_row ) != 1L
+  ) {
+    stop( paste0( "Scenario register lookup failed for: ", requested_scenario_id ) )
+  }
+  # The CarExpert vehicle specifications remain in focal_profiles and therefore
+  # flow into quote_market. They are intentionally not duplicated across the
+  # long competitor table because the competitor pricing DGP does not use them.
+  profile_base <- focal_profiles %>% dplyr::select( policy_id, quote_profile_id, technical_premium, focal_quote,
+      driver_age, vehicle_segment, vehicle_value, prior_claims_5yr, claim_free_years )
+  competitor_quotes_all <- tidyr::crossing( profile_base, competitor_assumptions ) %>% mutate( scenario_id =
+        requested_scenario_id, market_scenario_id = requested_scenario_id, scenario_log_stance = ( log_stance *
+            scenario_row$stance_scale[ 1 ] ) + scenario_row$stance_shift[ 1 ], scenario_quote_return_probability =
+        clamp( quote_return_probability + scenario_row$availability_shift[ 1 ], 0.50, 0.995 ),
+      segment_log_adjustment = calculate_segment_adjustment( competitor_archetype = competitor_archetype,
+          vehicle_segment = vehicle_segment, vehicle_value = vehicle_value, driver_age = driver_age,
+          prior_claims_5yr = prior_claims_5yr, claim_free_years = claim_free_years, appetite_scale =
+            scenario_row$appetite_scale[ 1 ] ) )
+  set.seed(
+    scenario_seed( requested_scenario_id ) )
+  competitor_quotes_all <- competitor_quotes_all %>% mutate( availability_draw = runif( n() ), quote_returned_raw =
+        availability_draw <= scenario_quote_return_probability, stochastic_log_noise = rnorm( n(), mean = 0, sd =
+            scenario_row$noise_sd[ 1 ] ), raw_competitor_multiplier = exp( scenario_log_stance +
+            segment_log_adjustment + stochastic_log_noise ), competitor_multiplier = clamp(
+          raw_competitor_multiplier, config$competitor_multiplier_lower, config$competitor_multiplier_upper ),
+      competitor_quote = technical_premium * competitor_multiplier ) %>% group_by( policy_id, quote_profile_id
+    ) %>% mutate(
+      # A comparison profile must contain at least two competitor quotes.
+      # If the availability process returns fewer than two, the competitors
+      # with the two smallest availability draws are retained.
+      quote_returned = if ( sum( quote_returned_raw ) >= config$minimum_returned_competitors
+        ) {
+          quote_returned_raw
+        } else {
+          rank( availability_draw, ties.method = "first" ) <= config$minimum_returned_competitors
+        } ) %>% ungroup()
+  if ( any( !is.finite( competitor_quotes_all$competitor_quote ) ) | any(
+        competitor_quotes_all$competitor_quote <= 0 )
+  ) {
+    stop( paste0( "Invalid competitor quote generated for scenario: ", requested_scenario_id ) )
+  }
+  competitor_quotes_available <- competitor_quotes_all %>% filter( quote_returned )
+  returned_count_check <- competitor_quotes_available %>% count( policy_id, quote_profile_id, name = "n_returned" )
+  if ( nrow( returned_count_check ) != nrow( focal_profiles ) | any( returned_count_check$n_returned <
+          config$minimum_returned_competitors )
+  ) {
+    stop( paste0( "Competitor availability validation failed for scenario: ", requested_scenario_id ) )
+  }
+  market_summary <- competitor_quotes_available %>% group_by( policy_id, quote_profile_id ) %>% summarise(
+      n_competitor_quotes = n(), competitor_count = n(), cheapest_competitor_quote = min( competitor_quote ),
+      median_competitor_quote = median( competitor_quote ), mean_competitor_quote = mean( competitor_quote ),
+      sd_competitor_quote = sd( competitor_quote ), maximum_competitor_quote = max( competitor_quote ),
+      minimum_competitor_quote = min( competitor_quote ), within_profile_competitor_spread_ratio = safe_divide(
+          maximum_competitor_quote, minimum_competitor_quote ), focal_rank = 1L + sum( competitor_quote < first(
+                focal_quote ) ), market_median_quote = median( c( competitor_quote, first( focal_quote ) ) ),
+      lowest_market_quote = min( c( competitor_quote, first( focal_quote ) ) ), highest_market_quote = max( c(
+            competitor_quote, first( focal_quote ) ) ), .groups = "drop" )
+  quote_market <- focal_profiles %>% left_join( market_summary, by = c( "policy_id", "quote_profile_id" ) ) %>%
+    mutate( scenario_id = requested_scenario_id, market_scenario_id = requested_scenario_id, relative_price =
+        safe_divide( focal_quote, cheapest_competitor_quote ), relative_price_to_cheapest_competitor =
+        relative_price, price_gap_to_cheapest = focal_quote - cheapest_competitor_quote, gap_to_cheapest =
+        price_gap_to_cheapest, percentage_gap_to_cheapest_competitor = relative_price_to_cheapest_competitor - 1,
+      relative_price_to_market_median = safe_divide( focal_quote, market_median_quote ),
+      relative_to_market_median = relative_price_to_market_median, distance_to_market_median = focal_quote -
+          market_median_quote, competitor_quote_cv = safe_divide( sd_competitor_quote, mean_competitor_quote ),
+      market_spread_ratio = safe_divide( highest_market_quote, lowest_market_quote ), focal_is_cheapest =
+        focal_quote <= cheapest_competitor_quote, focal_within_5pct_of_cheapest = focal_quote <= 1.05 *
+            cheapest_competitor_quote, focal_rank_percentile = safe_divide( focal_rank - 1, n_competitor_quotes ) )
+  if ( nrow( quote_market ) != nrow( focal_profiles )
+  ) {
+    stop( paste0( "Quote-market row count changed for scenario: ", requested_scenario_id ) )
+  }
+  if ( anyDuplicated( quote_market$quote_profile_id ) > 0L
+  ) {
+    stop( paste0( "quote_profile_id is duplicated for scenario: ", requested_scenario_id ) )
+  }
+  finite_market_fields <- c( "focal_quote", "cheapest_competitor_quote", "median_competitor_quote",
+    "market_median_quote", "relative_price_to_cheapest_competitor", "relative_price_to_market_median",
+    "within_profile_competitor_spread_ratio" )
+  if ( any( !is.finite( as.matrix( quote_market[ finite_market_fields ] ) ) )
+  ) {
+    stop( paste0( "Non-finite market-position variables detected for scenario: ", requested_scenario_id ) )
+  }
+  list( quote_market = quote_market, competitor_quotes_all = competitor_quotes_all, competitor_quotes_available =
+      competitor_quotes_available )
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 11. RUN REQUESTED SCENARIOS
+scenario_results <- purrr::set_names( config$scenarios_to_run ) %>% purrr::map( generate_market_scenario )
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 12. MARKET SUMMARIES
+quote_market_summary <- purrr::imap_dfr( scenario_results, function( scenario_result, scenario_name
+    ) {
+      q <- scenario_result$quote_market
+      tibble( scenario_id = scenario_name, profiles = nrow( q ), mean_returned_competitors = mean(
+            q$n_competitor_quotes ), minimum_returned_competitors = min( q$n_competitor_quotes ),
+        maximum_returned_competitors = max( q$n_competitor_quotes ), mean_technical_premium = mean(
+            q$technical_premium ), mean_focal_quote = mean( q$focal_quote ), mean_focal_multiplier = mean(
+            q$focal_price_multiplier ), mean_competitor_quote = mean( q$mean_competitor_quote ),
+        median_relative_price_to_cheapest = median( q$relative_price_to_cheapest_competitor ),
+        mean_relative_price_to_cheapest = mean( q$relative_price_to_cheapest_competitor ),
+        mean_percentage_gap_to_cheapest = mean( q$percentage_gap_to_cheapest_competitor ), median_focal_rank =
+          median( q$focal_rank ), mean_focal_rank = mean( q$focal_rank ), focal_cheapest_share = mean(
+            q$focal_is_cheapest ), focal_within_5pct_cheapest_share = mean( q$focal_within_5pct_of_cheapest ),
+        mean_competitor_quote_cv = mean( q$competitor_quote_cv ), median_competitor_spread_ratio = median(
+            q$within_profile_competitor_spread_ratio ) )
+    } )
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 13. FOCAL PRICE SUMMARY
+focal_price_summary <- tibble( metric = c( "Profiles", "Quote-market policy year", "Conversion train profiles",
+    "Conversion validation profiles", "Conversion test profiles", "Mean technical premium",
+    "Mean fitted annual loss cost", "Mean focal benchmark quote", "Mean focal price multiplier",
+    "Minimum focal price multiplier", "Maximum focal price multiplier", "SD commercial log adjustment",
+    "Risk-model R-squared for commercial adjustment", "Risk-model adjusted R-squared for commercial adjustment" ),
+  value = c( nrow(focal_profiles), config$expected_policy_year, conversion_split_counts[["train"]],
+    conversion_split_counts[["validation"]], conversion_split_counts[["test"]],
+    mean(focal_profiles$technical_premium), mean(focal_profiles$estimated_expected_claim_cost),
+    mean(focal_profiles$focal_benchmark_quote), mean(focal_profiles$focal_price_multiplier),
+    min(focal_profiles$focal_price_multiplier), max(focal_profiles$focal_price_multiplier),
+    sd(focal_profiles$commercial_log_adjustment), risk_model_r_squared, risk_model_adjusted_r_squared ) )
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 14. VEHICLE-SPECIFICATION PROPAGATION AUDIT
+vehicle_specification_market_audit <- tibble( metric = c( "Profiles", "Distinct motive-power levels",
+    "Distinct transmission levels", "Finite non-negative engine capacity share",
+    "Finite non-negative cylinder-count share", "Finite positive power share", "Finite positive torque share",
+    "Finite positive unladen-weight share" ), value = c( nrow( focal_profiles ), n_distinct(
+      focal_profiles$motive_power ), n_distinct( focal_profiles$transmission ), mean( is.finite(
+        focal_profiles$engine_capacity_l ) & focal_profiles$engine_capacity_l >= 0 ), mean( is.finite(
+        focal_profiles$cylinder_count ) & focal_profiles$cylinder_count >= 0 ), mean( is.finite(
+        focal_profiles$power_kw ) & focal_profiles$power_kw > 0 ), mean( is.finite( focal_profiles$torque_nm ) &
+        focal_profiles$torque_nm > 0 ), mean( is.finite( focal_profiles$unladen_weight_kg ) &
+        focal_profiles$unladen_weight_kg > 0 ) ) )
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 15. VALIDATION CHECKS
+global_validation_checks <- tribble( ~scenario_id, ~check_name, ~observed_value, ~lower_bound, ~upper_bound,
+  "GLOBAL", "Input pricing-profile rows", nrow(pricing_profiles), config$expected_profiles,
+  config$expected_profiles, "GLOBAL", "Input policy year is 2025 only",
+  as.numeric(all(pricing_profiles$policy_year == config$expected_policy_year)), 1, 1, "GLOBAL",
+  "Technical-pricing provenance is TEST only", as.numeric(all(pricing_profiles$technical_data_split == "test")), 1,
+  1, "GLOBAL", "Conversion TRAIN rows", sum(as.character(pricing_profiles$conversion_data_split) == "train"),
+  conversion_split_counts[["train"]], conversion_split_counts[["train"]], "GLOBAL", "Conversion VALIDATION rows",
+  sum(as.character(pricing_profiles$conversion_data_split) == "validation"),
+  conversion_split_counts[["validation"]], conversion_split_counts[["validation"]], "GLOBAL",
+  "Conversion TEST rows", sum(as.character(pricing_profiles$conversion_data_split) == "test"),
+  conversion_split_counts[["test"]], conversion_split_counts[["test"]], "GLOBAL",
+  "Downstream data_split matches conversion_data_split", as.numeric( all(
+      as.character(pricing_profiles$data_split) == as.character(pricing_profiles$conversion_data_split) ) ), 1, 1,
+  "GLOBAL", "Unique input quote-profile IDs", n_distinct(pricing_profiles$quote_profile_id),
+  nrow(pricing_profiles), nrow(pricing_profiles), "GLOBAL", "No current-year or latent leakage fields",
+  length(forbidden_columns), 0, 0, "GLOBAL", "Finite positive expected claims cost", mean(
+    is.finite(pricing_profiles$estimated_expected_claim_cost) & pricing_profiles$estimated_expected_claim_cost > 0
+  ), 1, 1, "GLOBAL", "Finite positive technical premium", mean( is.finite(pricing_profiles$technical_premium) &
+      pricing_profiles$technical_premium > 0 ), 1, 1, "GLOBAL", "CarExpert vehicle-specification fields present",
+  as.numeric( all( c( "motive_power", "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm",
+        "unladen_weight_kg", "transmission" ) %in% names(focal_profiles) ) ), 1, 1, "GLOBAL",
+  "Finite positive power share", mean(is.finite(focal_profiles$power_kw) & focal_profiles$power_kw > 0), 1, 1,
+  "GLOBAL", "Finite positive torque share",
+  mean(is.finite(focal_profiles$torque_nm) & focal_profiles$torque_nm > 0), 1, 1, "GLOBAL",
+  "Finite positive unladen-weight share", mean( is.finite(focal_profiles$unladen_weight_kg) &
+      focal_profiles$unladen_weight_kg > 0 ), 1, 1, "GLOBAL", "Nonblank transmission share", mean(
+    !is.na(focal_profiles$transmission) & trimws(as.character(focal_profiles$transmission)) != "" ), 1, 1,
+  "GLOBAL", "Mean focal price multiplier", mean(focal_profiles$focal_price_multiplier), 0.99, 1.01, "GLOBAL",
+  "Minimum focal multiplier inside support", min(focal_profiles$focal_price_multiplier),
+  config$focal_multiplier_lower, config$focal_multiplier_upper, "GLOBAL",
+  "Maximum focal multiplier inside support", max(focal_profiles$focal_price_multiplier),
+  config$focal_multiplier_lower, config$focal_multiplier_upper, "GLOBAL",
+  "Focal commercial-adjustment risk R-squared", risk_model_r_squared, 0, config$maximum_focal_adjustment_r_squared
+) %>% mutate( pass = observed_value >= lower_bound & observed_value <= upper_bound )
+scenario_validation_checks <- purrr::imap_dfr( scenario_results, function( scenario_result, scenario_name
+    ) {
+      q <- scenario_result$quote_market
+      c_all <- scenario_result$competitor_quotes_all
+      c_available <- scenario_result$competitor_quotes_available
+      tribble( ~scenario_id, ~check_name, ~observed_value, ~lower_bound, ~upper_bound, scenario_name,
+        "Quote-market rows", nrow( q ), nrow( focal_profiles ), nrow( focal_profiles ), scenario_name,
+        "Unique quote-profile IDs", n_distinct( q$quote_profile_id ), nrow( focal_profiles ), nrow( focal_profiles
+        ), scenario_name, "Potential competitor rows", nrow( c_all ), nrow( focal_profiles ) * nrow(
+            competitor_assumptions ), nrow( focal_profiles ) * nrow( competitor_assumptions ), scenario_name,
+        "Minimum returned competitors", min( q$n_competitor_quotes ), config$minimum_returned_competitors, nrow(
+          competitor_assumptions ), scenario_name, "Maximum returned competitors", max( q$n_competitor_quotes ),
+        config$minimum_returned_competitors, nrow( competitor_assumptions ), scenario_name,
+        "CarExpert fields retained in quote market", as.numeric( all( c( "motive_power", "engine_capacity_l",
+              "cylinder_count", "power_kw", "torque_nm", "unladen_weight_kg", "transmission" ) %in% names( q ) ) ),
+        1, 1, scenario_name, "Finite positive focal quotes", mean( is.finite( q$focal_quote ) & q$focal_quote > 0
+        ), 1, 1, scenario_name, "Finite positive returned competitor quotes", mean( is.finite(
+            c_available$competitor_quote ) & c_available$competitor_quote > 0 ), 1, 1, scenario_name,
+        "Valid focal ranks", mean( q$focal_rank >= 1 & q$focal_rank <= q$n_competitor_quotes + 1 ), 1, 1,
+        scenario_name, "Finite market-position variables", mean( is.finite( q$relative_price_to_cheapest_competitor
+          ) & is.finite( q$relative_price_to_market_median ) & is.finite( q$within_profile_competitor_spread_ratio
+            ) ), 1, 1 )
+    } ) %>% mutate( pass = observed_value >= lower_bound & observed_value <= upper_bound )
+quote_market_validation_checks <- bind_rows( global_validation_checks, scenario_validation_checks )
+if (any(!quote_market_validation_checks$pass)) {
+  failed_checks <- quote_market_validation_checks %>% filter(!pass)
+  stop( "Module 3 validation failed: ", paste(failed_checks$check_name, collapse = "; "),
+    ". Review quote_market_validation_checks.csv before Module 4." )
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 16. WRITE SCENARIO-SPECIFIC OUTPUTS (MULTI-SCENARIO RUNS ONLY)
+# The frozen baseline and each Module 7 sensitivity case run one scenario at a
+# time, so scenario-suffixed files would duplicate the canonical files below.
+# Retain them only for an intentional direct multi-scenario diagnostic run.
+if (length(scenario_results) > 1L) {
+  purrr::iwalk(scenario_results, function(scenario_result, scenario_name) {
+    readr::write_csv( scenario_result$quote_market,
+      file.path(config$output_dir, paste0("quote_market_", scenario_name, ".csv")) )
+    readr::write_csv( scenario_result$competitor_quotes_all,
+      file.path(config$output_dir, paste0("competitor_quotes_all_", scenario_name, ".csv")) )
+    readr::write_csv( scenario_result$competitor_quotes_available,
+      file.path(config$output_dir, paste0("competitor_quotes_available_", scenario_name, ".csv")) )
+  })
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 17. WRITE CANONICAL OUTPUTS
+# When exactly one market scenario is run, stable filenames are created for the
+# next module. This is also what Module 7 expects inside each isolated case.
+if ( length( scenario_results ) == 1L
+) {
+  canonical_result <- scenario_results[[1]]
+  readr::write_csv( canonical_result$quote_market, file.path( config$output_dir, "quote_market.csv" ) )
+  readr::write_csv( canonical_result$competitor_quotes_available, file.path( config$output_dir,
+      "competitor_quotes.csv" ) )
+  readr::write_csv( canonical_result$competitor_quotes_available, file.path( config$output_dir,
+      "competitor_quotes_available.csv" ) )
+  readr::write_csv( canonical_result$competitor_quotes_all, file.path( config$output_dir,
+      "competitor_quotes_all.csv" ) )
+  saveRDS( canonical_result$quote_market, file.path( config$output_dir, "quote_market.rds" ) )
+  saveRDS( canonical_result$competitor_quotes_available, file.path( config$output_dir,
+      "competitor_quotes_available.rds" ) )
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 18. WRITE SUPPORTING OUTPUTS
+readr::write_csv( conversion_split_summary, file.path( config$output_dir, "conversion_split_summary.csv" ) )
+readr::write_csv( market_scenario_register, file.path( config$output_dir, "market_scenario_register.csv" ) )
+readr::write_csv( competitor_assumptions, file.path( config$output_dir, "competitor_assumption_register.csv" ) )
+readr::write_csv( focal_price_summary, file.path( config$output_dir, "focal_price_summary.csv" ) )
+readr::write_csv( quote_market_summary, file.path( config$output_dir, "quote_market_summary.csv" ) )
+readr::write_csv( quote_market_validation_checks, file.path( config$output_dir,
+    "quote_market_validation_checks.csv" ) )
+readr::write_csv( vehicle_specification_market_audit, file.path( config$output_dir,
+    "quote_market_vehicle_specification_audit.csv" ) )
+rank_distribution <- purrr::imap_dfr( scenario_results, function( scenario_result, scenario_name
+    ) {
+      scenario_result$quote_market %>% count( focal_rank, name = "profiles" ) %>% mutate( scenario_id =
+            scenario_name, share = profiles / sum( profiles ), .before = 1 )
+    } )
+readr::write_csv( rank_distribution, file.path( config$output_dir, "focal_rank_distribution.csv" ) )
+saveRDS( list( module_version = "M3-OOT-2026-09-09", status = "candidate_freeze_after_validation", focal_seed =
+      config$focal_seed, competitor_seed_base = config$competitor_seed_base, focal_multiplier_lower =
+      config$focal_multiplier_lower, focal_multiplier_upper = config$focal_multiplier_upper,
+    competitor_multiplier_lower = config$competitor_multiplier_lower, competitor_multiplier_upper =
+      config$competitor_multiplier_upper, minimum_returned_competitors = config$minimum_returned_competitors,
+    maximum_focal_adjustment_r_squared = config$maximum_focal_adjustment_r_squared, scenarios_run =
+      config$scenarios_to_run, quote_market_policy_year = config$expected_policy_year, quote_market_profiles =
+      config$expected_profiles, technical_data_split = "test", conversion_split_seed =
+      config$conversion_split_seed, conversion_split_counts = conversion_split_counts, conversion_split_shares =
+      conversion_split_shares, focal_adjustment_r_squared = risk_model_r_squared,
+    propagated_vehicle_specification_fields = c( "motive_power", "engine_capacity_l", "cylinder_count", "power_kw",
+        "torque_nm", "unladen_weight_kg", "transmission" ) ), file.path( config$output_dir,
+    "quote_market_metadata.rds" ) )
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 19. DIAGNOSTIC PLOTS
+if ( isTRUE( config$write_plots )
+) {
+  plot_scenario <- if ( "baseline" %in% names( scenario_results )
+    ) {
+      "baseline"
+    } else {
+      names( scenario_results )[ 1 ]
+    }
+  plot_market <- scenario_results[[plot_scenario]]$quote_market
+  plot_competitors <- scenario_results[[plot_scenario]]$competitor_quotes_available
+  p_focal_multiplier <- ggplot( plot_market, aes( x = focal_price_multiplier ) ) + geom_histogram( bins = 40 ) +
+    labs( x = "Focal quote / technical premium", y = "Quote profiles", title = "Focal commercial-price adjustment"
+    ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "01_focal_price_multiplier.png" ), p_focal_multiplier, width = 8,
+    height = 5, dpi = 300 )
+  p_relative_price <- ggplot( plot_market, aes( x = relative_price_to_cheapest_competitor ) ) + geom_histogram(
+      bins = 60 ) + labs( x = "Focal quote / cheapest competitor quote", y = "Quote profiles",
+      title = "Relative-price distribution" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "02_relative_price_to_cheapest.png" ), p_relative_price, width = 8,
+    height = 5, dpi = 300 )
+  p_rank <- plot_market %>% count( focal_rank ) %>% mutate( share = n / sum( n ) ) %>% ggplot( aes( x = factor(
+            focal_rank ), y = share ) ) + geom_col() + labs( x = "Focal quote rank", y = "Portfolio share",
+      title = "Focal market-rank distribution" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "03_focal_rank.png" ), p_rank, width = 8, height = 5, dpi = 300 )
+  p_competitor_multiplier <- ggplot( plot_competitors, aes( x = competitor_multiplier, linetype =
+          competitor_archetype ) ) + geom_density() + labs( x = "Competitor quote / technical premium",
+      y = "Density", linetype = "Competitor", title = "Returned competitor pricing distributions" ) +
+    theme_minimal()
+  ggsave( file.path( config$output_dir, "04_competitor_multiplier_distribution.png" ), p_competitor_multiplier,
+    width = 9, height = 6, dpi = 300 )
+  p_competitor_count <- plot_market %>% count( n_competitor_quotes ) %>% mutate( share = n / sum( n ) ) %>% ggplot(
+      aes( x = factor( n_competitor_quotes ), y = share ) ) + geom_col() + labs( x = "Returned competitor quotes",
+      y = "Portfolio share", title = "Comparison-set size" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "05_returned_competitor_count.png" ), p_competitor_count, width = 8,
+    height = 5, dpi = 300 )
+}
+```
+
+
+```{r module-3-quote-market, message=FALSE, warning=TRUE}
+# 20. PRINT KEY RESULTS
+cat( "\n", "============================================================\n", "MODULE 3 COMPLETE\n",
+  "============================================================\n", sep = "" )
+cat( "\nQuote-market cohort:\n", "Policy year: ", config$expected_policy_year, "\nProfiles: ",
+  nrow(focal_profiles), "\nTechnical-pricing provenance: TEST only\n", sep = "" )
+cat( "\nConversion-development split:\n" )
+print( conversion_split_summary, n = Inf )
+cat( "\nScenarios run:\n" )
+print( config$scenarios_to_run )
+cat( "\nFocal-price identification diagnostic:\n" )
+print( focal_price_summary, n = Inf )
+cat( "\nQuote-market summary:\n" )
+print( quote_market_summary, n = Inf )
+cat( "\nVehicle-specification propagation audit:\n" )
+print( vehicle_specification_market_audit, n = Inf )
+cat( "\nValidation checks:\n" )
+print( quote_market_validation_checks, n = Inf )
+cat( "\nCanonical Module 4 market input:\n", file.path( config$output_dir, "quote_market.csv" ), "\n", sep = "" )
+```

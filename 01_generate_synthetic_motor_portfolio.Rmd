@@ -1,0 +1,1173 @@
+```{r module-1-generator, message=FALSE, warning=TRUE}
+# Generate a 50,000-profile motor portfolio and claims experience for 2021–2025.
+# Retain the underlying risk quantities separately from fitted modelling inputs.
+
+required_packages <- "tidyverse"
+missing_packages <- required_packages[!required_packages %in% rownames(installed.packages())]
+if (length(missing_packages) > 0L) {
+  stop("Install before running Module 1: ", paste(missing_packages, collapse = ", "))
+}
+invisible(lapply(required_packages, library, character.only = TRUE))
+source(file.path("R", "helpers.R"))
+options(dplyr.summarise.inform = FALSE, scipen = 999)
+# MULTI-YEAR DESIGN -------------------------------------------------------------
+# Five independent annual new-business cohorts are generated. No policyholder is
+# followed across years and no renewal process is introduced. 2021-2023 form
+# TRAIN, 2024 VALIDATION and 2025 TEST. Monetary claims retain a cohort-year
+# nominal value and a 2025 on-levelled value for technical model fitting.
+module_version <- "M1-MULTIYEAR-2026-09-09"
+module_freeze_date <- as.Date(NA_character_)
+module1_output_contract <- c( "synthetic_motor_modelling.csv", "synthetic_motor_full_truth.rds",
+  "synthetic_motor_claims.rds", "module1_validation_checks.csv", "portfolio_summary.csv",
+  "cohort_year_summary.csv", "claims_cost_onlevel_audit.csv", "vehicle_specification_simulation_audit.csv",
+  "module1_freeze_manifest.csv" )
+config <- list( seed = 20260806, n_policies = 50000L, cohort_years = 2021:2025, n_policies_per_cohort = 10000L,
+  calibrated_input_dir = file.path("inputs", "calibrated_multiyear"),
+  output_dir = file.path("outputs", "synthetic_generator_multiyear"),
+  # Empirical Module 0 inputs
+  module0_validation_file = file.path("inputs", "calibrated_multiyear", "calibration_validation_checks.csv"),
+  state_distribution_file = file.path("inputs", "calibrated_multiyear", "state_distribution.csv"),
+  state_distribution_by_policy_year_file = file.path("inputs", "calibrated_multiyear", "state_distribution_by_policy_year.csv"),
+  state_remoteness_distribution_by_policy_year_file = file.path("inputs", "calibrated_multiyear", "state_remoteness_distribution_by_policy_year.csv"),
+  vehicle_year_distribution_by_policy_year_state_file = file.path("inputs", "calibrated_multiyear", "vehicle_year_distribution_by_policy_year_state.csv"),
+  vehicle_make_model_distribution_by_policy_year_file = file.path("inputs", "calibrated_multiyear", "vehicle_make_model_distribution_by_policy_year.csv"),
+  annual_cost_level_indices_file = file.path("inputs", "calibrated_multiyear", "annual_cost_level_indices.csv"),
+  multiyear_module0_validation_file = file.path("inputs", "calibrated_multiyear", "multiyear_calibration_validation_checks.csv"),
+  state_remoteness_distribution_file = file.path("inputs", "calibrated_multiyear", "state_remoteness_distribution.csv"),
+  driver_age_distribution_file = file.path("inputs", "calibrated_multiyear", "driver_age_distribution.csv"),
+  vehicle_year_distribution_file = file.path("inputs", "calibrated_multiyear", "vehicle_year_distribution_by_state.csv"),
+  vehicle_year_eligibility_file = file.path("inputs", "calibrated_multiyear", "vehicle_year_eligibility_summary.csv"),
+  vehicle_segment_audit_file = file.path("inputs", "calibrated_multiyear", "vehicle_segment_classification_audit.csv"),
+  vehicle_segment_motive_power_by_year_file = file.path("inputs", "calibrated_multiyear", "vehicle_segment_motive_power_by_year.csv"),
+  vehicle_segment_motive_power_overall_file = file.path("inputs", "calibrated_multiyear", "vehicle_segment_motive_power_overall.csv"),
+  vehicle_make_model_spec_file = file.path("inputs", "calibrated_multiyear", "vehicle_make_model_spec_by_year.csv"),
+  vehicle_spec_donor_pool_file = file.path("inputs", "calibrated_multiyear", "vehicle_spec_donor_pool.csv"),
+  motive_power_distribution_file = file.path("inputs", "calibrated_multiyear", "motive_power_distribution.csv"),
+  motive_power_km_calibration_file = file.path("inputs", "calibrated_multiyear", "motive_power_km_calibration.csv"),
+  racq_vehicle_value_file = file.path("inputs", "calibrated_multiyear", "racq_vehicle_values_clean.csv"),
+  additional_quote_variable_calibration_file = file.path("inputs", "calibrated_multiyear", "additional_quote_variable_calibrations.rds"),
+  # Portfolio calibration
+  target_mean_annual_km = 11100, annual_km_cv = 0.45, cost_basis_year = 2025L, max_standard_vehicle_age = 30L,
+  # Claims frequency
+  target_annual_claimant_rate = 0.14, frailty_variance = 0.20, mileage_frequency_exponent = 0.55,
+  local_geographic_sdlog = 0.15,
+  # Claims severity
+  target_mean_paid_claim_severity = 5202, target_total_loss_cost_share = 0.25, non_total_loss_cv = 1.00,
+  vehicle_value_severity_exponent = 0.35,
+  # Premium and locality calibration
+  target_mean_technical_premium = 1052, target_localities = 450L,
+  # Quality controls
+  max_unclassified_vehicle_weight = 0.05, max_vehicle_spec_fallback_share = 0.07, vehicle_value_floor = 3000,
+  max_vehicle_value_floor_share = 0.20 )
+set.seed(config$seed)
+dir.create(config$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 2. MODULE-SPECIFIC HELPERS ----------------------------------------------------
+sample_age_from_group <- function(age_group) {
+  out <- integer(length(age_group))
+  closed_bounds <- list( `18-19` = 18:19, `20-24` = 20:24, `25-29` = 25:29,
+    `30-39` = 30:39, `40-49` = 40:49, `50-59` = 50:59, `60-69` = 60:69, `70-79` = 70:79 )
+  for (g in names(closed_bounds)) {
+    idx <- which(age_group == g)
+    if (length(idx) > 0L) {
+      out[idx] <- sample(closed_bounds[[g]], length(idx), replace = TRUE)
+    }
+  }
+  idx_80_plus <- which(age_group == "80+")
+  if (length(idx_80_plus) > 0L) {
+    ages <- 80:95
+    weights <- exp(-0.18 * (ages - 80))
+    out[idx_80_plus] <- sample( ages, length(idx_80_plus), replace = TRUE, prob = weights )
+  }
+  if (any(out == 0L)) stop("At least one driver age was not generated.")
+  out
+}
+sample_conditional_long <- function(
+    group_values, probability_table, group_column, value_column, probability_column
+) {
+  result <- vector("list", length(group_values))
+  for (g in unique(group_values)) {
+    idx <- which(group_values == g)
+    distribution <- probability_table[ probability_table[[group_column]] == g, , drop = FALSE ]
+    if (nrow(distribution) == 0L) {
+      stop("No conditional distribution found for group: ", g)
+    }
+    probs <- distribution[[probability_column]]
+    if (anyNA(probs) || any(probs < 0) || sum(probs) <= 0) {
+      stop("Invalid probabilities for group: ", g)
+    }
+    result[idx] <- as.list(sample( distribution[[value_column]], size = length(idx), replace = TRUE, prob = probs
+    ))
+  }
+  unlist(result, use.names = FALSE)
+}
+consecutive_claim_free_years <- function(history_matrix) {
+  if (ncol(history_matrix) != 5L) {
+    stop("Claims-history matrix must contain exactly five years.")
+  }
+  apply(history_matrix, 1, function(x) {
+    reversed <- rev(x)
+    if (all(reversed == 0)) return(5L)
+    which(reversed > 0)[1] - 1L
+  })
+}
+expected_lognormal_payment_above_excess <- function(mean_gross, cv, excess) {
+  if (any(mean_gross <= 0) || any(cv <= 0) || any(excess < 0)) {
+    stop("Invalid lognormal severity/excess input.")
+  }
+  sdlog <- sqrt(log1p(cv^2))
+  meanlog <- log(mean_gross) - 0.5 * sdlog^2
+  d <- pmax(excess, 1e-12)
+  z1 <- (meanlog + sdlog^2 - log(d)) / sdlog
+  z2 <- (meanlog - log(d)) / sdlog
+  payment <- mean_gross * pnorm(z1) - d * pnorm(z2)
+  payment[excess == 0] <- mean_gross[excess == 0]
+  pmax(payment, 0)
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 3. LOAD AND VALIDATE MODULE 0 CALIBRATIONS ----------------------------------
+required_calibration_files <- unlist(config[c( "module0_validation_file", "multiyear_module0_validation_file",
+  "state_distribution_file", "state_distribution_by_policy_year_file",
+  "state_remoteness_distribution_by_policy_year_file", "vehicle_year_distribution_by_policy_year_state_file",
+  "vehicle_make_model_distribution_by_policy_year_file", "annual_cost_level_indices_file",
+  "state_remoteness_distribution_file", "driver_age_distribution_file", "vehicle_year_distribution_file",
+  "vehicle_year_eligibility_file", "vehicle_segment_audit_file", "vehicle_segment_motive_power_by_year_file",
+  "vehicle_segment_motive_power_overall_file", "vehicle_make_model_spec_file", "vehicle_spec_donor_pool_file",
+  "motive_power_distribution_file", "motive_power_km_calibration_file", "racq_vehicle_value_file",
+  "additional_quote_variable_calibration_file" )])
+missing_files <- required_calibration_files[!file.exists(required_calibration_files)]
+if (length(missing_files) > 0L) {
+  stop( "Module 1 is missing Module 0 calibration files:\n", paste(missing_files, collapse = "\n"),
+    "\nRun Module 0 successfully before Module 1." )
+}
+module0_checks <- readr::read_csv(config$module0_validation_file, show_col_types = FALSE)
+assert_columns( module0_checks, c("check_name", "pass", "required_for_progress"), "Module 0 calibration checks" )
+required_module0_checks <- module0_checks |> mutate( pass = as.logical(pass),
+    required_for_progress = as.logical(required_for_progress) ) |> filter(required_for_progress)
+if (nrow(required_module0_checks) == 0L || !all(required_module0_checks$pass)) {
+  print(required_module0_checks |> filter(!pass), n = Inf)
+  stop("At least one required Module 0 calibration check failed.")
+}
+multiyear_module0_checks <- readr::read_csv(config$multiyear_module0_validation_file, show_col_types = FALSE) |>
+  mutate(pass = as.logical(pass), required_for_progress = as.logical(required_for_progress))
+if (nrow(multiyear_module0_checks) == 0L || !all(multiyear_module0_checks$pass[multiyear_module0_checks$required_for_progress])) {
+  print(multiyear_module0_checks |> filter(required_for_progress, !pass), n = Inf)
+  stop("At least one required multi-year Module 0 calibration check failed.")
+}
+state_distribution_by_policy_year <- readr::read_csv(config$state_distribution_by_policy_year_file, show_col_types = FALSE) |>
+  transmute(policy_year = as.integer(policy_year), state = as.character(state), probability = as.numeric(probability))
+state_remoteness_distribution_by_policy_year <- readr::read_csv(config$state_remoteness_distribution_by_policy_year_file, show_col_types = FALSE) |>
+  transmute(policy_year = as.integer(policy_year), state = as.character(state), remoteness_area = as.character(remoteness_area), probability = as.numeric(probability))
+vehicle_year_distribution_by_policy_year_state <- readr::read_csv(config$vehicle_year_distribution_by_policy_year_state_file, show_col_types = FALSE) |>
+  transmute(policy_year = as.integer(policy_year), state = as.character(state), year_of_manufacture = as.integer(year_of_manufacture), probability = as.numeric(probability))
+vehicle_make_model_distribution_by_policy_year <- readr::read_csv(config$vehicle_make_model_distribution_by_policy_year_file, show_col_types = FALSE) |>
+  transmute(policy_year = as.integer(policy_year), year_of_manufacture = as.integer(year_of_manufacture), make = as.character(make), model = as.character(model), motive_power = as.character(motive_power), vehicle_segment = as.character(vehicle_segment), probability = as.numeric(probability))
+annual_cost_level_indices <- readr::read_csv(config$annual_cost_level_indices_file, show_col_types = FALSE) |>
+  transmute(policy_year = as.integer(policy_year), claims_cost_level = as.numeric(claims_cost_level), motor_vehicle_price_level = as.numeric(motor_vehicle_price_level))
+if (!setequal(unique(state_distribution_by_policy_year$policy_year), config$cohort_years) ||
+    !setequal(unique(vehicle_make_model_distribution_by_policy_year$policy_year), config$cohort_years) ||
+    !setequal(annual_cost_level_indices$policy_year, config$cohort_years)) {
+  stop("Multi-year calibrations do not cover all cohort years 2021-2025.")
+}
+# State ------------------------------------------------------------------------
+state_distribution <- readr::read_csv( config$state_distribution_file, show_col_types = FALSE ) |>
+  transmute(state = as.character(state), probability = as.numeric(probability))
+assert_columns(state_distribution, c("state", "probability"), "state_distribution")
+if ( anyNA(state_distribution) || any(state_distribution$probability < 0) ||
+  abs(sum(state_distribution$probability) - 1) > 1e-8
+) {
+  stop("Invalid Module 0 State distribution.")
+}
+# Remoteness conditional on State ---------------------------------------------
+remoteness_levels <- c( "Major Cities", "Inner Regional", "Outer Regional", "Remote", "Very Remote" )
+state_remoteness_distribution <- readr::read_csv( config$state_remoteness_distribution_file, show_col_types = FALSE
+) |> transmute( state = as.character(state), remoteness_area = as.character(remoteness_area),
+    probability = as.numeric(probability) )
+assert_columns( state_remoteness_distribution, c("state", "remoteness_area", "probability"),
+  "state_remoteness_distribution" )
+invalid_remoteness <- setdiff( unique(state_remoteness_distribution$remoteness_area), remoteness_levels )
+if (length(invalid_remoteness) > 0L) {
+  stop("Invalid Remoteness Area label(s): ", paste(invalid_remoteness, collapse = ", "))
+}
+remoteness_sum_check <- state_remoteness_distribution |> summarise(probability_sum = sum(probability), .by = state)
+if (any(abs(remoteness_sum_check$probability_sum - 1) > 1e-5)) {
+  stop("State-remoteness probabilities do not sum to one within State.")
+}
+if (!identical( sort(unique(state_remoteness_distribution$state)), sort(unique(state_distribution$state))
+)) {
+  stop("State coverage differs between State and State x Remoteness tables.")
+}
+# Driver age -------------------------------------------------------------------
+driver_age_distribution <- readr::read_csv( config$driver_age_distribution_file, show_col_types = FALSE ) |>
+  transmute(age_group = as.character(age_group), probability = as.numeric(probability))
+expected_age_groups <- c( "18-19", "20-24", "25-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80+" )
+if (!setequal(driver_age_distribution$age_group, expected_age_groups)) {
+  stop("Driver-age calibration does not contain the expected age groups.")
+}
+if ( anyNA(driver_age_distribution) || any(driver_age_distribution$probability < 0) ||
+  abs(sum(driver_age_distribution$probability) - 1) > 1e-8
+) {
+  stop("Invalid Module 0 driver-age distribution.")
+}
+# Vehicle manufacture year -----------------------------------------------------
+minimum_eligible_manufacture_year <- min(config$cohort_years) - config$max_standard_vehicle_age
+bitre_vehicle_year <- readr::read_csv( config$vehicle_year_distribution_file, show_col_types = FALSE ) |>
+  transmute( state = as.character(state), year_of_manufacture = as.integer(year_of_manufacture),
+    no_vehicles = as.numeric(no_vehicles), probability = as.numeric(probability) )
+vehicle_year_eligibility_summary <- readr::read_csv( config$vehicle_year_eligibility_file, show_col_types = FALSE )
+assert_columns( bitre_vehicle_year, c("state", "year_of_manufacture", "no_vehicles", "probability"),
+  "vehicle_year_distribution_by_state" )
+if ( any(bitre_vehicle_year$year_of_manufacture < minimum_eligible_manufacture_year) ||
+  any(bitre_vehicle_year$year_of_manufacture > config$cost_basis_year)
+) {
+  stop("Vehicle-year calibration contains vehicles outside the eligible range.")
+}
+vehicle_year_probability_check <- bitre_vehicle_year |> summarise(probability_sum = sum(probability), .by = state)
+if (any(abs(vehicle_year_probability_check$probability_sum - 1) > 1e-8)) {
+  stop("Vehicle-year probabilities do not sum to one within State.")
+}
+if (!identical( sort(unique(bitre_vehicle_year$state)), sort(unique(state_distribution$state))
+)) {
+  stop("At least one State has no eligible vehicle-year distribution.")
+}
+# Joint vehicle segment and motive power ---------------------------------------
+valid_vehicle_segments <- c( "Small Passenger", "Medium/Large Passenger", "Small/Medium SUV", "Large SUV/4WD",
+  "Sports/Performance", "People Mover/Other Passenger" )
+valid_motive_power <- c( "Petrol", "Diesel", "Hybrid Electric", "Battery/Fuel-cell Electric", "Other/Dual Fuel" )
+vehicle_segment_audit <- readr::read_csv( config$vehicle_segment_audit_file, show_col_types = FALSE )
+assert_columns( vehicle_segment_audit, "weighted_unclassified_vehicle_share",
+  "vehicle_segment_classification_audit" )
+unclassified_vehicle_weight <- as.numeric(vehicle_segment_audit$weighted_unclassified_vehicle_share[1])
+if ( !is.finite(unclassified_vehicle_weight) ||
+  unclassified_vehicle_weight > config$max_unclassified_vehicle_weight
+) {
+  stop("Weighted unclassified vehicle share exceeds the Module 1 limit.")
+}
+vehicle_segment_motive_power_by_year <- readr::read_csv(
+  config$vehicle_segment_motive_power_by_year_file, show_col_types = FALSE ) |> transmute(
+    year_of_manufacture = as.integer(year_of_manufacture), vehicle_segment = as.character(vehicle_segment),
+    motive_power = as.character(motive_power), no_vehicles = as.numeric(no_vehicles),
+    probability = as.numeric(probability) )
+vehicle_segment_motive_power_overall <- readr::read_csv(
+  config$vehicle_segment_motive_power_overall_file, show_col_types = FALSE ) |> transmute(
+    vehicle_segment = as.character(vehicle_segment), motive_power = as.character(motive_power),
+    no_vehicles = as.numeric(no_vehicles), probability = as.numeric(probability) )
+motive_power_distribution <- readr::read_csv( config$motive_power_distribution_file, show_col_types = FALSE ) |>
+  transmute( motive_power = as.character(motive_power), no_vehicles = as.numeric(no_vehicles),
+    probability = as.numeric(probability) )
+motive_power_km_calibration <- readr::read_csv( config$motive_power_km_calibration_file, show_col_types = FALSE
+) |> transmute( motive_power = as.character(motive_power),
+    source_mean_annual_km = as.numeric(source_mean_annual_km), km_relativity = as.numeric(km_relativity),
+    evidence_classification = as.character(evidence_classification) )
+missing_motive_power <- setdiff( valid_motive_power, unique(vehicle_segment_motive_power_by_year$motive_power) )
+if (length(missing_motive_power) > 0L) {
+  stop("Joint vehicle calibration is missing: ", paste(missing_motive_power, collapse = ", "))
+}
+if (length(setdiff( unique(vehicle_segment_motive_power_by_year$vehicle_segment), valid_vehicle_segments
+)) > 0L) {
+  stop("Invalid vehicle segment in joint vehicle/motive-power calibration.")
+}
+joint_probability_check <- vehicle_segment_motive_power_by_year |>
+  summarise(probability_sum = sum(probability), .by = year_of_manufacture)
+if ( any(abs(joint_probability_check$probability_sum - 1) > 1e-8) ||
+  abs(sum(vehicle_segment_motive_power_overall$probability) - 1) > 1e-8 ||
+  abs(sum(motive_power_distribution$probability) - 1) > 1e-8
+) {
+  stop("Invalid Module 0 joint vehicle/motive-power probabilities.")
+}
+if ( !setequal(motive_power_km_calibration$motive_power, valid_motive_power) ||
+  any(!is.finite(motive_power_km_calibration$km_relativity)) || any(motive_power_km_calibration$km_relativity <= 0)
+) {
+  stop("Invalid motive-power annual-kilometre calibration.")
+}
+# BITRE x CarExpert joint make/model/spec calibration -------------------------
+vehicle_make_model_spec_by_year <- readr::read_csv( config$vehicle_make_model_spec_file, show_col_types = FALSE
+) |> mutate( year_of_manufacture = as.integer(year_of_manufacture), make = as.character(make),
+    model = as.character(model), vehicle_segment = as.character(vehicle_segment),
+    motive_power = as.character(motive_power), no_vehicles = as.numeric(no_vehicles),
+    probability = as.numeric(probability), has_carexpert_spec = as.logical(has_carexpert_spec),
+    engine_capacity_l = as.numeric(engine_capacity_l), cylinder_count = as.numeric(cylinder_count),
+    power_kw = as.numeric(power_kw), power_rpm = as.numeric(power_rpm), torque_nm = as.numeric(torque_nm),
+    torque_rpm = as.numeric(torque_rpm), unladen_weight_kg = as.numeric(unladen_weight_kg) )
+assert_columns( vehicle_make_model_spec_by_year, c(
+    "year_of_manufacture", "make", "model", "vehicle_segment", "motive_power",
+    "no_vehicles", "probability", "vehicle_spec_match_status",
+    "has_carexpert_spec", "variant", "engine_capacity_l", "cylinder_count",
+    "power_kw", "torque_nm", "transmission_raw", "transmission_group", "unladen_weight_kg", "source_url" ),
+  "vehicle_make_model_spec_by_year" )
+vehicle_spec_probability_check <- vehicle_make_model_spec_by_year |>
+  summarise(probability_sum = sum(probability), .by = year_of_manufacture)
+if (any(abs(vehicle_spec_probability_check$probability_sum - 1) > 1e-8)) {
+  stop("Invalid make/model/spec probabilities from Module 0.")
+}
+vehicle_spec_donor_pool <- readr::read_csv( config$vehicle_spec_donor_pool_file, show_col_types = FALSE ) |>
+  mutate( year_of_manufacture = as.integer(year_of_manufacture), make = as.character(make),
+    model = as.character(model), vehicle_segment = as.character(vehicle_segment),
+    motive_power = as.character(motive_power), donor_weight = as.numeric(donor_weight),
+    engine_capacity_l = as.numeric(engine_capacity_l), cylinder_count = as.numeric(cylinder_count),
+    power_kw = as.numeric(power_kw), power_rpm = as.numeric(power_rpm), torque_nm = as.numeric(torque_nm),
+    torque_rpm = as.numeric(torque_rpm), unladen_weight_kg = as.numeric(unladen_weight_kg) )
+if ( nrow(vehicle_spec_donor_pool) == 0L || any(!is.finite(vehicle_spec_donor_pool$donor_weight)) ||
+  any(vehicle_spec_donor_pool$donor_weight <= 0)
+) {
+  stop("Invalid CarExpert vehicle-specification donor pool.")
+}
+# Helper used only for the residual fleet without a direct make/model/year
+# CarExpert specification. The hierarchy preserves year, segment and motive
+# power as tightly as possible. Crucially, a combustion target is never allowed
+# to inherit an EV-only engine specification simply because the same segment is
+# available. This avoids unresolved engine-capacity/cylinder fields downstream.
+vehicle_spec_compatible_pool <- function(target_motive) {
+  if (identical(target_motive, "Battery/Fuel-cell Electric")) {
+    vehicle_spec_donor_pool |> filter(motive_power == "Battery/Fuel-cell Electric")
+  } else {
+    vehicle_spec_donor_pool |> filter(motive_power != "Battery/Fuel-cell Electric")
+  }
+}
+# Shared donor hierarchy. Refactoring the hierarchy into one helper prevents the
+# full-row, numeric-field and transmission fallbacks from drifting apart while
+# preserving the original matching order exactly.
+vehicle_spec_candidate_pool <- function( target_year, target_segment, target_motive, field_name = NULL,
+    require_transmission = FALSE
+) {
+  compatible_pool <- vehicle_spec_compatible_pool(target_motive)
+  if (!is.null(field_name)) {
+    compatible_pool <- compatible_pool |> filter(is.finite(.data[[field_name]]))
+  }
+  if (isTRUE(require_transmission)) {
+    compatible_pool <- compatible_pool |> filter(!is.na(transmission_group), trimws(transmission_group) != "")
+  }
+  filters <- list( function(x) x |> filter( year_of_manufacture == target_year, vehicle_segment == target_segment,
+      motive_power == target_motive ), function(x) x |> filter( abs(year_of_manufacture - target_year) <= 2L,
+      vehicle_segment == target_segment, motive_power == target_motive ), function(x) x |> filter(
+      vehicle_segment == target_segment, motive_power == target_motive ),
+    function(x) x |> filter(motive_power == target_motive),
+    function(x) x |> filter(vehicle_segment == target_segment), function(x) x )
+  for (candidate_filter in filters) {
+    candidates <- candidate_filter(compatible_pool)
+    if (nrow(candidates) > 0L) return(candidates)
+  }
+  compatible_pool[0, , drop = FALSE]
+}
+select_vehicle_spec_donor <- function(target_year, target_segment, target_motive) {
+  candidates <- vehicle_spec_candidate_pool( target_year = target_year, target_segment = target_segment,
+    target_motive = target_motive )
+  if (nrow(candidates) == 0L) {
+    stop( "No compatible CarExpert specification donor available for motive power: ", target_motive )
+  }
+  candidates |> slice_sample(n = 1L, weight_by = donor_weight)
+}
+# RACQ vehicle values ----------------------------------------------------------
+racq_vehicle_values <- readr::read_csv( config$racq_vehicle_value_file, show_col_types = FALSE ) |> transmute(
+    make = as.character(make), model = as.character(model), vehicle_segment = as.character(vehicle_segment),
+    on_road_price = as.numeric(on_road_price), residual_value_5yr = as.numeric(residual_value_5yr),
+    residual_ratio_5yr = as.numeric(residual_ratio_5yr) )
+assert_columns( racq_vehicle_values, c( "make", "model", "vehicle_segment", "on_road_price",
+    "residual_value_5yr", "residual_ratio_5yr" ), "racq_vehicle_values_clean" )
+missing_racq_segments <- setdiff( valid_vehicle_segments, unique(racq_vehicle_values$vehicle_segment) )
+if (length(missing_racq_segments) > 0L) {
+  stop("RACQ calibration is missing: ", paste(missing_racq_segments, collapse = ", "))
+}
+if ( any(!is.finite(racq_vehicle_values$on_road_price)) ||
+  any(!is.finite(racq_vehicle_values$residual_value_5yr)) ||
+  any(!is.finite(racq_vehicle_values$residual_ratio_5yr)) || any(racq_vehicle_values$on_road_price <= 0) ||
+  any(racq_vehicle_values$residual_value_5yr <= 0) || any(racq_vehicle_values$residual_ratio_5yr <= 0 |
+      racq_vehicle_values$residual_ratio_5yr >= 1)
+) {
+  stop("Invalid RACQ vehicle-value calibration.")
+}
+# Additional quote-stage variable calibrations ---------------------------------
+additional_quote_calibrations <- readRDS( config$additional_quote_variable_calibration_file )
+required_additional_calibrations <- c( "parking_distribution_by_remoteness", "finance_distribution",
+  "vehicle_colour_distribution", "modification_type_distribution", "pre_existing_damage_type_distribution",
+  "annual_km_band_definition", "scalar_assumptions" )
+missing_additional_calibrations <- setdiff( required_additional_calibrations, names(additional_quote_calibrations)
+)
+if (length(missing_additional_calibrations) > 0L) {
+  stop("Additional quote-variable calibration object is missing: ", paste(missing_additional_calibrations, collapse = ", "))
+}
+parking_distribution_by_remoteness <- additional_quote_calibrations$parking_distribution_by_remoteness
+finance_distribution <- additional_quote_calibrations$finance_distribution
+vehicle_colour_distribution <- additional_quote_calibrations$vehicle_colour_distribution
+modification_type_distribution <- additional_quote_calibrations$modification_type_distribution
+pre_existing_damage_type_distribution <- additional_quote_calibrations$pre_existing_damage_type_distribution
+annual_km_band_definition <- additional_quote_calibrations$annual_km_band_definition
+quote_scalar_assumptions <- additional_quote_calibrations$scalar_assumptions
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 4. CUSTOMER AND GEOGRAPHY ----------------------------------------------------
+n <- config$n_policies
+if (config$n_policies_per_cohort * length(config$cohort_years) != n) {
+  stop("n_policies must equal n_policies_per_cohort x number of cohort years.")
+}
+# Exactly 10,000 independent new-business quote opportunities are generated for
+# each annual cohort. The rows are shuffled after assigning policy year so policy
+# IDs do not encode calendar year.
+policy_year_vector <- rep(config$cohort_years, each = config$n_policies_per_cohort)
+policy_year_vector <- sample(policy_year_vector, length(policy_year_vector), replace = FALSE)
+portfolio <- tibble( policy_id = sprintf("POL%07d", seq_len(n)), quote_profile_id = sprintf("QPF%07d", seq_len(n)),
+  policy_year = as.integer(policy_year_vector), state = NA_character_, age_group = sample(
+    driver_age_distribution$age_group, n, replace = TRUE, prob = driver_age_distribution$probability ) )
+# State varies empirically by cohort year.
+for (yr in config$cohort_years) {
+  idx <- which(portfolio$policy_year == yr)
+  d <- state_distribution_by_policy_year |> filter(policy_year == yr)
+  portfolio$state[idx] <- sample(d$state, length(idx), replace = TRUE, prob = d$probability)
+}
+# P(Remoteness | State) is held at the Module 0 empirical geographic crosswalk,
+# while State weights vary by cohort year.
+portfolio$remoteness_area <- NA_character_
+for (yr in config$cohort_years) {
+  for (s in unique(portfolio$state[portfolio$policy_year == yr])) {
+    idx <- which(portfolio$policy_year == yr & portfolio$state == s)
+    d <- state_remoteness_distribution_by_policy_year |> filter(policy_year == yr, state == s)
+    if (nrow(d) == 0L) stop("No remoteness calibration for ", yr, " / ", s)
+    portfolio$remoteness_area[idx] <- sample(d$remoteness_area, length(idx), replace = TRUE, prob = d$probability)
+  }
+}
+portfolio$driver_age <- sample_age_from_group(portfolio$age_group)
+portfolio$driver_sex_audit <- sample(c("Female", "Male"), n, replace = TRUE, prob = c(0.49, 0.51))
+portfolio <- portfolio |> mutate(
+    licence_start_age = pmin(driver_age, pmax(17L, pmin(25L, as.integer(round(rnorm(n(), mean = 18.3, sd = 1.8)))))),
+    licence_years = pmax(driver_age - licence_start_age, 0L), cover_type = "Comprehensive", exposure = 1,
+    policy_term_assumption = "Full one-year term; no cancellation, lapse, amendment, endorsement or vehicle substitution"
+  ) |> left_join(annual_cost_level_indices, by = "policy_year")
+# Synthetic localities and shared geographic risk -----------------------------
+# One common locality lattice is used across years. This represents persistent
+# geographic heterogeneity, while annual State mix changes empirically.
+joint_geography_targets <- state_distribution |> select(state, state_probability = probability) |>
+  left_join(state_remoteness_distribution, by = "state") |>
+  mutate(joint_probability = state_probability * probability)
+locality_structure <- joint_geography_targets |> filter(joint_probability > 0) |>
+  mutate(n_localities = pmax(1L, as.integer(round(config$target_localities * joint_probability)))) |>
+  tidyr::uncount(n_localities, .id = "locality_within_cell") |>
+  mutate(locality_id = sprintf("LOC%04d", row_number())) |>
+  mutate(latent_geographic_effect = rlnorm(n(), meanlog = -0.5 * config$local_geographic_sdlog^2, sdlog = config$local_geographic_sdlog))
+portfolio$locality_id <- NA_character_
+for (s in unique(portfolio$state)) {
+  for (r in unique(portfolio$remoteness_area[portfolio$state == s])) {
+    idx <- which(portfolio$state == s & portfolio$remoteness_area == r)
+    candidates <- locality_structure |> filter(state == s, remoteness_area == r) |> pull(locality_id)
+    if (length(candidates) == 0L) stop("No synthetic locality exists for ", s, " / ", r)
+    portfolio$locality_id[idx] <- sample(candidates, length(idx), replace = TRUE)
+  }
+}
+portfolio <- portfolio |>
+  left_join(locality_structure |> select(locality_id, latent_geographic_effect), by = "locality_id")
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 5. VEHICLE CHARACTERISTICS ---------------------------------------------------
+# Manufacture year is sampled from each cohort-year x State fleet distribution.
+portfolio$year_of_manufacture <- NA_integer_
+for (yr in config$cohort_years) {
+  for (s in unique(portfolio$state[portfolio$policy_year == yr])) {
+    idx <- which(portfolio$policy_year == yr & portfolio$state == s)
+    d <- vehicle_year_distribution_by_policy_year_state |> filter(policy_year == yr, state == s)
+    if (nrow(d) == 0L) stop("No vehicle-year distribution for ", yr, " / ", s)
+    portfolio$year_of_manufacture[idx] <- sample(d$year_of_manufacture, length(idx), replace = TRUE, prob = d$probability)
+  }
+}
+portfolio <- portfolio |> mutate(vehicle_age = pmax(0L, policy_year - year_of_manufacture))
+if (any(portfolio$vehicle_age > config$max_standard_vehicle_age)) stop("Generated vehicle exceeds max_standard_vehicle_age.")
+# Make/model/segment/motive power are sampled jointly from the annual fleet
+# conditional on cohort year and manufacture year. Physical specifications are
+# then attached from the common CarExpert representative lookup; residual gaps
+# use the existing empirical donor hierarchy.
+vehicle_fields <- c( "vehicle_make", "vehicle_model", "vehicle_segment", "motive_power",
+  "vehicle_spec_match_status", "vehicle_variant", "engine_capacity_l",
+  "cylinder_count", "power_kw", "power_rpm", "torque_nm", "torque_rpm",
+  "transmission_raw", "transmission_group", "unladen_weight_kg",
+  "vehicle_spec_source_url", "vehicle_spec_source_access_date" )
+for (nm in vehicle_fields) portfolio[[nm]] <- if (nm %in% c("engine_capacity_l","cylinder_count","power_kw","power_rpm","torque_nm","torque_rpm","unladen_weight_kg")) NA_real_ else NA_character_
+portfolio$vehicle_spec_imputed <- FALSE
+portfolio$power_kw_imputed <- FALSE
+portfolio$torque_nm_imputed <- FALSE
+portfolio$segment_distribution_fallback <- FALSE
+for (yr in config$cohort_years) {
+  for (yom in unique(portfolio$year_of_manufacture[portfolio$policy_year == yr])) {
+    idx <- which(portfolio$policy_year == yr & portfolio$year_of_manufacture == yom)
+    d <- vehicle_make_model_distribution_by_policy_year |> filter(policy_year == yr, year_of_manufacture == yom)
+    if (nrow(d) == 0L) stop("No make/model distribution for policy year ", yr, " and manufacture year ", yom)
+    rows <- sample(seq_len(nrow(d)), length(idx), replace = TRUE, prob = d$probability)
+    sampled <- d[rows, , drop = FALSE]
+    portfolio$vehicle_make[idx] <- sampled$make
+    portfolio$vehicle_model[idx] <- sampled$model
+    portfolio$vehicle_segment[idx] <- sampled$vehicle_segment
+    portfolio$motive_power[idx] <- sampled$motive_power
+  }
+}
+# Attach exact representative CarExpert specifications where available.
+spec_lookup <- vehicle_make_model_spec_by_year |> transmute( year_of_manufacture = as.integer(year_of_manufacture),
+    vehicle_make = as.character(make), vehicle_model = as.character(model),
+    motive_power = as.character(motive_power), vehicle_spec_match_status, vehicle_variant = variant,
+    engine_capacity_l, cylinder_count, power_kw, power_rpm, torque_nm, torque_rpm,
+    transmission_raw, transmission_group, unladen_weight_kg, vehicle_spec_source_url = source_url,
+    vehicle_spec_source_access_date = source_access_date ) |>
+  distinct(year_of_manufacture, vehicle_make, vehicle_model, motive_power, .keep_all = TRUE)
+portfolio <- portfolio |>
+  select(-any_of(c("vehicle_spec_match_status","vehicle_variant","engine_capacity_l","cylinder_count","power_kw","power_rpm","torque_nm","torque_rpm","transmission_raw","transmission_group","unladen_weight_kg","vehicle_spec_source_url","vehicle_spec_source_access_date"))) |>
+  left_join(spec_lookup, by = c("year_of_manufacture","vehicle_make","vehicle_model","motive_power"))
+if (anyNA(portfolio$vehicle_make) || anyNA(portfolio$vehicle_model) || anyNA(portfolio$vehicle_segment) || anyNA(portfolio$motive_power)) {
+  stop("Annual make/model/segment/motive-power simulation produced missing values.")
+}
+# Full-row empirical donor fallback for the residual make/model/year combinations
+# without a direct CarExpert specification. The simulated BITRE make/model itself
+# is retained; only the missing representative specification fields are borrowed.
+fallback_idx <- which(is.na(portfolio$vehicle_spec_source_url))
+if (length(fallback_idx) > 0L) {
+  for (i in fallback_idx) {
+    donor <- select_vehicle_spec_donor( portfolio$year_of_manufacture[i], portfolio$vehicle_segment[i],
+      portfolio$motive_power[i] )
+    portfolio$vehicle_variant[i] <- paste0( "Empirical donor specification: ", donor$make, " ", donor$model,
+      " (", donor$year_of_manufacture, ") - ", donor$variant )
+    portfolio$engine_capacity_l[i] <- donor$engine_capacity_l
+    portfolio$cylinder_count[i] <- donor$cylinder_count
+    portfolio$power_kw[i] <- donor$power_kw
+    portfolio$power_rpm[i] <- donor$power_rpm
+    portfolio$torque_nm[i] <- donor$torque_nm
+    portfolio$torque_rpm[i] <- donor$torque_rpm
+    portfolio$transmission_raw[i] <- donor$transmission_raw
+    portfolio$transmission_group[i] <- donor$transmission_group
+    portfolio$unladen_weight_kg[i] <- donor$unladen_weight_kg
+    portfolio$vehicle_spec_source_url[i] <- donor$source_url
+    portfolio$vehicle_spec_source_access_date[i] <- donor$source_access_date
+    portfolio$vehicle_spec_imputed[i] <- TRUE
+    portfolio$vehicle_spec_match_status[i] <- "Empirical donor fallback"
+  }
+}
+# Complete isolated specification gaps using compatible empirical donors.
+# Direct CarExpert matches are retained wherever present. A donor is used only
+# when the representative row itself lacks the required field. Any such use is
+# flagged through vehicle_spec_imputed and, for power/torque, the dedicated flags.
+fill_numeric_spec_from_donors <- function( data, field_name, flag_name = NULL, eligible_idx = NULL
+) {
+  if (is.null(eligible_idx)) {
+    eligible_idx <- seq_len(nrow(data))
+  }
+  missing_idx <- eligible_idx[!is.finite(data[[field_name]][eligible_idx])]
+  for (i in missing_idx) {
+    candidates <- vehicle_spec_candidate_pool( target_year = data$year_of_manufacture[i],
+      target_segment = data$vehicle_segment[i], target_motive = data$motive_power[i], field_name = field_name )
+    if (nrow(candidates) == 0L) {
+      stop( "No finite compatible donor available for vehicle specification field '", field_name,
+        "' and motive power '", data$motive_power[i], "'." )
+    }
+    donor <- candidates |> slice_sample(n = 1L, weight_by = donor_weight)
+    data[[field_name]][i] <- as.numeric(donor[[field_name]][1])
+    data$vehicle_spec_imputed[i] <- TRUE
+    if (!is.null(flag_name)) {
+      data[[flag_name]][i] <- TRUE
+    }
+  }
+  data
+}
+fill_transmission_from_donors <- function(data) {
+  missing_idx <- which( is.na(data$transmission_group) | trimws(data$transmission_group) == "" )
+  for (i in missing_idx) {
+    candidates <- vehicle_spec_candidate_pool( target_year = data$year_of_manufacture[i],
+      target_segment = data$vehicle_segment[i], target_motive = data$motive_power[i], require_transmission = TRUE )
+    if (nrow(candidates) == 0L) {
+      stop( "No compatible transmission donor available for motive power: ", data$motive_power[i] )
+    }
+    donor <- candidates |> slice_sample(n = 1L, weight_by = donor_weight)
+    data$transmission_raw[i] <- as.character(donor$transmission_raw[1])
+    data$transmission_group[i] <- as.character(donor$transmission_group[1])
+    data$vehicle_spec_imputed[i] <- TRUE
+  }
+  data
+}
+# Battery/fuel-cell electric vehicles do not have ICE displacement or cylinders.
+# Use zero to encode 'not applicable' in the rectangular modelling table.
+ev_idx_specs <- which(portfolio$motive_power == "Battery/Fuel-cell Electric")
+non_ev_idx_specs <- which(portfolio$motive_power != "Battery/Fuel-cell Electric")
+portfolio$engine_capacity_l[ ev_idx_specs[!is.finite(portfolio$engine_capacity_l[ev_idx_specs])] ] <- 0
+portfolio$cylinder_count[ ev_idx_specs[!is.finite(portfolio$cylinder_count[ev_idx_specs])] ] <- 0
+# For non-EVs, missing engine displacement/cylinder counts are genuine gaps and
+# are therefore completed only from non-EV compatible empirical donors.
+portfolio <- fill_numeric_spec_from_donors( portfolio, "engine_capacity_l", eligible_idx = non_ev_idx_specs )
+portfolio <- fill_numeric_spec_from_donors( portfolio, "cylinder_count", eligible_idx = non_ev_idx_specs )
+# Power and torque are meaningful for both ICE and electric vehicles.
+portfolio <- fill_numeric_spec_from_donors( portfolio, "power_kw", "power_kw_imputed" )
+portfolio <- fill_numeric_spec_from_donors( portfolio, "torque_nm", "torque_nm_imputed" )
+# Weight and transmission must also be complete for the downstream modelling file.
+portfolio <- fill_numeric_spec_from_donors( portfolio, "unladen_weight_kg" )
+portfolio <- fill_transmission_from_donors(portfolio)
+count_unresolved_vehicle_specs <- function(data) {
+  c( engine_capacity_l = sum(!is.finite(data$engine_capacity_l)),
+    cylinder_count = sum(!is.finite(data$cylinder_count)), power_kw = sum(!is.finite(data$power_kw)),
+    torque_nm = sum(!is.finite(data$torque_nm)), unladen_weight_kg = sum(!is.finite(data$unladen_weight_kg)),
+    transmission_group = sum( is.na(data$transmission_group) | trimws(data$transmission_group) == "" ) )
+}
+vehicle_spec_unresolved_counts <- count_unresolved_vehicle_specs(portfolio)
+if (any(vehicle_spec_unresolved_counts > 0L)) {
+  stop( "Vehicle specification integration produced unresolved core fields: ", paste(
+      names(vehicle_spec_unresolved_counts), vehicle_spec_unresolved_counts, sep = "=", collapse = ", " ) )
+}
+# RACQ-calibrated vehicle value -------------------------------------------------
+# RACQ provides 2025 on-road prices. The ABS Motor vehicles CPI ratio supplied by
+portfolio$racq_calibration_row <- NA_integer_
+for (segment in valid_vehicle_segments) {
+  idx <- which(portfolio$vehicle_segment == segment)
+  source_rows <- which(racq_vehicle_values$vehicle_segment == segment)
+  portfolio$racq_calibration_row[idx] <- sample(source_rows, length(idx), replace = TRUE)
+}
+portfolio <- portfolio |> mutate(
+    new_vehicle_value_2025_basis = racq_vehicle_values$on_road_price[racq_calibration_row],
+    residual_ratio_5yr = racq_vehicle_values$residual_ratio_5yr[racq_calibration_row],
+    depreciation_multiplier = residual_ratio_5yr^(vehicle_age / 5),
+    vehicle_value_2025_basis = pmax(config$vehicle_value_floor, new_vehicle_value_2025_basis * depreciation_multiplier),
+    vehicle_value_2025_basis = pmin(vehicle_value_2025_basis, new_vehicle_value_2025_basis),
+    new_vehicle_value_nominal = new_vehicle_value_2025_basis * motor_vehicle_price_level,
+    vehicle_value_nominal = vehicle_value_2025_basis * motor_vehicle_price_level,
+    # vehicle_value remains the observable cohort-year nominal value. The
+    # explicitly on-levelled version is retained for later multi-year modelling.
+    new_vehicle_value = round(new_vehicle_value_nominal, -2), vehicle_value = round(vehicle_value_nominal, -2),
+    new_vehicle_value_2025_basis = round(new_vehicle_value_2025_basis, -2),
+    vehicle_value_2025_basis = round(vehicle_value_2025_basis, -2) )
+# Annual kilometres ------------------------------------------------------------
+# Age and remoteness factors are literature-informed simulation assumptions.
+# Motive-power mileage relativities are imported from Module 0.
+age_km_rel <- case_when( portfolio$driver_age <= 24 ~ 1.10, portfolio$driver_age <= 59 ~ 1.00,
+  portfolio$driver_age <= 69 ~ 0.87, portfolio$driver_age <= 79 ~ 0.72, TRUE ~ 0.58 )
+remoteness_km_rel <- c( `Major Cities` = 0.94, `Inner Regional` = 1.10, `Outer Regional` = 1.18, Remote = 1.24,
+  `Very Remote` = 1.27 )
+motive_power_km_rel <- setNames( motive_power_km_calibration$km_relativity,
+  motive_power_km_calibration$motive_power )
+if (any(!portfolio$motive_power %in% names(motive_power_km_rel))) {
+  stop("A simulated motive-power category has no annual-kilometre relativity.")
+}
+annual_km_raw <- rlnorm_mean_cv( n, rep(config$target_mean_annual_km, n), config$annual_km_cv ) * age_km_rel *
+  unname(remoteness_km_rel[portfolio$remoteness_area]) * unname(motive_power_km_rel[portfolio$motive_power])
+portfolio$annual_km <- NA_real_
+for (yr in config$cohort_years) {
+  idx <- which(portfolio$policy_year == yr)
+  scaled <- annual_km_raw[idx] * config$target_mean_annual_km / mean(annual_km_raw[idx])
+  scaled <- pmax(1500, pmin(50000, scaled))
+  scaled <- scaled * config$target_mean_annual_km / mean(scaled)
+  portfolio$annual_km[idx] <- round(scaled, -2)
+}
+# Voluntary excess -------------------------------------------------------------
+portfolio$voluntary_excess <- sample( c(400, 600, 800, 1000, 1500), n, replace = TRUE,
+  prob = c(0.10, 0.25, 0.35, 0.20, 0.10) )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 6. CLAIM FREQUENCY -----------------------------------------------------------
+age_frequency_rel <- pmin( 2.20, exp(0.00055 * (portfolio$driver_age - 50)^2) )
+experience_frequency_rel <- exp( -0.020 * pmin(portfolio$licence_years, 15) )
+km_frequency_rel <- ( portfolio$annual_km / config$target_mean_annual_km )^config$mileage_frequency_exponent
+# No direct State, Remoteness, vehicle-age, segment, motive-power, engine-power,
+# torque or unladen-weight frequency relativity is imposed in the baseline truth.
+# The new CarExpert specification fields are observable covariates, not imposed
+# causal claims relativities.
+vehicle_segment_frequency_rel <- rep(1, n)
+frailty_shape <- 1 / config$frailty_variance
+frailty_scale <- config$frailty_variance
+unobserved_frailty <- rgamma( n, shape = frailty_shape, scale = frailty_scale )
+raw_frequency_risk <- age_frequency_rel * experience_frequency_rel * km_frequency_rel *
+  vehicle_segment_frequency_rel * portfolio$latent_geographic_effect * unobserved_frailty
+# Calibrate P(N >= 1) to 14%, rather than E[N].
+claimant_rate_objective <- function(frequency_scaler) {
+  idx_2025 <- portfolio$policy_year == config$cost_basis_year
+  mean(1 - exp(-frequency_scaler * raw_frequency_risk[idx_2025])) - config$target_annual_claimant_rate
+}
+frequency_scaler <- uniroot( claimant_rate_objective, interval = c(1e-6, 5) )$root
+true_annual_claim_frequency <- frequency_scaler * raw_frequency_risk
+# Five-year claims history ------------------------------------------------------
+historical_claims_matrix <- sapply(5:1, function(year_back) {
+  rpois(n, lambda = true_annual_claim_frequency)
+})
+colnames(historical_claims_matrix) <- paste0("claims_t_minus_", 5:1)
+portfolio <- bind_cols(portfolio, as_tibble(historical_claims_matrix)) |> mutate(
+    prior_claims_5yr = rowSums(historical_claims_matrix),
+    claim_free_years = consecutive_claim_free_years(historical_claims_matrix) )
+# Current year
+portfolio$claim_count <- rpois(n, lambda = true_annual_claim_frequency)
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 7. CLAIM SEVERITY ------------------------------------------------------------
+# The 2025 cohort is the common actuarial cost basis. Historical claims are
+# generated at their cohort-year nominal level and separately on-levelled to
+# 2025 dollars. The 2025 mean paid severity is calibrated to $5,202.
+idx_2025 <- which(portfolio$policy_year == config$cost_basis_year)
+# Total-loss payments: cohort-year nominal and equivalent 2025 basis.
+total_loss_paid_amount_nominal <- pmax(portfolio$vehicle_value - portfolio$voluntary_excess, 0)
+total_loss_paid_amount_2025 <- total_loss_paid_amount_nominal / portfolio$motor_vehicle_price_level
+claim_weighted_mean_total_loss_2025 <- weighted.mean( total_loss_paid_amount_2025[idx_2025],
+  w = true_annual_claim_frequency[idx_2025] )
+target_total_loss_dollars_per_claim <- config$target_total_loss_cost_share * config$target_mean_paid_claim_severity
+total_loss_probability <- target_total_loss_dollars_per_claim / claim_weighted_mean_total_loss_2025
+if (!is.finite(total_loss_probability) || total_loss_probability <= 0 || total_loss_probability >= 1) {
+  stop("Derived total-loss probability is invalid: ", total_loss_probability)
+}
+# Non-total-loss 2025-basis severity varies with 2025-basis vehicle value.
+vehicle_value_reference_2025 <- weighted.mean( portfolio$vehicle_value_2025_basis[idx_2025],
+  w = true_annual_claim_frequency[idx_2025] )
+vehicle_value_severity_rel <- (portfolio$vehicle_value_2025_basis / vehicle_value_reference_2025)^config$vehicle_value_severity_exponent
+vehicle_value_severity_rel <- vehicle_value_severity_rel /
+  weighted.mean(vehicle_value_severity_rel[idx_2025], w = true_annual_claim_frequency[idx_2025])
+target_non_total_loss_paid_conditional <- ((1 - config$target_total_loss_cost_share) * config$target_mean_paid_claim_severity) / (1 - total_loss_probability)
+non_tl_scale_objective <- function(base_gross_mean) {
+  gross_mean_i <- base_gross_mean * vehicle_value_severity_rel[idx_2025]
+  expected_paid_i <- expected_lognormal_payment_above_excess(
+    gross_mean_i, rep(config$non_total_loss_cv, length(idx_2025)), portfolio$voluntary_excess[idx_2025] )
+  weighted.mean(expected_paid_i, w = true_annual_claim_frequency[idx_2025]) - target_non_total_loss_paid_conditional
+}
+non_total_loss_base_gross_mean_2025 <- uniroot(non_tl_scale_objective, interval = c(1000, 100000))$root
+true_non_total_loss_gross_mean_2025 <- non_total_loss_base_gross_mean_2025 * vehicle_value_severity_rel
+true_non_total_loss_paid_mean_2025 <- expected_lognormal_payment_above_excess( true_non_total_loss_gross_mean_2025,
+  rep(config$non_total_loss_cv, n), portfolio$voluntary_excess / portfolio$claims_cost_level )
+# Historical nominal gross losses are backcast using the ABS repair-cost index.
+true_non_total_loss_gross_mean_nominal <- true_non_total_loss_gross_mean_2025 * portfolio$claims_cost_level
+true_non_total_loss_paid_mean_nominal <- expected_lognormal_payment_above_excess(
+  true_non_total_loss_gross_mean_nominal, rep(config$non_total_loss_cv, n), portfolio$voluntary_excess )
+true_mean_claim_severity_2025 <- total_loss_probability * total_loss_paid_amount_2025 +
+  (1 - total_loss_probability) * true_non_total_loss_paid_mean_2025
+true_mean_claim_severity_nominal <- total_loss_probability * total_loss_paid_amount_nominal +
+  (1 - total_loss_probability) * true_non_total_loss_paid_mean_nominal
+true_annual_loss_cost_2025 <- true_annual_claim_frequency * true_mean_claim_severity_2025
+true_annual_loss_cost_nominal <- true_annual_claim_frequency * true_mean_claim_severity_nominal
+# Compatibility aliases use the 2025 on-levelled truth, because Module 2 fits a
+# common technical model on on-levelled historical claims.
+true_non_total_loss_gross_mean <- true_non_total_loss_gross_mean_2025
+true_non_total_loss_paid_mean <- true_non_total_loss_paid_mean_2025
+true_total_loss_paid_amount <- total_loss_paid_amount_2025
+true_mean_claim_severity <- true_mean_claim_severity_2025
+true_annual_loss_cost <- true_annual_loss_cost_2025
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 8. LATENT TECHNICAL PREMIUM --------------------------------------------------
+# Calibrate the latent actuarial price scale to mean $1,052 in the 2025 cohort,
+# then apply the same multiplicative loading relationship to every year.
+premium_loading_factor <- config$target_mean_technical_premium / mean(true_annual_loss_cost_nominal[idx_2025])
+true_technical_premium_nominal <- premium_loading_factor * true_annual_loss_cost_nominal
+true_technical_premium_2025 <- premium_loading_factor * true_annual_loss_cost_2025
+true_technical_premium <- true_technical_premium_2025
+implied_true_claim_ratio <- sum(true_annual_loss_cost_nominal[idx_2025]) / sum(true_technical_premium_nominal[idx_2025])
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 9. CLAIM-LEVEL EXPERIENCE ----------------------------------------------------
+claim_rows <- portfolio |> select(policy_id, policy_year, vehicle_value, vehicle_value_2025_basis,
+         voluntary_excess, claims_cost_level, motor_vehicle_price_level, claim_count) |> mutate(
+    true_non_total_loss_gross_mean_nominal = true_non_total_loss_gross_mean_nominal,
+    true_non_total_loss_gross_mean_2025 = true_non_total_loss_gross_mean_2025 ) |> filter(claim_count > 0) |>
+  tidyr::uncount(claim_count, .id = "claim_number")
+if (nrow(claim_rows) > 0L) {
+  claims <- claim_rows |> mutate( total_loss = rbinom(n(), size = 1, prob = total_loss_probability) == 1,
+      gross_claim_cost_nominal = if_else( total_loss, vehicle_value,
+        rlnorm_mean_cv(n(), true_non_total_loss_gross_mean_nominal, config$non_total_loss_cv) ),
+      incurred_claim_cost_nominal = pmax(gross_claim_cost_nominal - voluntary_excess, 0),
+      onlevel_factor_to_2025 = if_else(total_loss, 1 / motor_vehicle_price_level, 1 / claims_cost_level),
+      gross_claim_cost_2025 = gross_claim_cost_nominal * onlevel_factor_to_2025,
+      incurred_claim_cost_2025 = incurred_claim_cost_nominal * onlevel_factor_to_2025,
+      # Compatibility aliases supplied to Module 2 are on the common 2025 basis.
+      gross_claim_cost = gross_claim_cost_2025, incurred_claim_cost = incurred_claim_cost_2025 ) |>
+    mutate(across(c(gross_claim_cost_nominal, incurred_claim_cost_nominal,
+                    gross_claim_cost_2025, incurred_claim_cost_2025,
+                    gross_claim_cost, incurred_claim_cost), ~round(.x, 2))) |>
+    select(policy_id, policy_year, claim_number, total_loss, gross_claim_cost_nominal, incurred_claim_cost_nominal,
+           gross_claim_cost_2025, incurred_claim_cost_2025,
+           gross_claim_cost, voluntary_excess, incurred_claim_cost)
+} else {
+  claims <- tibble(
+    policy_id = character(), policy_year = integer(), claim_number = integer(), total_loss = logical(),
+    gross_claim_cost_nominal = numeric(), incurred_claim_cost_nominal = numeric(),
+    gross_claim_cost_2025 = numeric(), incurred_claim_cost_2025 = numeric(),
+    gross_claim_cost = numeric(), voluntary_excess = numeric(), incurred_claim_cost = numeric() )
+}
+claim_summary <- claims |> group_by(policy_id) |> summarise( observed_claim_count = n(),
+    incurred_claim_cost = sum(incurred_claim_cost), incurred_claim_cost_nominal = sum(incurred_claim_cost_nominal),
+    gross_claim_cost = sum(gross_claim_cost), gross_claim_cost_nominal = sum(gross_claim_cost_nominal),
+    largest_paid_claim = max(incurred_claim_cost), largest_paid_claim_nominal = max(incurred_claim_cost_nominal),
+    total_loss_claim_count = sum(total_loss), any_total_loss = any(total_loss), .groups = "drop" )
+portfolio <- portfolio |> left_join(claim_summary, by = "policy_id") |> mutate(
+    observed_claim_count = replace_na(observed_claim_count, 0L),
+    incurred_claim_cost = replace_na(incurred_claim_cost, 0),
+    incurred_claim_cost_nominal = replace_na(incurred_claim_cost_nominal, 0),
+    gross_claim_cost = replace_na(gross_claim_cost, 0),
+    gross_claim_cost_nominal = replace_na(gross_claim_cost_nominal, 0),
+    largest_paid_claim = replace_na(largest_paid_claim, 0),
+    largest_paid_claim_nominal = replace_na(largest_paid_claim_nominal, 0),
+    total_loss_claim_count = replace_na(total_loss_claim_count, 0L),
+    any_total_loss = replace_na(any_total_loss, FALSE),
+    average_paid_claim_cost = if_else(observed_claim_count > 0, incurred_claim_cost / observed_claim_count, NA_real_),
+    average_paid_claim_cost_nominal = if_else(observed_claim_count > 0, incurred_claim_cost_nominal / observed_claim_count, NA_real_)
+  )
+if (!all(portfolio$claim_count == portfolio$observed_claim_count)) stop("Policy claim counts do not match the claim-level file.")
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 10. DATA SPLIT AND OUTPUT DATASETS -------------------------------------------
+# Out-of-time model-development split: 2021-2023 TRAIN, 2024 VALIDATION,
+# 2025 TEST. This replaces the previous random 60/20/20 split.
+portfolio$data_split <- case_when( portfolio$policy_year <= 2023L ~ "train",
+  portfolio$policy_year == 2024L ~ "validation", portfolio$policy_year == 2025L ~ "test", TRUE ~ NA_character_ )
+if (anyNA(portfolio$data_split)) stop("Unable to assign temporal data split.")
+# 10.1 ADDITIONAL QUOTE-STAGE UNDERWRITING VARIABLES ---------------------------
+# Generated after claims and split so the previously validated claims DGP and
+# train/validation/test assignment remain unchanged.
+annual_km_breaks <- c( -Inf, annual_km_band_definition$upper_km[is.finite(annual_km_band_definition$upper_km)], Inf
+)
+portfolio$annual_km_band <- cut( portfolio$annual_km, breaks = annual_km_breaks,
+  labels = annual_km_band_definition$annual_km_band, right = TRUE, ordered_result = TRUE )
+portfolio$overnight_parking <- sample_conditional_long(
+  portfolio$remoteness_area, parking_distribution_by_remoteness,
+  "remoteness_area", "overnight_parking", "probability" )
+portfolio$finance_status <- sample( finance_distribution$finance_status, n, replace = TRUE,
+  prob = finance_distribution$probability )
+portfolio$vehicle_colour <- sample( vehicle_colour_distribution$vehicle_colour, n, replace = TRUE,
+  prob = vehicle_colour_distribution$probability )
+portfolio$vehicle_modified <- rbinom( n, 1, quote_scalar_assumptions$vehicle_modified_probability ) == 1
+portfolio$modification_type <- "None"
+modified_idx <- which(portfolio$vehicle_modified)
+if (length(modified_idx) > 0L) {
+  portfolio$modification_type[modified_idx] <- sample(
+    modification_type_distribution$modification_type, length(modified_idx),
+    replace = TRUE, prob = modification_type_distribution$probability )
+}
+portfolio$pre_existing_damage <- rbinom( n, 1, quote_scalar_assumptions$pre_existing_damage_probability ) == 1
+portfolio$pre_existing_damage_type <- "None"
+damage_idx <- which(portfolio$pre_existing_damage)
+if (length(damage_idx) > 0L) {
+  portfolio$pre_existing_damage_type[damage_idx] <- sample(
+    pre_existing_damage_type_distribution$damage_type, length(damage_idx),
+    replace = TRUE, prob = pre_existing_damage_type_distribution$probability )
+}
+portfolio$policyholder_is_regular_driver <- rbinom(
+  n, 1, quote_scalar_assumptions$policyholder_is_regular_driver_probability ) == 1
+# Transmission is sourced exclusively from the CarExpert representative
+# specification layer (direct match or documented empirical donor fallback).
+# No parallel synthetic transmission-by-year assumption is retained.
+portfolio$transmission <- as.character(portfolio$transmission_group)
+if ( anyNA(portfolio$transmission) || any(trimws(portfolio$transmission) == "")
+) {
+  stop("Vehicle-specification integration left at least one transmission unresolved.")
+}
+portfolio$policy_inception_date <- as.Date(NA_character_)
+for (yr in config$cohort_years) {
+  idx <- which(portfolio$policy_year == yr)
+  start <- as.Date(paste0(yr, "-01-01"))
+  end <- as.Date(paste0(yr, "-12-31"))
+  portfolio$policy_inception_date[idx] <- start + sample(0:as.integer(end - start), length(idx), replace = TRUE)
+}
+portfolio$quote_lead_days <- sample(0:as.integer(quote_scalar_assumptions$maximum_quote_lead_days), n, replace = TRUE)
+portfolio$quote_date <- portfolio$policy_inception_date - portfolio$quote_lead_days
+portfolio$policy_expiry_date <- portfolio$policy_inception_date + 365
+portfolio <- portfolio |> mutate(
+    inception_month = factor(format(policy_inception_date, "%b"), levels = month.abb, ordered = TRUE),
+    inception_quarter = paste0("Q", ceiling(as.integer(format(policy_inception_date, "%m")) / 3)) )
+if (anyNA(portfolio$annual_km_band) || anyNA(portfolio$overnight_parking) ||
+    anyNA(portfolio$finance_status) || anyNA(portfolio$vehicle_colour) ||
+    anyNA(portfolio$transmission) || anyNA(portfolio$policy_inception_date)) {
+  stop("At least one additional quote-stage variable contains missing values.")
+}
+portfolio_full <- portfolio |> mutate(
+    # Compatibility truth fields used by downstream modules. These are explicitly
+    # bound here rather than relying on external vectors during tidyselect.
+    true_annual_claim_frequency = true_annual_claim_frequency, true_mean_claim_severity = true_mean_claim_severity,
+    true_non_total_loss_gross_mean = true_non_total_loss_gross_mean,
+    true_non_total_loss_paid_mean = true_non_total_loss_paid_mean,
+    true_total_loss_probability = total_loss_probability,
+    true_total_loss_paid_amount = total_loss_paid_amount_2025, true_annual_loss_cost = true_annual_loss_cost,
+    true_technical_premium = true_technical_premium,
+    # Multi-year nominal and 2025 on-levelled truth fields.
+    true_mean_claim_severity_nominal = true_mean_claim_severity_nominal,
+    true_mean_claim_severity_2025 = true_mean_claim_severity_2025,
+    true_annual_loss_cost_nominal = true_annual_loss_cost_nominal,
+    true_annual_loss_cost_2025 = true_annual_loss_cost_2025,
+    true_technical_premium_nominal = true_technical_premium_nominal,
+    true_technical_premium_2025 = true_technical_premium_2025, unobserved_frailty = unobserved_frailty,
+    premium_loading_factor = premium_loading_factor ) |> select(
+    policy_id, quote_profile_id, policy_year, data_split, state, remoteness_area, locality_id,
+    driver_age, age_group, driver_sex_audit, licence_start_age, licence_years,
+    year_of_manufacture, vehicle_age, vehicle_make, vehicle_model, vehicle_segment, motive_power, vehicle_variant,
+    engine_capacity_l, cylinder_count, power_kw, torque_nm,
+    unladen_weight_kg, transmission_raw, transmission_group, vehicle_spec_match_status, vehicle_spec_imputed,
+    power_kw_imputed, torque_nm_imputed, vehicle_spec_source_url, vehicle_spec_source_access_date,
+    segment_distribution_fallback, new_vehicle_value, new_vehicle_value_2025_basis, residual_ratio_5yr,
+    vehicle_value, vehicle_value_2025_basis, claims_cost_level, motor_vehicle_price_level,
+    annual_km, annual_km_band, overnight_parking, finance_status, vehicle_colour,
+    vehicle_modified, modification_type, pre_existing_damage, pre_existing_damage_type,
+    policyholder_is_regular_driver, transmission, quote_date, policy_inception_date, policy_expiry_date,
+    quote_lead_days, inception_month, inception_quarter,
+    cover_type, voluntary_excess, exposure, policy_term_assumption,
+    claims_t_minus_5, claims_t_minus_4, claims_t_minus_3,
+    claims_t_minus_2, claims_t_minus_1, prior_claims_5yr, claim_free_years,
+    claim_count, incurred_claim_cost, incurred_claim_cost_nominal, gross_claim_cost, gross_claim_cost_nominal,
+    average_paid_claim_cost, average_paid_claim_cost_nominal, largest_paid_claim, largest_paid_claim_nominal,
+    total_loss_claim_count, any_total_loss, true_annual_claim_frequency, true_mean_claim_severity,
+    true_non_total_loss_gross_mean, true_non_total_loss_paid_mean,
+    true_total_loss_probability, true_total_loss_paid_amount,
+    true_mean_claim_severity_nominal, true_mean_claim_severity_2025, true_annual_loss_cost_nominal, true_annual_loss_cost_2025, true_technical_premium_nominal, true_technical_premium_2025,
+    true_annual_loss_cost, true_technical_premium,
+    unobserved_frailty, latent_geographic_effect, premium_loading_factor )
+# Latent truth is excluded from the Module 2 modelling file.
+latent_columns_to_remove <- c( "true_annual_claim_frequency", "true_mean_claim_severity",
+  "true_non_total_loss_gross_mean", "true_non_total_loss_paid_mean", "true_total_loss_probability",
+  "true_total_loss_paid_amount", "true_annual_loss_cost", "true_technical_premium",
+  "true_mean_claim_severity_nominal", "true_mean_claim_severity_2025", "true_annual_loss_cost_nominal",
+  "true_annual_loss_cost_2025", "true_technical_premium_nominal", "true_technical_premium_2025",
+  "unobserved_frailty", "latent_geographic_effect", "premium_loading_factor", "segment_distribution_fallback",
+  "residual_ratio_5yr" )
+portfolio_modelling <- portfolio_full |> select( -any_of(latent_columns_to_remove), -driver_sex_audit,
+    -vehicle_spec_match_status, -vehicle_spec_imputed, -power_kw_imputed, -torque_nm_imputed,
+    -vehicle_spec_source_url, -vehicle_spec_source_access_date, -vehicle_make, -vehicle_model, -vehicle_variant,
+    -transmission_raw, -transmission_group, -policy_term_assumption )
+# 10A. MULTI-YEAR COHORT AUDITS -------------------------------------------------
+cohort_year_summary <- portfolio |> group_by(policy_year, data_split) |> summarise( policies = n(),
+    claimant_rate = mean(claim_count > 0), mean_annual_km = mean(annual_km),
+    mean_vehicle_value_nominal = mean(vehicle_value),
+    mean_vehicle_value_2025_basis = mean(vehicle_value_2025_basis),
+    mean_incurred_claim_cost_nominal = mean(incurred_claim_cost_nominal),
+    mean_incurred_claim_cost_2025_basis = mean(incurred_claim_cost), .groups = "drop" )
+readr::write_csv(cohort_year_summary, file.path(config$output_dir, "cohort_year_summary.csv"))
+claims_cost_onlevel_audit <- claims |> group_by(policy_year) |> summarise( claims = n(),
+    nominal_paid_claim_cost = sum(incurred_claim_cost_nominal),
+    onlevelled_2025_paid_claim_cost = sum(incurred_claim_cost_2025),
+    mean_nominal_paid_severity = mean(incurred_claim_cost_nominal),
+    mean_2025_paid_severity = mean(incurred_claim_cost_2025), .groups = "drop" ) |>
+  left_join(annual_cost_level_indices, by = "policy_year")
+readr::write_csv(claims_cost_onlevel_audit, file.path(config$output_dir, "claims_cost_onlevel_audit.csv"))
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 11. VALIDATION ---------------------------------------------------------------
+# Motive-power validation must use the same hierarchy as the simulation:
+#   policy year -> State -> manufacture year -> make/model/motive power.
+# A raw annual make/model registration marginal is not the correct target here,
+# because manufacture year is first sampled conditional on State. We therefore
+# reconstruct the exact policy-year marginal implied by the frozen Module 0
+# probabilities and compare the simulated portfolio against that target.
+# Marginal State x manufacture-year probability for each policy year.
+target_yom_by_year <- state_distribution_by_policy_year |> transmute( policy_year = as.integer(policy_year),
+    state = as.character(state), state_probability = as.numeric(probability) ) |> inner_join(
+    vehicle_year_distribution_by_policy_year_state |> transmute( policy_year = as.integer(policy_year),
+        state = as.character(state), year_of_manufacture = as.integer(year_of_manufacture),
+        yom_given_state_probability = as.numeric(probability) ), by = c("policy_year", "state") ) |> mutate(
+    joint_state_yom_probability = state_probability * yom_given_state_probability ) |> summarise(
+    target_yom_probability = sum(joint_state_yom_probability), .by = c(policy_year, year_of_manufacture) )
+# Conditional motive-power probability given policy year and manufacture year.
+target_motive_given_yom <- vehicle_make_model_distribution_by_policy_year |> summarise(
+    motive_given_yom_probability = sum(probability), .by = c(policy_year, year_of_manufacture, motive_power) )
+# Exact policy-year marginal motive-power target implied by the generator.
+target_motive_power_by_year <- target_yom_by_year |> inner_join( target_motive_given_yom,
+    by = c("policy_year", "year_of_manufacture") ) |> mutate( joint_probability =
+      target_yom_probability * motive_given_yom_probability ) |> summarise(
+    target_probability = sum(joint_probability), .by = c(policy_year, motive_power) ) |> group_by(policy_year) |>
+  mutate( target_probability = target_probability / sum(target_probability) ) |> ungroup()
+# Include every target category even if a finite simulation happens to draw zero
+# observations in a very small motive-power cell.
+simulated_motive_power <- portfolio_full |> count(policy_year, motive_power, name = "n") |> complete(
+    policy_year = config$cohort_years, motive_power = unique(target_motive_power_by_year$motive_power),
+    fill = list(n = 0L) ) |> group_by(policy_year) |> mutate(probability = n / sum(n)) |> ungroup() |> left_join(
+    target_motive_power_by_year, by = c("policy_year", "motive_power") ) |> mutate(
+    target_probability = replace_na(target_probability, 0) )
+motive_power_validation_audit <- simulated_motive_power |> mutate(
+    absolute_probability_deviation = abs(probability - target_probability) ) |>
+  arrange(policy_year, desc(absolute_probability_deviation))
+readr::write_csv( motive_power_validation_audit, file.path(config$output_dir, "motive_power_validation_audit.csv")
+)
+motive_power_target_probability_check <- target_motive_power_by_year |> summarise(
+    probability_sum = sum(target_probability), .by = policy_year )
+if (any(abs(motive_power_target_probability_check$probability_sum - 1) > 1e-8)) {
+  stop("Internal error: reconstructed motive-power validation probabilities do not sum to one.")
+}
+readr::write_csv( motive_power_target_probability_check,
+  file.path(config$output_dir, "motive_power_target_probability_check.csv") )
+observed_claimant_rate <- mean(portfolio_full$claim_count[portfolio_full$policy_year == config$cost_basis_year] > 0)
+observed_mean_claim_count <- mean(portfolio_full$claim_count)
+observed_zero_claim_rate <- mean(portfolio_full$claim_count == 0)
+claims_2025 <- claims |> filter(policy_year == config$cost_basis_year)
+observed_mean_paid_severity <- safe_divide( sum(claims_2025$incurred_claim_cost), nrow(claims_2025) )
+observed_total_loss_cost_share <- safe_divide( sum(claims_2025$incurred_claim_cost[claims_2025$total_loss]),
+  sum(claims_2025$incurred_claim_cost) )
+observed_total_loss_incidence <- if (nrow(claims) > 0L) {
+  mean(claims$total_loss)
+} else {
+  NA_real_
+}
+# The non-total-loss CV assumption is conditional on each policy's expected
+# gross severity. Validate it after standardising by that policy-specific mean.
+non_total_loss_claims <- claims |> filter(!total_loss) |> left_join( portfolio_full |>
+      select(policy_id, true_non_total_loss_gross_mean), by = "policy_id" ) |> mutate(
+    standardised_gross_severity = gross_claim_cost / true_non_total_loss_gross_mean )
+if (any(!is.finite(non_total_loss_claims$standardised_gross_severity))) {
+  stop("Non-finite standardised non-total-loss severities detected.")
+}
+observed_non_tl_gross_cv <- safe_divide( sd(non_total_loss_claims$standardised_gross_severity),
+  mean(non_total_loss_claims$standardised_gross_severity) )
+observed_non_tl_standardised_mean <- mean(non_total_loss_claims$standardised_gross_severity)
+observed_implied_claim_ratio <- safe_divide( sum(portfolio_full$true_annual_loss_cost),
+  sum(portfolio_full$true_technical_premium) )
+simulated_finance <- portfolio_full |> count(finance_status) |> mutate(probability = n / sum(n)) |>
+  left_join(finance_distribution |> rename(target_probability = probability), by = "finance_status")
+simulated_colour <- portfolio_full |> count(vehicle_colour) |> mutate(probability = n / sum(n)) |>
+  left_join(vehicle_colour_distribution |> rename(target_probability = probability), by = "vehicle_colour")
+observed_modified_share <- mean(portfolio_full$vehicle_modified)
+observed_damage_share <- mean(portfolio_full$pre_existing_damage)
+observed_regular_driver_share <- mean(portfolio_full$policyholder_is_regular_driver)
+observed_vehicle_spec_fallback_share <- mean(portfolio_full$vehicle_spec_imputed)
+observed_power_imputation_share <- mean(portfolio_full$power_kw_imputed)
+observed_torque_imputation_share <- mean(portfolio_full$torque_nm_imputed)
+validation_checks <- tribble( ~check_name, ~observed_value, ~lower_bound, ~upper_bound, ~unit, "Policy rows",
+  nrow(portfolio_full), config$n_policies, config$n_policies, "rows", "Unique policy IDs",
+  n_distinct(portfolio_full$policy_id), config$n_policies, config$n_policies, "IDs", "Mean annual kilometres",
+  mean(portfolio_full$annual_km), config$target_mean_annual_km - 250, config$target_mean_annual_km + 250, "km",
+  "Maximum vehicle age", max(portfolio_full$vehicle_age), 0, config$max_standard_vehicle_age, "years",
+  "Vehicle-value floor share", mean(portfolio_full$vehicle_value_2025_basis <= config$vehicle_value_floor), 0,
+  config$max_vehicle_value_floor_share, "share", "Annual claimant rate", observed_claimant_rate,
+  config$target_annual_claimant_rate - 0.0075, config$target_annual_claimant_rate + 0.0075, "share",
+  "Mean paid claim severity", observed_mean_paid_severity, config$target_mean_paid_claim_severity - 200,
+  config$target_mean_paid_claim_severity + 200, "AUD", "Total-loss cost share", observed_total_loss_cost_share,
+  config$target_total_loss_cost_share - 0.03, config$target_total_loss_cost_share + 0.03, "share",
+  "Standardised non-total-loss severity mean", observed_non_tl_standardised_mean, 0.95, 1.05, "ratio",
+  "Conditional non-total-loss gross CV", observed_non_tl_gross_cv, config$non_total_loss_cv - 0.10,
+  config$non_total_loss_cv + 0.10, "CV", "Mean true technical premium - 2025 cohort calibration", mean(
+    portfolio_full$true_technical_premium_nominal[ portfolio_full$policy_year == config$cost_basis_year]),
+  config$target_mean_technical_premium - 1, config$target_mean_technical_premium + 1, "AUD",
+  "Mean latent geographic effect", mean(portfolio_full$latent_geographic_effect), 0.95, 1.05, "relativity",
+  "Maximum motive-power probability deviation", max( abs( simulated_motive_power$probability -
+        simulated_motive_power$target_probability ), na.rm = TRUE ), 0, 0.02, "absolute probability",
+  "Maximum finance-status probability deviation",
+  max(abs(simulated_finance$probability - simulated_finance$target_probability), na.rm = TRUE),
+  0, 0.02, "absolute probability", "Maximum vehicle-colour probability deviation",
+  max(abs(simulated_colour$probability - simulated_colour$target_probability), na.rm = TRUE),
+  0, 0.02, "absolute probability", "Vehicle-modification prevalence", observed_modified_share,
+  quote_scalar_assumptions$vehicle_modified_probability - 0.01,
+  quote_scalar_assumptions$vehicle_modified_probability + 0.01, "share", "Pre-existing-damage prevalence",
+  observed_damage_share, quote_scalar_assumptions$pre_existing_damage_probability - 0.01,
+  quote_scalar_assumptions$pre_existing_damage_probability + 0.01, "share",
+  "Policyholder is regular-driver prevalence", observed_regular_driver_share,
+  quote_scalar_assumptions$policyholder_is_regular_driver_probability - 0.02,
+  quote_scalar_assumptions$policyholder_is_regular_driver_probability + 0.02, "share",
+  "Policy inception date matches assigned policy year",
+  as.numeric(all(as.integer(format(portfolio_full$policy_inception_date, "%Y")) == portfolio_full$policy_year)),
+  1, 1, "indicator", "Vehicle-segment fallback share", mean(portfolio_full$segment_distribution_fallback), 0, 0.02,
+  "share", "Vehicle-specification donor fallback share", observed_vehicle_spec_fallback_share, 0,
+  config$max_vehicle_spec_fallback_share, "share", "Finite vehicle power coverage",
+  mean(is.finite(portfolio_full$power_kw)), 1, 1, "share", "Finite vehicle torque coverage",
+  mean(is.finite(portfolio_full$torque_nm)), 1, 1, "share", "Finite vehicle unladen-weight coverage",
+  mean(is.finite(portfolio_full$unladen_weight_kg)), 1, 1, "share" ) |> mutate(
+    pass = observed_value >= lower_bound & observed_value <= upper_bound )
+cohort_counts <- portfolio_full |> count(policy_year)
+cohort_split_ok <- all(cohort_counts$n == config$n_policies_per_cohort) &&
+  all(portfolio_full$data_split[portfolio_full$policy_year <= 2023] == "train") &&
+  all(portfolio_full$data_split[portfolio_full$policy_year == 2024] == "validation") &&
+  all(portfolio_full$data_split[portfolio_full$policy_year == 2025] == "test")
+annual_km_by_year <- portfolio_full |> group_by(policy_year) |> summarise(mean_km = mean(annual_km), .groups = "drop")
+validation_checks <- bind_rows( validation_checks, tibble(
+    check_name = c("Exactly 10,000 policies per cohort year", "Temporal split follows 2021-23 TRAIN / 2024 VALIDATION / 2025 TEST", "Each cohort annual-km mean within 250 km of target"),
+    observed_value = c(as.numeric(all(cohort_counts$n == config$n_policies_per_cohort)), as.numeric(cohort_split_ok), max(abs(annual_km_by_year$mean_km - config$target_mean_annual_km))),
+    lower_bound = c(1, 1, 0), upper_bound = c(1, 1, 250), unit = c("indicator", "indicator", "km"),
+    pass = c(all(cohort_counts$n == config$n_policies_per_cohort), cohort_split_ok, max(abs(annual_km_by_year$mean_km - config$target_mean_annual_km)) <= 250)
+  ) )
+if (!all(validation_checks$pass)) {
+  print(validation_checks |> filter(!pass), n = Inf)
+  stop("One or more required Module 1 validation checks are outside their stated bounds.")
+}
+# Compact portfolio summary ----------------------------------------------------
+top_one_percent_claim_cost_share <- if (nrow(claims) > 0L) {
+  threshold <- quantile(claims$incurred_claim_cost, 0.99, names = FALSE)
+  safe_divide( sum(claims$incurred_claim_cost[claims$incurred_claim_cost >= threshold]),
+    sum(claims$incurred_claim_cost) )
+} else {
+  NA_real_
+}
+portfolio_summary <- tibble( metric = c( "Policies", "Exposure years", "Mean driver age", "Mean vehicle age",
+    "Maximum vehicle age", "Vehicle-value floor share", "Mean annual kilometres", "Mean current vehicle value",
+    "Annual claimant rate", "Mean annual claim count", "Zero-claim proportion", "Mean paid claim severity",
+    "Derived total-loss probability", "Observed total-loss incidence", "Observed total-loss cost share",
+    "Mean true annual loss cost - 2025 basis, all cohorts",
+    "Mean true technical premium - 2025 basis, all cohorts",
+    "Mean true technical premium - 2025 cohort calibration", "Implied true claims ratio",
+    "Number of synthetic localities", "Weighted unclassified BITRE vehicle share",
+    "Segment-distribution fallback share", "Vehicle-specification donor fallback share", "Power imputation share",
+    "Torque imputation share", "Mean engine power (kW)", "Mean torque (Nm)", "Mean unladen weight (kg)",
+    "Vehicle modified share", "Pre-existing damage share", "Policyholder is regular driver share",
+    "No-finance share", "Street/open-land overnight parking share", "Automatic transmission share",
+    "Top 1% share of paid claim dollars" ), value = c( nrow(portfolio_full), sum(portfolio_full$exposure),
+    mean(portfolio_full$driver_age), mean(portfolio_full$vehicle_age), max(portfolio_full$vehicle_age),
+    mean(portfolio_full$vehicle_value <= config$vehicle_value_floor), mean(portfolio_full$annual_km),
+    mean(portfolio_full$vehicle_value), observed_claimant_rate, observed_mean_claim_count,
+    observed_zero_claim_rate, observed_mean_paid_severity, total_loss_probability, observed_total_loss_incidence,
+    observed_total_loss_cost_share, mean(portfolio_full$true_annual_loss_cost_2025),
+    mean(portfolio_full$true_technical_premium_2025), mean(portfolio_full$true_technical_premium_nominal[
+        portfolio_full$policy_year == config$cost_basis_year]), observed_implied_claim_ratio,
+    n_distinct(portfolio_full$locality_id), unclassified_vehicle_weight,
+    mean(portfolio_full$segment_distribution_fallback), observed_vehicle_spec_fallback_share,
+    observed_power_imputation_share, observed_torque_imputation_share, mean(portfolio_full$power_kw),
+    mean(portfolio_full$torque_nm), mean(portfolio_full$unladen_weight_kg), observed_modified_share,
+    observed_damage_share, observed_regular_driver_share, mean(portfolio_full$finance_status == "No finance"),
+    mean(portfolio_full$overnight_parking == "Street / open land"),
+    mean(portfolio_full$transmission == "Automatic"), top_one_percent_claim_cost_share ) )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 12. WRITE ONLY REQUIRED / DECISION-RELEVANT OUTPUTS --------------------------
+# Required downstream inputs
+readr::write_csv( portfolio_modelling, file.path(config$output_dir, "synthetic_motor_modelling.csv") )
+saveRDS( portfolio_full, file.path(config$output_dir, "synthetic_motor_full_truth.rds") )
+# Claim-level audit data retained in compact RDS form
+saveRDS( claims, file.path(config$output_dir, "synthetic_motor_claims.rds") )
+# Key validation/documentation outputs
+readr::write_csv( validation_checks, file.path(config$output_dir, "module1_validation_checks.csv") )
+readr::write_csv( portfolio_summary, file.path(config$output_dir, "portfolio_summary.csv") )
+vehicle_specification_simulation_audit <- portfolio_full |> summarise( policies = n(),
+    donor_fallback_share = mean(vehicle_spec_imputed), power_imputation_share = mean(power_kw_imputed),
+    torque_imputation_share = mean(torque_nm_imputed), mean_power_kw = mean(power_kw),
+    mean_torque_nm = mean(torque_nm), mean_unladen_weight_kg = mean(unladen_weight_kg),
+    automatic_share = mean(transmission == "Automatic") )
+readr::write_csv( vehicle_specification_simulation_audit,
+  file.path(config$output_dir, "vehicle_specification_simulation_audit.csv") )
+# 12.1 Frozen-module manifest ---------------------------------------------------
+# Documentation only. This records the fixed interface/assumptions used for the
+# dissertation baseline and does not enter the simulation.
+module1_freeze_manifest <- tibble( module = "Module 1", module_version = module_version,
+  freeze_date = ifelse(is.na(module_freeze_date), NA_character_, as.character(module_freeze_date)),
+  seed = config$seed, n_policies = config$n_policies,
+  target_annual_claimant_rate = config$target_annual_claimant_rate,
+  target_mean_paid_claim_severity = config$target_mean_paid_claim_severity,
+  target_total_loss_cost_share = config$target_total_loss_cost_share,
+  target_mean_technical_premium = config$target_mean_technical_premium,
+  max_vehicle_spec_fallback_share = config$max_vehicle_spec_fallback_share )
+readr::write_csv( module1_freeze_manifest, file.path(config$output_dir, "module1_freeze_manifest.csv") )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 13. FINAL CONSOLE SUMMARY ----------------------------------------------------
+cat("\nModule 1 complete.\n")
+cat("Policies:", format(nrow(portfolio_full), big.mark = ","), "\n")
+cat("Claimant rate:", round(100 * observed_claimant_rate, 2), "%\n")
+cat("Mean paid claim severity: $", round(observed_mean_paid_severity, 2), "\n", sep = "")
+cat( "Total-loss cost share:", round(100 * observed_total_loss_cost_share, 2), "%\n" )
+cat( "Mean true technical premium - 2025 cohort calibration: $", round( mean(
+      portfolio_full$true_technical_premium_nominal[ portfolio_full$policy_year == config$cost_basis_year ] ), 2 ),
+  "\n", sep = "" )
+cat( "Mean true technical premium - all cohorts, 2025 basis: $", round(
+    mean(portfolio_full$true_technical_premium_2025), 2 ), "\n", sep = "" )
+cat( "All validation checks passed:", all(validation_checks$pass), "\n" )
+cat("Vehicle specifications appended: vehicle_make, vehicle_model, engine_capacity_l, cylinder_count, power_kw, torque_nm, unladen_weight_kg, transmission\n")
+cat("Additional quote-stage variables appended: annual_km_band, overnight_parking, finance_status, vehicle_colour, vehicle_modified, pre_existing_damage, policyholder_is_regular_driver, quote_date, policy_inception_date\n")
+cat("Output directory:", config$output_dir, "\n")
+```

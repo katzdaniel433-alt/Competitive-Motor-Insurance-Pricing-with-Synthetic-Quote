@@ -1,0 +1,870 @@
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# Generate market participation, insurer choice and binary conversion outcomes.
+# The known choice probabilities are retained for independent evaluation.
+
+required_packages <- c( "tidyverse" )
+missing_packages <- required_packages[ !required_packages %in% rownames( installed.packages() ) ]
+if ( length( missing_packages ) > 0L
+) {
+  stop( paste0( "Install the following packages before running Module 4: ", paste( missing_packages,
+        collapse = ", " ) ) )
+}
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+options( dplyr.summarise.inform = FALSE, scipen = 999 )
+config <- list(
+  input_dir = file.path("outputs", "quote_market"),
+  output_dir = file.path("outputs", "conversion_generation"),
+  demand_scenarios_to_run = c("baseline"),
+  # Frozen downstream handoff from revised Module 3.
+  expected_policy_year = 2025L, expected_profiles = 10000L, expected_conversion_train_rows = 6000L,
+  expected_conversion_validation_rows = 2000L, expected_conversion_test_rows = 2000L,
+  # Common random numbers.
+  # These fixed seeds mean that alternative demand scenarios are compared using
+  # the same underlying profile heterogeneity, latent tastes and outcome draws.
+  profile_price_sensitivity_seed = 20261001L, alternative_taste_seed = 20261002L, purchase_draw_seed = 20261003L,
+  choice_draw_seed = 20261004L,
+  # Baseline calibration targets.
+  # These are scenario assumptions. They are not estimates of actual Australian
+  # aggregator conversion rates.
+  target_market_purchase_rate = 0.78, target_focal_conversion_rate = 0.18,
+  # Numerical protection.
+  probability_clip = 1e-8,
+  # Broad validation tolerances.
+  expected_purchase_tolerance = 0.002, expected_conversion_tolerance = 0.002,
+  observed_conversion_tolerance = 0.012, write_plots = TRUE )
+dir.create(
+  config$output_dir, recursive = TRUE, showWarnings = FALSE )
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 1. UTILITY FUNCTIONS
+safe_divide <- function( numerator, denominator
+) {
+  output_length <- max( length( numerator ), length( denominator ) )
+  numerator_recycled <- rep_len( numerator, output_length )
+  denominator_recycled <- rep_len( denominator, output_length )
+  result <- numerator_recycled / denominator_recycled
+  invalid_denominator <- is.na( denominator_recycled ) | denominator_recycled == 0
+  result[ invalid_denominator ] <- NA_real_
+  result
+}
+check_required_columns <- function( data, required_columns, data_name
+) {
+  missing_columns <- setdiff( required_columns, names( data ) )
+  if ( length( missing_columns ) > 0L
+  ) {
+    stop( paste0( data_name, " is missing required columns: ", paste( missing_columns, collapse = ", " ) ) )
+  }
+}
+assert_required_files <- function( files, context
+) {
+  missing_files <- files[ !file.exists( files ) ]
+  if ( length( missing_files ) > 0L
+  ) {
+    stop( paste0( context, " is missing required file(s): ", paste( missing_files, collapse = "; " ) ) )
+  }
+}
+assert_nonblank_columns <- function( data, columns, data_name
+) {
+  for ( field_name in columns
+  ) {
+    invalid <- is.na( data[[field_name]] ) | trimws( as.character( data[[field_name]] ) ) == ""
+    if ( any( invalid )
+    ) {
+      stop( paste0( field_name, " contains ", sum( invalid ), " missing or blank value(s) in ", data_name, "." ) )
+    }
+  }
+}
+clip_probability <- function( probability, epsilon = config$probability_clip
+) {
+  pmin( pmax( probability, epsilon ), 1 - epsilon )
+}
+lognormal_parameters_from_mean_cv <- function( arithmetic_mean, coefficient_of_variation
+) {
+  sigma2 <- log( 1 + coefficient_of_variation^2 )
+  sigma <- sqrt( sigma2 )
+  mu <- log( arithmetic_mean ) - 0.5 * sigma2
+  list( meanlog = mu, sdlog = sigma )
+}
+log_sum_exp <- function( x
+) {
+  maximum_x <- max( x )
+  maximum_x + log( sum( exp( x - maximum_x ) ) )
+}
+calibrate_logit_intercept <- function( linear_predictor_without_intercept, target_mean
+) {
+  objective <- function( intercept
+  ) {
+    mean( plogis( intercept + linear_predictor_without_intercept ) ) - target_mean
+  }
+  lower_value <- objective( -15 )
+  upper_value <- objective( 15 )
+  if ( lower_value * upper_value > 0
+  ) {
+    stop( paste0( "Unable to calibrate logit intercept to target mean ", target_mean,
+        ". Expand the root-search interval." ) )
+  }
+  uniroot( objective, interval = c( -15, 15 ), tol = 1e-10 )$root
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 2. READ MODULE 3 INPUTS
+quote_market_file <- file.path( config$input_dir, "quote_market.csv" )
+competitor_quotes_file <- file.path( config$input_dir, "competitor_quotes.csv" )
+module3_validation_file <- file.path( config$input_dir, "quote_market_validation_checks.csv" )
+assert_required_files( c( quote_market_file, competitor_quotes_file, module3_validation_file ),
+  "Revised Module 3 interface" )
+quote_market <- readr::read_csv( quote_market_file, show_col_types = FALSE )
+competitor_quotes <- readr::read_csv( competitor_quotes_file, show_col_types = FALSE )
+module3_validation_checks <- readr::read_csv( module3_validation_file, show_col_types = FALSE )
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 3. VALIDATE 2025 INPUT STRUCTURE
+required_quote_market_columns <- c( "policy_id", "quote_profile_id", "policy_year", "technical_data_split",
+  "conversion_data_split", "data_split", "state", "remoteness_area", "driver_age", "licence_years", "vehicle_age",
+  "vehicle_segment", "motive_power", "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm",
+  "unladen_weight_kg", "transmission", "vehicle_value", "annual_km", "voluntary_excess", "exposure",
+  "prior_claims_5yr", "claim_free_years", "estimated_claim_frequency", "estimated_claim_severity",
+  "estimated_expected_claim_cost", "technical_loading", "technical_premium", "focal_price_multiplier",
+  "focal_quote", "focal_benchmark_quote", "n_competitor_quotes", "cheapest_competitor_quote",
+  "market_median_quote", "focal_rank", "relative_price_to_cheapest_competitor",
+  "percentage_gap_to_cheapest_competitor", "relative_price_to_market_median",
+  "within_profile_competitor_spread_ratio", "scenario_id", "market_scenario_id" )
+required_competitor_columns <- c( "policy_id", "quote_profile_id", "competitor_id", "competitor_archetype",
+  "competitor_quote" )
+check_required_columns( quote_market, required_quote_market_columns, "quote_market.csv" )
+check_required_columns( competitor_quotes, required_competitor_columns, "competitor_quotes.csv" )
+check_required_columns( module3_validation_checks, c( "check_name", "pass" ), "quote_market_validation_checks.csv"
+)
+module3_validation_checks <- module3_validation_checks %>% mutate( pass = as.logical( pass ) )
+failed_module3_checks <- module3_validation_checks %>% filter( is.na( pass ) | !pass )
+if ( nrow( failed_module3_checks ) > 0L
+) {
+  stop( paste0( "Module 3 contains failed validation checks. Resolve these before ",
+      "running Module 4. Failed checks: ", paste( failed_module3_checks$check_name, collapse = "; " ) ) )
+}
+quote_market <- quote_market %>% mutate( policy_year = as.integer( policy_year ), technical_data_split = tolower(
+        trimws( as.character( technical_data_split ) ) ), conversion_data_split = tolower( trimws( as.character(
+            conversion_data_split ) ) ), data_split = tolower( trimws( as.character( data_split ) ) ) )
+if ( nrow( quote_market ) != config$expected_profiles
+) {
+  stop( paste0( "Module 4 requires exactly ", config$expected_profiles, " 2025 quote profiles; observed ", nrow(
+        quote_market ), "." ) )
+}
+if ( anyDuplicated( quote_market$policy_id ) > 0L
+) {
+  stop( "policy_id is duplicated in quote_market.csv." )
+}
+if ( anyDuplicated( quote_market$quote_profile_id ) > 0L
+) {
+  stop( "quote_profile_id is duplicated in quote_market.csv." )
+}
+if ( !all( quote_market$policy_year == config$expected_policy_year )
+) {
+  stop( "Module 4 must receive the 2025 quote-market cohort only." )
+}
+if ( !all( quote_market$technical_data_split == "test" )
+) {
+  stop( "technical_data_split must remain 'test' for every 2025 quote profile." )
+}
+expected_conversion_splits <- c( "train", "validation", "test" )
+if ( !setequal( unique( quote_market$conversion_data_split ), expected_conversion_splits )
+) {
+  stop( paste0( "conversion_data_split must contain train, validation and test only. Observed: ", paste( sort(
+          unique( quote_market$conversion_data_split ) ), collapse = ", " ) ) )
+}
+if ( !all( quote_market$data_split == quote_market$conversion_data_split )
+) {
+  stop( paste( "Module 3 downstream alias failure:", "data_split must equal conversion_data_split for every row." )
+  )
+}
+conversion_split_input_summary <- quote_market %>% count( conversion_data_split, name = "profiles" ) %>% mutate(
+    share = profiles / sum( profiles ) )
+conversion_train_rows <- sum( quote_market$conversion_data_split == "train" )
+conversion_validation_rows <- sum( quote_market$conversion_data_split == "validation" )
+conversion_test_rows <- sum( quote_market$conversion_data_split == "test" )
+if ( conversion_train_rows != config$expected_conversion_train_rows || conversion_validation_rows !=
+      config$expected_conversion_validation_rows || conversion_test_rows != config$expected_conversion_test_rows
+) {
+  stop( paste0( "Conversion split row counts do not match the frozen 6000/2000/2000 design. ",
+      "Observed train/validation/test = ", conversion_train_rows, "/", conversion_validation_rows, "/",
+      conversion_test_rows, "." ) )
+}
+if ( any( !is.finite( quote_market$focal_quote ) ) | any( quote_market$focal_quote <= 0 )
+) {
+  stop( "focal_quote must be finite and strictly positive." )
+}
+if ( any( !is.finite( quote_market$technical_premium ) ) | any( quote_market$technical_premium <= 0 ) | any(
+      !is.finite( quote_market$estimated_expected_claim_cost ) ) | any(
+      quote_market$estimated_expected_claim_cost <= 0 )
+) {
+  stop( paste( "technical_premium and estimated_expected_claim_cost must both", "be finite and strictly positive."
+    ) )
+}
+vehicle_spec_numeric_requirements <- list( engine_capacity_l = function(x) is.finite(x) & x >= 0, cylinder_count =
+    function(x) is.finite(x) & x >= 0, power_kw = function(x) is.finite(x) & x > 0, torque_nm =
+    function(x) is.finite(x) & x > 0, unladen_weight_kg = function(x) is.finite(x) & x > 0 )
+for ( field_name in names( vehicle_spec_numeric_requirements )
+) {
+  valid_field <- vehicle_spec_numeric_requirements[[field_name]]( quote_market[[field_name]] )
+  if ( any( !valid_field )
+  ) {
+    stop( paste0( "Module 3 vehicle-specification field ", field_name, " contains ", sum( !valid_field ),
+        " invalid row(s)." ) )
+  }
+}
+assert_nonblank_columns( quote_market, c( "motive_power", "transmission" ), "quote_market.csv" )
+if ( any( !is.finite( competitor_quotes$competitor_quote ) ) | any( competitor_quotes$competitor_quote <= 0 )
+) {
+  stop( "competitor_quote must be finite and strictly positive." )
+}
+competitor_count_check <- competitor_quotes %>% count( policy_id, quote_profile_id, name = "competitors_in_file"
+  ) %>% inner_join( quote_market %>% dplyr::select( policy_id, quote_profile_id, n_competitor_quotes ), by = c(
+      "policy_id", "quote_profile_id" ) )
+if ( nrow( competitor_count_check ) != nrow( quote_market ) | any( competitor_count_check$competitors_in_file !=
+        competitor_count_check$n_competitor_quotes )
+) {
+  stop( paste( "Competitor quote counts do not reconcile between", "quote_market.csv and competitor_quotes.csv." )
+  )
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 4. MARKET-SCENARIO ID
+if ( any( is.na( quote_market$scenario_id ) ) | any( is.na( quote_market$market_scenario_id ) )
+) {
+  stop( "Module 3 scenario identifiers contain missing values." )
+}
+if ( any( as.character( quote_market$scenario_id ) != as.character( quote_market$market_scenario_id ) )
+) {
+  stop( paste( "Module 3 interface failure:", "scenario_id and market_scenario_id are not identical." ) )
+}
+market_scenario_values <- unique( as.character( quote_market$market_scenario_id ) )
+if ( length( market_scenario_values ) != 1L
+) {
+  stop( paste0( "Module 4 expects exactly one market scenario in quote_market.csv. Found: ", paste(
+        market_scenario_values, collapse = ", " ) ) )
+}
+market_scenario_id <- market_scenario_values[ 1 ]
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 5. LEAKAGE CHECK ON MODULE 3 INPUT
+explicit_forbidden_input_columns <- c( "claim_count", "pricing_claim_count", "incurred_claim_cost",
+  "reconstructed_incurred_claim_cost", "gross_claim_cost", "average_paid_claim_cost",
+  "pricing_average_paid_claim_cost", "largest_paid_claim", "total_loss_claim_count", "any_total_loss",
+  "reconstructed_reported_claim_count", "incurred_claim_cost_nominal", "gross_claim_cost_nominal",
+  "average_paid_claim_cost_nominal", "largest_paid_claim_nominal", "driver_sex_audit" )
+pattern_forbidden_input_columns <- names( quote_market )[ str_detect( names( quote_market ), regex( paste( c(
+          "^true_", "frailty", "^latent_" ), collapse = "|" ), ignore_case = TRUE ) ) ]
+forbidden_input_columns <- union( intersect( explicit_forbidden_input_columns, names( quote_market ) ),
+  pattern_forbidden_input_columns )
+if ( length( forbidden_input_columns ) > 0L
+) {
+  stop( paste0( "Module 4 leakage check failed. Forbidden input columns detected: ", paste(
+        forbidden_input_columns, collapse = ", " ) ) )
+}
+# 5A. VEHICLE-SPECIFICATION AND SPLIT INTERFACE AUDIT
+vehicle_specification_columns <- c( "motive_power", "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm",
+  "unladen_weight_kg", "transmission" )
+conversion_vehicle_specification_audit <- tibble( market_scenario_id = market_scenario_id, policy_year =
+    config$expected_policy_year, profiles = nrow( quote_market ), conversion_train_profiles =
+    conversion_train_rows, conversion_validation_profiles = conversion_validation_rows, conversion_test_profiles =
+    conversion_test_rows, distinct_motive_power_levels = n_distinct( quote_market$motive_power ),
+  distinct_transmission_levels = n_distinct( quote_market$transmission ), valid_engine_capacity_share = mean(
+      is.finite( quote_market$engine_capacity_l ) & quote_market$engine_capacity_l >= 0 ),
+  valid_cylinder_count_share = mean( is.finite( quote_market$cylinder_count ) & quote_market$cylinder_count >= 0 ),
+  positive_power_share = mean( is.finite( quote_market$power_kw ) & quote_market$power_kw > 0 ),
+  positive_torque_share = mean( is.finite( quote_market$torque_nm ) & quote_market$torque_nm > 0 ),
+  positive_unladen_weight_share = mean( is.finite( quote_market$unladen_weight_kg ) &
+        quote_market$unladen_weight_kg > 0 ), nonblank_transmission_share = mean( !is.na( quote_market$transmission
+      ) & trimws( as.character( quote_market$transmission ) ) != "" ) )
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 6. DEMAND-SCENARIO REGISTER
+# All numerical values in this register are scenario assumptions rather than
+# empirical estimates.
+# The baseline is designed to produce:
+#   - a meaningful but not deterministic price response;
+#   - stronger conversion for better quote position;
+#   - customer-level heterogeneity in price sensitivity;
+#   - nonlinear penalties when quotes become materially uncompetitive; and
+#   - sufficient latent taste heterogeneity that price alone does not determine
+#     the chosen insurer.
+# The three sensitivity scenarios alter the shape of demand while the focal
+# expected-conversion level is recalibrated to the same 18% target. This makes
+# comparisons focus on elasticity/decision structure rather than a mechanical
+# shift in the aggregate baseline conversion level.
+demand_scenario_register <- tribble( ~demand_scenario_id, ~demand_scenario_label, ~demand_scenario_description,
+  ~target_market_purchase_rate, ~target_focal_conversion_rate, ~participation_market_price_sensitivity,
+  ~mean_choice_price_sensitivity, ~choice_price_sensitivity_cv, ~rank_salience_scale, ~price_threshold_ratio,
+  ~price_threshold_strength, ~rank_threshold, ~rank_threshold_strength, ~taste_shock_sd, "baseline",
+  "Baseline demand", paste( "Moderate heterogeneous price sensitivity, quote-rank salience,",
+    "nonlinear tolerance penalties and non-price taste heterogeneity." ), 0.78, 0.18, 0.75, 7.0, 0.35, 1.00, 1.08,
+  0.65, 4, 0.10, 0.35, "low_price_sensitivity", "Low price sensitivity", paste(
+    "Weaker own/relative-price and rank response with stronger", "non-price preference heterogeneity." ), 0.78,
+  0.18, 0.50, 4.0, 0.40, 0.60, 1.10, 0.35, 5, 0.05, 0.50, "agentic", "Agent-mediated demand", paste(
+    "Lower search friction with stronger price and rank salience,",
+    "a tighter price-tolerance threshold and lower non-price noise." ), 0.78, 0.18, 0.90, 10.0, 0.25, 1.35, 1.06,
+  0.95, 3, 0.16, 0.22, "threshold", "Threshold demand", paste(
+    "Moderate smooth price response but a sharp nonlinear penalty after",
+    "relative-price and rank tolerance thresholds are breached." ), 0.78, 0.18, 0.70, 6.0, 0.30, 0.80, 1.05, 1.70,
+  3, 0.34, 0.30 )
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 7. VALIDATE REQUESTED DEMAND SCENARIOS
+registered_demand_scenarios <- demand_scenario_register$demand_scenario_id
+unknown_demand_scenarios <- setdiff( config$demand_scenarios_to_run, registered_demand_scenarios )
+if ( length( unknown_demand_scenarios ) > 0L
+) {
+  stop( paste0( "Unknown demand scenario(s): ", paste( unknown_demand_scenarios, collapse = ", " ) ) )
+}
+if ( length( config$demand_scenarios_to_run ) == 0L
+) {
+  stop( "demand_scenarios_to_run contains no scenarios." )
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 8. BUILD COMMON PROFILE-LEVEL RANDOM NUMBERS
+# The ordering is fixed before random draws are generated so that Module 7
+# receives common random numbers when it reruns this file under different
+# demand scenarios.
+profile_random_base <- quote_market %>% arrange( quote_profile_id ) %>% dplyr::select( policy_id, quote_profile_id
+  )
+set.seed(
+  config$profile_price_sensitivity_seed )
+profile_random_base$price_sensitivity_z <- rnorm( nrow( profile_random_base ) )
+set.seed(
+  config$purchase_draw_seed )
+profile_random_base$purchase_uniform <- runif( nrow( profile_random_base ) )
+set.seed(
+  config$choice_draw_seed )
+profile_random_base$choice_uniform <- runif( nrow( profile_random_base ) )
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 9. BUILD COMMON ALTERNATIVE-LEVEL MARKET TABLE
+focal_alternatives <- quote_market %>% transmute( policy_id, quote_profile_id, alternative_id = "FOCAL",
+    alternative_archetype = "Focal insurer", alternative_quote = focal_quote, is_focal = TRUE )
+competitor_alternatives <- competitor_quotes %>% transmute( policy_id, quote_profile_id, alternative_id =
+      competitor_id, alternative_archetype = competitor_archetype, alternative_quote = competitor_quote, is_focal =
+      FALSE )
+alternative_base <- bind_rows( focal_alternatives, competitor_alternatives ) %>% arrange( quote_profile_id,
+    alternative_id ) %>% group_by( policy_id, quote_profile_id ) %>% mutate( market_cheapest_quote = min(
+        alternative_quote ), market_median_quote_reconstructed = median( alternative_quote ), alternative_rank =
+      rank( alternative_quote, ties.method = "first" ), alternative_relative_price = safe_divide(
+        alternative_quote, market_cheapest_quote ) ) %>% ungroup()
+set.seed(
+  config$alternative_taste_seed )
+alternative_base$latent_taste_z <- rnorm( nrow( alternative_base ) )
+market_median_reconstruction_check <- alternative_base %>% group_by( policy_id, quote_profile_id ) %>% summarise(
+    reconstructed_market_median = first( market_median_quote_reconstructed ), .groups = "drop" ) %>% inner_join(
+    quote_market %>% dplyr::select( policy_id, quote_profile_id, market_median_quote ), by = c( "policy_id",
+      "quote_profile_id" ) ) %>% mutate( absolute_difference = abs( reconstructed_market_median -
+          market_median_quote ) )
+maximum_market_median_reconstruction_error <- max( market_median_reconstruction_check$absolute_difference )
+if ( maximum_market_median_reconstruction_error > 1e-8
+) {
+  stop( paste0( "The alternative-level market does not reproduce Module 3 market medians. ",
+      "Maximum absolute difference = ", maximum_market_median_reconstruction_error ) )
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 10. NON-PRICE ALTERNATIVE UTILITY
+# These utilities are deliberately modest. They prevent a pure lowest-price
+# winner-takes-all mechanism while preserving price and market position as major
+# determinants of conditional choice.
+# The specialist interactions use only observable characteristics and represent
+# stylised affinity/appetite rather than real insurer behaviour.
+calculate_nonprice_utility <- function( alternative_archetype, driver_age, vehicle_value, prior_claims_5yr,
+    claim_free_years
+) {
+  case_when( alternative_archetype == "Focal insurer" ~ 0.00, alternative_archetype == "Value Direct" ~ -0.04,
+    alternative_archetype == "Mainstream Alpha" ~ 0.08, alternative_archetype == "Mainstream Beta" ~ 0.04,
+    alternative_archetype == "Premium Brand" & vehicle_value >= 45000 & driver_age >= 35 & driver_age <= 69 ~ 0.18,
+    alternative_archetype == "Premium Brand" ~ 0.09, alternative_archetype == "Young Driver Specialist" &
+      driver_age <= 29 ~ 0.20, alternative_archetype == "Young Driver Specialist" ~ -0.04, alternative_archetype ==
+      "Low-Risk Specialist" & prior_claims_5yr == 0 & claim_free_years >= 3 ~ 0.18, alternative_archetype ==
+      "Low-Risk Specialist" & prior_claims_5yr >= 2 ~ -0.08, alternative_archetype == "Low-Risk Specialist" ~ 0.03,
+    TRUE ~ 0 )
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 11. GENERATE ONE DEMAND SCENARIO
+generate_demand_scenario <- function( requested_demand_scenario_id
+) {
+  scenario_row <- demand_scenario_register %>% filter( .data$demand_scenario_id ==
+        .env$requested_demand_scenario_id )
+  if ( nrow( scenario_row ) != 1L
+  ) {
+    stop( paste0( "Demand-scenario lookup failed for: ", requested_demand_scenario_id ) )
+  }
+  # 11.1 Profile-level heterogeneous price sensitivity
+  price_sensitivity_parameters <- lognormal_parameters_from_mean_cv( arithmetic_mean =
+        scenario_row$mean_choice_price_sensitivity[ 1 ], coefficient_of_variation =
+        scenario_row$choice_price_sensitivity_cv[ 1 ] )
+  profile_scenario <- quote_market %>% arrange( quote_profile_id ) %>% left_join( profile_random_base, by = c(
+        "policy_id", "quote_profile_id" ) ) %>% mutate( demand_scenario_id = requested_demand_scenario_id,
+      true_choice_price_sensitivity = exp( price_sensitivity_parameters$meanlog +
+            price_sensitivity_parameters$sdlog * price_sensitivity_z ) )
+  # 11.2 Stage A: market participation
+  portfolio_market_median <- median( profile_scenario$market_median_quote )
+  profile_scenario <- profile_scenario %>% mutate( participation_market_price_index = log( market_median_quote /
+            portfolio_market_median ), participation_age_effect = case_when( driver_age <= 24 ~ -0.12,
+          driver_age <= 34 ~ 0.02, driver_age <= 69 ~ 0.10, driver_age <= 79 ~ 0.02, TRUE ~ -0.06 ),
+      participation_claim_history_effect = 0.035 * pmin( prior_claims_5yr, 3 ),
+      participation_linear_predictor_without_intercept = -scenario_row$participation_market_price_sensitivity[ 1
+        ] * participation_market_price_index + participation_age_effect + participation_claim_history_effect )
+  participation_intercept <- calibrate_logit_intercept( linear_predictor_without_intercept =
+        profile_scenario$participation_linear_predictor_without_intercept, target_mean =
+        scenario_row$target_market_purchase_rate[ 1 ] )
+  profile_scenario <- profile_scenario %>% mutate( true_market_purchase_probability = clip_probability( plogis(
+            participation_intercept + participation_linear_predictor_without_intercept ) ), market_purchase =
+        purchase_uniform < true_market_purchase_probability )
+  # 11.3 Alternative-level utility before focal brand calibration
+  alternative_scenario <- alternative_base %>% left_join( profile_scenario %>% dplyr::select( policy_id,
+          quote_profile_id, driver_age, vehicle_value, prior_claims_5yr, claim_free_years,
+          true_choice_price_sensitivity, true_market_purchase_probability, choice_uniform ), by = c( "policy_id",
+        "quote_profile_id" ) ) %>% mutate( demand_scenario_id = requested_demand_scenario_id,
+      base_nonprice_utility = calculate_nonprice_utility( alternative_archetype = alternative_archetype,
+          driver_age = driver_age, vehicle_value = vehicle_value, prior_claims_5yr = prior_claims_5yr,
+          claim_free_years = claim_free_years ), latent_taste_utility = scenario_row$taste_shock_sd[ 1 ] *
+          latent_taste_z, smooth_price_utility = -true_choice_price_sensitivity * log( alternative_relative_price
+          ), rank_salience_utility = scenario_row$rank_salience_scale[ 1 ] * case_when( alternative_rank == 1 ~
+              0.55, alternative_rank == 2 ~ 0.26, alternative_rank == 3 ~ 0.10, TRUE ~ 0 ),
+      price_threshold_excess = pmax( alternative_relative_price - scenario_row$price_threshold_ratio[ 1 ], 0 ),
+      price_threshold_penalty = scenario_row$price_threshold_strength[ 1 ] * ( price_threshold_excess / 0.05 )^2,
+      rank_threshold_excess = pmax( alternative_rank - scenario_row$rank_threshold[ 1 ], 0 ),
+      rank_threshold_penalty = scenario_row$rank_threshold_strength[ 1 ] * rank_threshold_excess^2,
+      utility_before_focal_calibration = base_nonprice_utility + latent_taste_utility + smooth_price_utility +
+        rank_salience_utility - price_threshold_penalty - rank_threshold_penalty )
+  # 11.4 Calibrate focal brand constant to expected focal conversion target
+  choice_calibration_base <- alternative_scenario %>% group_by( policy_id, quote_profile_id ) %>% summarise(
+      true_market_purchase_probability = first( true_market_purchase_probability ), focal_base_utility =
+        utility_before_focal_calibration[ is_focal ][1], competitor_log_sum_exp = log_sum_exp(
+          utility_before_focal_calibration[ !is_focal ] ), .groups = "drop" )
+  focal_conversion_objective <- function( focal_brand_constant
+  ) {
+    focal_choice_probability <- plogis( choice_calibration_base$focal_base_utility + focal_brand_constant -
+          choice_calibration_base$competitor_log_sum_exp )
+    mean( choice_calibration_base$true_market_purchase_probability * focal_choice_probability ) -
+      scenario_row$target_focal_conversion_rate[ 1 ]
+  }
+  lower_objective <- focal_conversion_objective( -10 )
+  upper_objective <- focal_conversion_objective( 10 )
+  if ( lower_objective * upper_objective > 0
+  ) {
+    stop( paste0( "Unable to calibrate focal brand utility for demand scenario: ", requested_demand_scenario_id ) )
+  }
+  focal_brand_constant_scalar <- uniroot( focal_conversion_objective, interval = c( -10, 10 ), tol = 1e-10 )$root
+  # 11.5 Final alternative probabilities
+  # Each alternative retains its own softmax numerator. The group-level
+  # denominator is calculated once and direct vector/scalar division is used.
+  # This avoids accidental scalar recycling inside helper functions.
+  alternative_scenario <- alternative_scenario %>% mutate( calibrated_focal_brand_utility = if_else( is_focal,
+          .env$focal_brand_constant_scalar, 0 ), true_choice_utility = utility_before_focal_calibration +
+        calibrated_focal_brand_utility ) %>% group_by( policy_id, quote_profile_id ) %>% mutate( utility_maximum =
+        max( true_choice_utility ), choice_probability_numerator = exp( true_choice_utility - utility_maximum ),
+      choice_probability_denominator = sum( choice_probability_numerator ),
+      # IMPORTANT:
+      # Do not use safe_divide() here. The denominator is a single group-level
+      # scalar and each alternative must retain its own numerator. Direct
+      # division therefore gives the exact profile-level softmax probability.
+      true_conditional_choice_probability = choice_probability_numerator / choice_probability_denominator,
+      choice_probability_sum = sum( true_conditional_choice_probability ) ) %>% arrange( alternative_id,
+      .by_group = TRUE ) %>% mutate( cumulative_choice_probability_raw = cumsum(
+          true_conditional_choice_probability ), cumulative_choice_probability = if_else( row_number() == n(), 1,
+          cumulative_choice_probability_raw ), previous_cumulative_probability = lag(
+          cumulative_choice_probability, default = 0 ), alternative_selected_if_purchase = choice_uniform >
+          previous_cumulative_probability & choice_uniform <= cumulative_choice_probability ) %>% ungroup()
+  choice_probability_normalisation_check <- alternative_scenario %>% group_by( policy_id, quote_profile_id ) %>%
+    summarise( probability_sum = sum( true_conditional_choice_probability ), .groups = "drop" )
+  maximum_choice_probability_sum_error <- max( abs( choice_probability_normalisation_check$probability_sum - 1 ) )
+  if ( maximum_choice_probability_sum_error > 1e-10
+  ) {
+    stop( paste0( "Conditional choice probabilities do not sum to one. Maximum error = ",
+        maximum_choice_probability_sum_error ) )
+  }
+  selected_alternative_count <- alternative_scenario %>% group_by( policy_id, quote_profile_id ) %>% summarise(
+      selected_alternatives = sum( alternative_selected_if_purchase ), .groups = "drop" )
+  if ( any( selected_alternative_count$selected_alternatives != 1L )
+  ) {
+    stop( paste0( "Conditional insurer-choice simulation failed for demand scenario: ",
+        requested_demand_scenario_id ) )
+  }
+  # 11.6 Profile-level focal truth and realised label
+  focal_truth <- alternative_scenario %>% filter( is_focal ) %>% transmute( policy_id, quote_profile_id,
+      true_focal_choice_probability = true_conditional_choice_probability, focal_selected_if_purchase =
+        alternative_selected_if_purchase, focal_taste_shock = latent_taste_utility, focal_base_nonprice_utility =
+        base_nonprice_utility, focal_smooth_price_utility = smooth_price_utility, focal_rank_salience_utility =
+        rank_salience_utility, focal_price_threshold_penalty = price_threshold_penalty,
+      focal_rank_threshold_penalty = rank_threshold_penalty )
+  profile_truth <- profile_scenario %>% left_join( focal_truth, by = c( "policy_id", "quote_profile_id" ) ) %>%
+    mutate( scenario_id = market_scenario_id, market_scenario_id = market_scenario_id, demand_scenario_id =
+        requested_demand_scenario_id, true_focal_conversion_probability = true_market_purchase_probability *
+          true_focal_choice_probability, focal_conversion = as.integer( market_purchase &
+            focal_selected_if_purchase ), participation_intercept = participation_intercept,
+      calibrated_focal_brand_utility = focal_brand_constant_scalar, target_market_purchase_rate =
+        scenario_row$target_market_purchase_rate[ 1 ], target_focal_conversion_rate =
+        scenario_row$target_focal_conversion_rate[ 1 ] )
+  # 11.7 Leakage-safe Module 5 modelling dataset
+  conversion_data <- quote_market %>% mutate( scenario_id = market_scenario_id, market_scenario_id =
+        market_scenario_id, demand_scenario_id = requested_demand_scenario_id ) %>% left_join( profile_truth %>%
+        dplyr::select( policy_id, quote_profile_id, focal_conversion ), by = c( "policy_id", "quote_profile_id" ) )
+  missing_vehicle_specification_columns <- setdiff( vehicle_specification_columns, names( conversion_data ) )
+  if ( length( missing_vehicle_specification_columns ) > 0L
+  ) {
+    stop( paste0( "Module 4 failed to retain vehicle-specification columns in conversion_data: ", paste(
+          missing_vehicle_specification_columns, collapse = ", " ) ) )
+  }
+  forbidden_conversion_modelling_columns <- names( conversion_data )[ str_detect( names( conversion_data ), regex(
+        paste( c( "^true_", "^latent_", "price_sensitivity_z", "taste_shock", "utility", "purchase_uniform",
+            "choice_uniform", "participation_intercept", "calibrated_focal_brand_utility" ), collapse = "|" ),
+        ignore_case = TRUE ) ) ]
+  if ( length( forbidden_conversion_modelling_columns ) > 0L
+  ) {
+    stop( paste0( "Module 4 leakage-safe output contains forbidden DGP truth columns: ", paste(
+          forbidden_conversion_modelling_columns, collapse = ", " ) ) )
+  }
+  # 11.8 Summary diagnostics
+  expected_purchase_rate <- mean( profile_truth$true_market_purchase_probability )
+  realised_purchase_rate <- mean( profile_truth$market_purchase )
+  expected_focal_conversion_rate <- mean( profile_truth$true_focal_conversion_probability )
+  realised_focal_conversion_rate <- mean( profile_truth$focal_conversion )
+  expected_conditional_focal_choice_rate <- mean( profile_truth$true_focal_choice_probability )
+  realised_conditional_focal_choice_rate <- mean( profile_truth$focal_selected_if_purchase )
+  conversion_by_rank <- profile_truth %>% group_by( focal_rank ) %>% summarise( profiles = n(),
+      mean_relative_price = mean( relative_price_to_cheapest_competitor ), expected_market_purchase_rate = mean(
+          true_market_purchase_probability ), expected_focal_choice_given_purchase = mean(
+          true_focal_choice_probability ), expected_focal_conversion_rate = mean( true_focal_conversion_probability
+        ), observed_focal_conversion_rate = mean( focal_conversion ), .groups = "drop" )
+  conversion_by_relative_price_decile <- profile_truth %>% mutate( relative_price_decile = ntile(
+          relative_price_to_cheapest_competitor, 10 ) ) %>% group_by( relative_price_decile ) %>% summarise(
+      profiles = n(), mean_relative_price_to_cheapest = mean( relative_price_to_cheapest_competitor ),
+      mean_focal_rank = mean( focal_rank ), expected_focal_conversion_rate = mean(
+          true_focal_conversion_probability ), observed_focal_conversion_rate = mean( focal_conversion ), .groups =
+        "drop" )
+  conversion_by_split <- profile_truth %>% group_by( conversion_data_split ) %>% summarise( profiles = n(),
+      conversions = sum( focal_conversion ), nonconversions = sum( focal_conversion == 0L ),
+      expected_focal_conversion_rate = mean( true_focal_conversion_probability ), observed_focal_conversion_rate =
+        mean( focal_conversion ), .groups = "drop" ) %>% mutate( conversion_data_split = as.character(
+          conversion_data_split ) )
+  split_value <- function( split_name, field_name
+  ) {
+    split_row <- conversion_by_split %>% filter( conversion_data_split == split_name )
+    if ( nrow( split_row ) != 1L
+    ) {
+      stop( paste0( "Unable to retrieve conversion split row for ", split_name, "." ) )
+    }
+    if ( !field_name %in% names( split_row )
+    ) {
+      stop( paste0( "Unknown conversion split metric: ", field_name, "." ) )
+    }
+    output <- split_row[[field_name]]
+    if ( length( output ) != 1L
+    ) {
+      stop( paste0( "Unable to retrieve conversion split metric ", field_name, " for ", split_name, "." ) )
+    }
+    output
+  }
+  rank_conversion_spearman <- cor( profile_truth$focal_rank, profile_truth$true_focal_conversion_probability,
+      method = "spearman" )
+  relative_price_conversion_spearman <- cor( profile_truth$relative_price_to_cheapest_competitor,
+      profile_truth$true_focal_conversion_probability, method = "spearman" )
+  first_rank_expected_conversion <- conversion_by_rank %>% filter( focal_rank == min( focal_rank ) ) %>% pull(
+      expected_focal_conversion_rate )
+  poor_rank_expected_conversion <- conversion_by_rank %>% filter( focal_rank >= 5 ) %>% summarise( value =
+        weighted.mean( expected_focal_conversion_rate, w = profiles ) ) %>% pull( value )
+  if ( length( poor_rank_expected_conversion ) == 0L | !is.finite( poor_rank_expected_conversion )
+  ) {
+    poor_rank_expected_conversion <- NA_real_
+  }
+  scenario_summary <- tibble( scenario_id = market_scenario_id, demand_scenario_id = requested_demand_scenario_id,
+    profiles = nrow( profile_truth ), policy_year = config$expected_policy_year, conversion_train_profiles =
+      split_value( "train", "profiles" ), conversion_validation_profiles = split_value( "validation", "profiles" ),
+    conversion_test_profiles = split_value( "test", "profiles" ), conversion_train_rate = split_value( "train",
+        "observed_focal_conversion_rate" ), conversion_validation_rate = split_value( "validation",
+        "observed_focal_conversion_rate" ), conversion_test_rate = split_value( "test",
+        "observed_focal_conversion_rate" ), target_market_purchase_rate = scenario_row$target_market_purchase_rate[
+        1 ], expected_market_purchase_rate = expected_purchase_rate, realised_market_purchase_rate =
+      realised_purchase_rate, target_focal_conversion_rate = scenario_row$target_focal_conversion_rate[ 1 ],
+    expected_focal_conversion_rate = expected_focal_conversion_rate, realised_focal_conversion_rate =
+      realised_focal_conversion_rate, expected_conditional_focal_choice_rate =
+      expected_conditional_focal_choice_rate, realised_conditional_focal_choice_rate =
+      realised_conditional_focal_choice_rate, mean_true_choice_price_sensitivity = mean(
+        profile_truth$true_choice_price_sensitivity ), sd_true_choice_price_sensitivity = sd(
+        profile_truth$true_choice_price_sensitivity ), participation_intercept = participation_intercept,
+    calibrated_focal_brand_utility = focal_brand_constant_scalar, rank_conversion_spearman =
+      rank_conversion_spearman, relative_price_conversion_spearman = relative_price_conversion_spearman,
+    first_rank_expected_conversion = first_rank_expected_conversion, poor_rank_expected_conversion =
+      poor_rank_expected_conversion )
+  # 11.9 Validation checks
+  scenario_validation_checks <- tribble( ~scenario_id, ~demand_scenario_id, ~check_name, ~observed_value,
+    ~lower_bound, ~upper_bound, market_scenario_id, requested_demand_scenario_id, "Conversion modelling rows",
+    nrow( conversion_data ), nrow( quote_market ), nrow( quote_market ), market_scenario_id,
+    requested_demand_scenario_id, "Unique quote-profile IDs", n_distinct( conversion_data$quote_profile_id ), nrow(
+      quote_market ), nrow( quote_market ), market_scenario_id, requested_demand_scenario_id, "Truth rows", nrow(
+      profile_truth ), nrow( quote_market ), nrow( quote_market ), market_scenario_id,
+    requested_demand_scenario_id, "Policy year is 2025 only", as.numeric( all( conversion_data$policy_year ==
+          config$expected_policy_year ) ), 1, 1, market_scenario_id, requested_demand_scenario_id,
+    "Technical-pricing provenance remains TEST only", as.numeric( all( conversion_data$technical_data_split ==
+          "test" ) ), 1, 1, market_scenario_id, requested_demand_scenario_id,
+    "Downstream data_split matches conversion_data_split", as.numeric( all( as.character(
+          conversion_data$data_split ) == as.character( conversion_data$conversion_data_split ) ) ), 1, 1,
+    market_scenario_id, requested_demand_scenario_id, "Conversion TRAIN rows", split_value( "train", "profiles" ),
+    config$expected_conversion_train_rows, config$expected_conversion_train_rows, market_scenario_id,
+    requested_demand_scenario_id, "Conversion VALIDATION rows", split_value( "validation", "profiles" ),
+    config$expected_conversion_validation_rows, config$expected_conversion_validation_rows, market_scenario_id,
+    requested_demand_scenario_id, "Conversion TEST rows", split_value( "test", "profiles" ),
+    config$expected_conversion_test_rows, config$expected_conversion_test_rows, market_scenario_id,
+    requested_demand_scenario_id, "Conversion TRAIN contains both outcome classes", as.numeric( split_value(
+        "train", "conversions" ) > 0 & split_value( "train", "nonconversions" ) > 0 ), 1, 1, market_scenario_id,
+    requested_demand_scenario_id, "Conversion VALIDATION contains both outcome classes", as.numeric( split_value(
+        "validation", "conversions" ) > 0 & split_value( "validation", "nonconversions" ) > 0 ), 1, 1,
+    market_scenario_id, requested_demand_scenario_id, "Conversion TEST contains both outcome classes", as.numeric(
+      split_value( "test", "conversions" ) > 0 & split_value( "test", "nonconversions" ) > 0 ), 1, 1,
+    market_scenario_id, requested_demand_scenario_id, "Vehicle specification columns retained", as.numeric( all(
+        vehicle_specification_columns %in% names( conversion_data ) ) ), 1, 1, market_scenario_id,
+    requested_demand_scenario_id, "Positive power retained in conversion data", mean( is.finite(
+        conversion_data$power_kw ) & conversion_data$power_kw > 0 ), 1, 1, market_scenario_id,
+    requested_demand_scenario_id, "Positive torque retained in conversion data", mean( is.finite(
+        conversion_data$torque_nm ) & conversion_data$torque_nm > 0 ), 1, 1, market_scenario_id,
+    requested_demand_scenario_id, "Positive unladen weight retained in conversion data", mean( is.finite(
+        conversion_data$unladen_weight_kg ) & conversion_data$unladen_weight_kg > 0 ), 1, 1, market_scenario_id,
+    requested_demand_scenario_id, "Nonblank transmission retained in conversion data", mean( !is.na(
+        conversion_data$transmission ) & trimws( as.character( conversion_data$transmission ) ) != "" ), 1, 1,
+    market_scenario_id, requested_demand_scenario_id, "Finite true focal conversion probabilities", mean(
+      is.finite( profile_truth$true_focal_conversion_probability ) ), 1, 1, market_scenario_id,
+    requested_demand_scenario_id, "True focal conversion probabilities inside [0,1]", mean(
+      profile_truth$true_focal_conversion_probability >= 0 & profile_truth$true_focal_conversion_probability <= 1
+    ), 1, 1, market_scenario_id, requested_demand_scenario_id, "Positive heterogeneous price sensitivity", mean(
+      is.finite( profile_truth$true_choice_price_sensitivity ) & profile_truth$true_choice_price_sensitivity > 0 ),
+    1, 1, market_scenario_id, requested_demand_scenario_id, "Expected market purchase rate",
+    expected_purchase_rate, scenario_row$target_market_purchase_rate[ 1 ] - config$expected_purchase_tolerance,
+    scenario_row$target_market_purchase_rate[ 1 ] + config$expected_purchase_tolerance, market_scenario_id,
+    requested_demand_scenario_id, "Expected focal conversion rate", expected_focal_conversion_rate,
+    scenario_row$target_focal_conversion_rate[ 1 ] - config$expected_conversion_tolerance,
+    scenario_row$target_focal_conversion_rate[ 1 ] + config$expected_conversion_tolerance, market_scenario_id,
+    requested_demand_scenario_id, "Observed focal conversion reasonably close to expectation",
+    realised_focal_conversion_rate, expected_focal_conversion_rate - config$observed_conversion_tolerance,
+    expected_focal_conversion_rate + config$observed_conversion_tolerance, market_scenario_id,
+    requested_demand_scenario_id, "Conditional choice probabilities sum to one",
+    maximum_choice_probability_sum_error, 0, 1e-10, market_scenario_id, requested_demand_scenario_id,
+    "Realised conditional focal choice close to expectation", realised_conditional_focal_choice_rate,
+    expected_conditional_focal_choice_rate - config$observed_conversion_tolerance,
+    expected_conditional_focal_choice_rate + config$observed_conversion_tolerance, market_scenario_id,
+    requested_demand_scenario_id, "Rank has negative association with true conversion", rank_conversion_spearman,
+    -1, -0.20, market_scenario_id, requested_demand_scenario_id,
+    "Relative price has negative association with true conversion", relative_price_conversion_spearman, -1, -0.20,
+    market_scenario_id, requested_demand_scenario_id, "Rank 1 expected conversion exceeds poorer ranks",
+    first_rank_expected_conversion - poor_rank_expected_conversion, 0.03, 1 ) %>% mutate( pass = observed_value >=
+          lower_bound & observed_value <= upper_bound )
+  # 11.10 Alternative truth output for later counterfactual evaluation
+  alternative_truth <- alternative_scenario %>% dplyr::select( policy_id, quote_profile_id, alternative_id,
+      alternative_archetype, is_focal, alternative_quote, alternative_rank, alternative_relative_price,
+      market_cheapest_quote, market_median_quote_reconstructed, latent_taste_z, base_nonprice_utility,
+      latent_taste_utility, smooth_price_utility, rank_salience_utility, price_threshold_excess,
+      price_threshold_penalty, rank_threshold_excess, rank_threshold_penalty, calibrated_focal_brand_utility,
+      utility_before_focal_calibration, true_choice_utility, choice_probability_numerator,
+      choice_probability_denominator, choice_probability_sum, true_conditional_choice_probability ) %>% mutate(
+      scenario_id = market_scenario_id, market_scenario_id = market_scenario_id, demand_scenario_id =
+        requested_demand_scenario_id, .before = 1 )
+  # 11.11 Scenario metadata
+  scenario_metadata <- list( market_scenario_id = market_scenario_id, demand_scenario_id =
+      requested_demand_scenario_id, quote_market_policy_year = config$expected_policy_year, quote_market_profiles =
+      config$expected_profiles, technical_data_split = "test", conversion_split_counts = c( train =
+          config$expected_conversion_train_rows, validation = config$expected_conversion_validation_rows, test =
+          config$expected_conversion_test_rows ), demand_parameters = as.list( scenario_row[ 1, ] ),
+    participation_intercept = participation_intercept, calibrated_focal_brand_utility =
+      focal_brand_constant_scalar, portfolio_market_median = portfolio_market_median, price_sensitivity_meanlog =
+      price_sensitivity_parameters$meanlog, price_sensitivity_sdlog = price_sensitivity_parameters$sdlog,
+    common_random_number_seeds = list( profile_price_sensitivity_seed = config$profile_price_sensitivity_seed,
+        alternative_taste_seed = config$alternative_taste_seed, purchase_draw_seed = config$purchase_draw_seed,
+        choice_draw_seed = config$choice_draw_seed ), extensive_margin_assumption = paste(
+        "Market participation depends on the full-market median quote.",
+        "Focal repricing affects market participation only when it changes",
+        "the market median; otherwise repricing acts through conditional insurer choice." ) )
+  list( conversion_data = conversion_data, profile_truth = profile_truth, alternative_truth = alternative_truth,
+    scenario_summary = scenario_summary, conversion_by_rank = conversion_by_rank,
+    conversion_by_relative_price_decile = conversion_by_relative_price_decile, conversion_by_split =
+      conversion_by_split, validation_checks = scenario_validation_checks, metadata = scenario_metadata )
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 12. RUN REQUESTED DEMAND SCENARIOS
+demand_results <- purrr::set_names( config$demand_scenarios_to_run ) %>% purrr::map( generate_demand_scenario )
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 13. CONSOLIDATED SUMMARIES AND VALIDATION
+conversion_generation_summary <- purrr::map_dfr( demand_results, "scenario_summary" )
+conversion_generation_validation_checks <- purrr::map_dfr( demand_results, "validation_checks" )
+conversion_by_rank_all <- purrr::imap_dfr( demand_results, function( scenario_result, scenario_name
+    ) {
+      scenario_result$conversion_by_rank %>% mutate( scenario_id = market_scenario_id, demand_scenario_id =
+            scenario_name, .before = 1 )
+    } )
+conversion_by_relative_price_decile_all <- purrr::imap_dfr( demand_results, function( scenario_result,
+        scenario_name
+    ) {
+      scenario_result$conversion_by_relative_price_decile %>% mutate( scenario_id = market_scenario_id,
+          demand_scenario_id = scenario_name, .before = 1 )
+    } )
+conversion_by_split_all <- purrr::imap_dfr( demand_results, function( scenario_result, scenario_name
+    ) {
+      scenario_result$conversion_by_split %>% mutate( scenario_id = market_scenario_id, demand_scenario_id =
+            scenario_name, .before = 1 )
+    } )
+if ( any( is.na( conversion_generation_validation_checks$pass ) | !conversion_generation_validation_checks$pass )
+) {
+  failed_conversion_checks <- conversion_generation_validation_checks %>% filter( is.na( pass ) | !pass )
+  stop( paste0( "Module 4 validation failed. Resolve these checks before running Module 5: ", paste( paste0(
+          failed_conversion_checks$demand_scenario_id, " / ", failed_conversion_checks$check_name ),
+        collapse = "; " ) ) )
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 14. WRITE SCENARIO-SPECIFIC OUTPUTS
+if ( length( demand_results ) > 1L
+) {
+  purrr::iwalk( demand_results, function( scenario_result, scenario_name
+    ) {
+      readr::write_csv( scenario_result$conversion_data, file.path( config$output_dir, paste0( "conversion_data_",
+            scenario_name, ".csv" ) ) )
+      saveRDS( scenario_result$profile_truth, file.path( config$output_dir, paste0( "conversion_truth_",
+            scenario_name, ".rds" ) ) )
+      saveRDS( scenario_result$alternative_truth, file.path( config$output_dir, paste0(
+            "conversion_alternative_truth_", scenario_name, ".rds" ) ) )
+      saveRDS( scenario_result$metadata, file.path( config$output_dir, paste0( "demand_scenario_metadata_",
+            scenario_name, ".rds" ) ) )
+    } )
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 15. WRITE CANONICAL SINGLE-SCENARIO OUTPUTS
+# Stable filenames are produced for the single-scenario baseline and for
+if ( length( demand_results ) == 1L
+) {
+  canonical_result <- demand_results[[1]]
+  readr::write_csv( canonical_result$conversion_data, file.path( config$output_dir, "conversion_data.csv" ) )
+  saveRDS( canonical_result$profile_truth, file.path( config$output_dir, "conversion_truth.rds" ) )
+  saveRDS( canonical_result$alternative_truth, file.path( config$output_dir, "conversion_alternative_truth.rds" ) )
+  saveRDS( canonical_result$metadata, file.path( config$output_dir, "demand_scenario_metadata.rds" ) )
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 16. WRITE SUPPORTING OUTPUTS
+readr::write_csv( conversion_split_input_summary, file.path( config$output_dir,
+    "conversion_split_input_summary.csv" ) )
+readr::write_csv( conversion_by_split_all, file.path( config$output_dir, "conversion_by_split.csv" ) )
+readr::write_csv( demand_scenario_register, file.path( config$output_dir, "demand_scenario_register.csv" ) )
+readr::write_csv( conversion_generation_summary, file.path( config$output_dir, "conversion_generation_summary.csv"
+  ) )
+readr::write_csv( conversion_generation_validation_checks, file.path( config$output_dir,
+    "conversion_generation_validation_checks.csv" ) )
+readr::write_csv( conversion_by_rank_all, file.path( config$output_dir, "conversion_by_rank.csv" ) )
+readr::write_csv( conversion_by_relative_price_decile_all, file.path( config$output_dir,
+    "conversion_by_relative_price_decile.csv" ) )
+readr::write_csv( market_median_reconstruction_check, file.path( config$output_dir,
+    "market_median_reconstruction_check.csv" ) )
+readr::write_csv( conversion_vehicle_specification_audit, file.path( config$output_dir,
+    "conversion_vehicle_specification_audit.csv" ) )
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 17. DIAGNOSTIC PLOTS
+if ( isTRUE( config$write_plots )
+) {
+  plot_scenario <- if ( "baseline" %in% names( demand_results )
+    ) {
+      "baseline"
+    } else {
+      names( demand_results )[ 1 ]
+    }
+  plot_truth <- demand_results[[plot_scenario]]$profile_truth
+  plot_rank <- demand_results[[plot_scenario]]$conversion_by_rank
+  plot_price_decile <- demand_results[[plot_scenario]]$conversion_by_relative_price_decile
+  p_probability_distribution <- ggplot( plot_truth, aes( x = true_focal_conversion_probability ) ) +
+    geom_histogram( bins = 50 ) + labs( x = "True focal conversion probability", y = "Quote profiles",
+      title = "Synthetic focal-conversion probability distribution" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "01_true_conversion_probability.png" ), p_probability_distribution,
+    width = 8, height = 5, dpi = 300 )
+  p_conversion_by_rank <- plot_rank %>% dplyr::select( focal_rank, expected_focal_conversion_rate,
+      observed_focal_conversion_rate ) %>% pivot_longer( cols = c( expected_focal_conversion_rate,
+        observed_focal_conversion_rate ), names_to = "series", values_to = "conversion_rate" ) %>% mutate( series =
+        recode( series, expected_focal_conversion_rate = "Expected from DGP", observed_focal_conversion_rate =
+            "Realised binary labels" ) ) %>% ggplot( aes( x = focal_rank, y = conversion_rate, linetype = series )
+    ) + geom_line() + geom_point() + labs( x = "Focal quote rank", y = "Conversion rate", linetype = NULL,
+      title = "Conversion by focal quote rank" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "02_conversion_by_rank.png" ), p_conversion_by_rank, width = 8, height = 5,
+    dpi = 300 )
+  p_conversion_by_relative_price <- plot_price_decile %>% ggplot( aes( x = mean_relative_price_to_cheapest, y =
+          expected_focal_conversion_rate ) ) + geom_line() + geom_point() + labs(
+      x = "Mean focal quote / cheapest competitor quote", y = "Expected focal conversion rate",
+      title = "True conversion response to relative price" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "03_conversion_by_relative_price.png" ), p_conversion_by_relative_price,
+    width = 8, height = 5, dpi = 300 )
+  p_price_sensitivity <- ggplot( plot_truth, aes( x = true_choice_price_sensitivity ) ) + geom_histogram( bins = 50
+    ) + labs( x = "True customer price sensitivity", y = "Quote profiles",
+      title = "Heterogeneous customer price sensitivity" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "04_price_sensitivity_distribution.png" ), p_price_sensitivity, width = 8,
+    height = 5, dpi = 300 )
+}
+```
+
+
+```{r module-4-conversion-dgp, message=FALSE, warning=TRUE}
+# 18. PRINT KEY RESULTS
+cat( "\n", "============================================================\n",
+  "MODULE 4 2025 OOT CONVERSION DGP COMPLETE\n", "============================================================\n",
+  sep = "" )
+cat( "\nMarket scenario:\n" )
+print( market_scenario_id )
+cat( "\nQuote-market cohort and preserved conversion split:\n" )
+cat( "Policy year: ", config$expected_policy_year, "\nProfiles: ", nrow( quote_market ),
+  "\nTechnical-pricing provenance: TEST only\n", sep = "" )
+print( conversion_split_input_summary, n = Inf )
+cat( "\nDemand scenarios run:\n" )
+print( config$demand_scenarios_to_run )
+cat( "\nConversion-generation summary:\n" )
+print( conversion_generation_summary, n = Inf )
+cat( "\nConversion outcomes by development split:\n" )
+print( conversion_by_split_all, n = Inf )
+cat( "\nValidation checks:\n" )
+print( conversion_generation_validation_checks, n = Inf )
+cat( "\nCanonical Module 5 input when one demand scenario is run:\n", file.path( config$output_dir,
+    "conversion_data.csv" ), "\n", sep = "" )
+cat( "\nKnown-DGP truth retained separately for later validation:\n", file.path( config$output_dir,
+    "conversion_truth.rds" ), "\n", file.path( config$output_dir, "conversion_alternative_truth.rds" ), "\n",
+  sep = "" )
+```

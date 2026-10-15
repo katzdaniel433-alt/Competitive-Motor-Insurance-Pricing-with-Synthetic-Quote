@@ -1,0 +1,1165 @@
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# Vary market, demand and pricing assumptions one scenario family at a time.
+# Generate separate case-specific outputs using canonical module templates.
+
+required_packages <- c( "tidyverse", "broom", "mgcv", "lpSolve" )
+missing_packages <- required_packages[ !required_packages %in% rownames( installed.packages() ) ]
+if ( length( missing_packages ) > 0L
+) {
+  stop( paste0( "Install the following packages before running Module 7: ", paste( missing_packages,
+        collapse = ", " ) ) )
+}
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+options( dplyr.summarise.inform = FALSE, scipen = 999 )
+project_root <- normalizePath( getwd(), winslash = "/", mustWork = TRUE )
+cat( "\nModule 7 project root: ", project_root, "\n", sep = "" )
+config <- list( output_dir = file.path( project_root, "outputs", "sensitivity_analysis" ), cases_dir = file.path(
+      project_root, "outputs", "sensitivity_analysis", "cases" ), module3_template =
+    file.path(project_root, "03_construct_synthetic_quote_market.Rmd"), module4_template =
+    file.path(project_root, "04_generate_conversion_outcomes.Rmd"), module5_template =
+    file.path(project_root, "05_fit_conversion_models.Rmd"), module6_template =
+    file.path(project_root, "06_constrained_pricing_simulation.Rmd"), expected_policy_year = 2025L,
+  expected_profiles = 10000L, expected_conversion_train_rows = 6000L, expected_conversion_validation_rows = 2000L,
+  expected_conversion_test_rows = 2000L, expected_module5_version = "M5-GLMGAM-OOT-2026-09-18",
+  expected_module6_version = "M6-GLMGAM-OOT-2026-09-18", expected_conversion_model_families = c( "glm", "gam" ),
+  expected_conversion_candidates = c( "Technical-only GLM", "Own-price GLM", "Relative-price GLM", "Rank GLM",
+      "Market-position GLM", "Market-position GAM" ),
+  cases_to_run = NULL,
+  overwrite_existing_cases = FALSE,
+  # Central robustness criteria.
+  minimum_truth_margin_retention = 1.00, minimum_truth_conversion_uplift = 0.00,
+  # Rate neutrality is judged on VALIDATION, where the targeted constraint is
+  # imposed. TEST rate level is descriptive and never used to retune the strategy.
+  development_rate_neutral_tolerance = 0.005, write_plots = TRUE )
+dir.create(
+  config$output_dir, recursive = TRUE, showWarnings = FALSE )
+dir.create(
+  config$cases_dir, recursive = TRUE, showWarnings = FALSE )
+# Fail early if the resolved absolute Module 7 output directory itself cannot
+# create a new file.
+write_probe_path <- file.path( config$output_dir, paste0( ".module7_write_probe_", Sys.getpid(), ".tmp" ) )
+write_probe_connection <- tryCatch( file( write_probe_path, open = "w" ),
+    error = function(e) {
+      NULL
+    } )
+if ( is.null( write_probe_connection )
+) {
+  stop( paste0( "Module 7 cannot create files in its resolved output directory.\n", "Project root: ", project_root,
+      "\n", "Resolved output directory: ", config$output_dir, "\n", "Current working directory: ", getwd(), "\n",
+      "Directory exists: ", dir.exists( config$output_dir ), "\n", "file.access(write) result: ", file.access(
+        config$output_dir, 2 ) ) )
+}
+close( write_probe_connection )
+unlink( write_probe_path, force = TRUE )
+assert_template_contains <- function( file_path, required_text, template_label
+) {
+  if ( !file.exists( file_path )
+  ) {
+    stop( paste0( template_label, " template not found: ", file_path ) )
+  }
+  template_text <- paste( readLines( file_path, warn = FALSE, encoding = "UTF-8" ), collapse = "\n" )
+  if ( !grepl( required_text, template_text, fixed = TRUE )
+  ) {
+    stop( paste0( template_label, " does not match the final GLM/GAM contract. Expected marker: ", required_text,
+        ". Resolved file: ", file_path ) )
+  }
+  invisible( TRUE )
+}
+assert_template_contains( config$module5_template, config$expected_module5_version, "Module 5" )
+assert_template_contains( config$module6_template, config$expected_module6_version, "Module 6" )
+# 0.1 CORE NUMERIC HELPER
+safe_divide <- function( numerator, denominator
+) {
+  result <- numerator / denominator
+  result[ !is.finite( result ) ] <- NA_real_
+  result
+}
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 1. VERIFY TEMPLATE FILES
+template_paths <- c( Module_3 = config$module3_template, Module_4 = config$module4_template, Module_5 =
+    config$module5_template, Module_6 = config$module6_template )
+missing_templates <- template_paths[ !file.exists( template_paths ) ]
+if ( length( missing_templates ) > 0L
+) {
+  stop( paste0( "Module 7 cannot find the following template file(s) in the current ",
+      "RStudio project directory:\n", paste( paste0( names( missing_templates ), ": ", unname( missing_templates )
+        ), collapse = "\n" ), "\n\nIf your files use different names, change the four template paths ",
+      "in the Module 7 configuration block." ) )
+}
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 2. SENSITIVITY CASE REGISTER
+# The sensitivity values below are modelling scenarios, not empirical estimates.
+# Each case changes one major assumption group relative to baseline.
+scenario_register <- tibble::tribble( ~case_order, ~case_id, ~scenario_group, ~scenario_description,
+  ~market_scenario_id, ~demand_scenario_id, ~multiplier_lower, ~multiplier_upper, ~multiplier_step,
+  ~maximum_admissible_claim_ratio, ~minimum_unit_margin_retention, ~minimum_portfolio_margin_retention,
+  ~targeted_rate_level_lower, ~targeted_rate_level_upper, ~scenario_note, 1L, "baseline", "Baseline",
+  "Frozen 2025 baseline market, demand and pricing-rule assumptions", "baseline", "baseline", 0.95, 1.05, 0.01,
+  0.800, 0.90, 1.00, 0.995, 1.005,
+  "Primary reference case; baseline Module 5 selects the Market-position GAM and Module 6 selects vehicle-value quartiles.",
+  2L, "market_high_competition", "Market structure",
+  "Competitors are more price-aggressive and more likely to return quotes", "high_competition", "baseline", 0.95,
+  1.05, 0.01, 0.800, 0.90, 1.00, 0.995, 1.005, "Tests stronger comparison-market pressure.", 3L,
+  "market_low_competition", "Market structure",
+  "Competitors are less aggressive and the returned comparison set is thinner", "low_competition", "baseline",
+  0.95, 1.05, 0.01, 0.800, 0.90, 1.00, 0.995, 1.005, "Tests weaker competitive pressure and fewer alternatives.",
+  4L, "market_fragmented", "Market structure", "Competitor pricing and segment appetites are more dispersed",
+  "fragmented_market", "baseline", 0.95, 1.05, 0.01, 0.800, 0.90, 1.00, 0.995, 1.005,
+  "Tests greater cross-insurer price disagreement.", 5L, "demand_low_price_sensitivity", "Demand",
+  "Customers respond less strongly to relative price and quote rank", "baseline", "low_price_sensitivity", 0.95,
+  1.05, 0.01, 0.800, 0.90, 1.00, 0.995, 1.005,
+  "Tests weaker price response and stronger non-price preference heterogeneity.", 6L, "demand_agentic", "Demand",
+  "Lower search friction produces stronger relative-price and rank response", "baseline", "agentic", 0.95, 1.05,
+  0.01, 0.800, 0.90, 1.00, 0.995, 1.005, "Tests stronger price/rank salience.", 7L, "demand_threshold", "Demand",
+  "Demand falls more sharply after price and rank tolerance thresholds", "baseline", "threshold", 0.95, 1.05, 0.01,
+  0.800, 0.90, 1.00, 0.995, 1.005, "Tests nonlinear threshold behaviour.", 8L, "pricing_narrow_support",
+  "Pricing rule", "Narrower admissible commercial-price support around technical premium", "baseline", "baseline",
+  0.97, 1.03, 0.01, 0.800, 0.90, 1.00, 0.995, 1.005, "Tests a more conservative +/-3% pricing envelope.", 9L,
+  "pricing_strict_adequacy", "Pricing rule", "Stricter expected claim-ratio ceiling", "baseline", "baseline", 0.95,
+  1.05, 0.01, 0.780, 0.90, 1.00, 0.995, 1.005, paste(
+    "Reduces the admissible claim-ratio ceiling from 80% to 78%.",
+    "The 78% ceiling remains above the 76.9% technical benchmark." ), 10L, "pricing_wide_stress", "Pricing rule",
+  "Wider candidate-price support beyond the baseline observed focal-price range", "baseline", "baseline", 0.90,
+  1.10, 0.025, 0.800, 0.90, 1.00, 0.995, 1.005, paste(
+    "Stress test only: deliberately allows extrapolation outside the",
+    "0.95-1.05 focal-price support used to generate baseline quote observations." ) ) %>% arrange( case_order )
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 3. OPTIONAL CASE SUBSETTING
+if ( !is.null( config$cases_to_run )
+) {
+  unknown_cases <- setdiff( config$cases_to_run, scenario_register$case_id )
+  if ( length( unknown_cases ) > 0L
+  ) {
+    stop( paste0( "Unknown sensitivity case(s): ", paste( unknown_cases, collapse = ", " ) ) )
+  }
+  scenario_register <- scenario_register %>% filter( case_id %in% config$cases_to_run ) %>% arrange( case_order )
+}
+if ( !"baseline" %in% scenario_register$case_id
+) {
+  stop( paste( "The baseline case must be included.", "Demand and pricing-rule cases reuse baseline case outputs."
+    ) )
+}
+
+# Write results using their canonical filenames.
+write_csv_resilient <- function(x, file, ...) {
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  tryCatch({
+    readr::write_csv(x, file, ...)
+    invisible(file)
+  }, error = function(e) {
+    stop("Unable to write output ", file, ": ", conditionMessage(e), call. = FALSE)
+  })
+}
+write_csv_resilient( scenario_register, file.path( config$output_dir, "sensitivity_case_register.csv" ) )
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 4. GENERAL HELPER FUNCTIONS
+normalise_r_path <- function( path
+) {
+  gsub( "\\\\", "/", path )
+}
+path_config_line <- function( name, path
+) {
+  paste0( name, ' = "', normalise_r_path( path ), '",' )
+}
+replace_once_line <- function( lines, old, new, label
+) {
+  matching_lines <- which( trimws( lines ) == trimws( old ) )
+  # Template versions can differ in the existing RHS while retaining the same
+  # configuration variable. If the exact line is absent, fall back to the
+  # unique active assignment for that variable. Commented documentation lines
+  # are explicitly excluded.
+  if ( length( matching_lines ) == 0L
+  ) {
+    assignment_name <- stringr::str_match( trimws( old ), "^([A-Za-z][A-Za-z0-9_.]*)\\s*=" )[ 1, 2 ]
+    if ( !is.na( assignment_name )
+    ) {
+      active_assignment_pattern <- paste0( "^\\s*", assignment_name, "\\s*=" )
+      matching_lines <- which( !stringr::str_detect( lines,
+            "^\\s*#"
+          ) & stringr::str_detect( lines, active_assignment_pattern ) )
+    }
+  }
+  if ( length( matching_lines ) != 1L
+  ) {
+    stop( paste0( "Expected exactly one active configuration line for '", label, "' but found ", length(
+          matching_lines ), ". The template may have changed." ) )
+  }
+  line_index <- matching_lines[ 1 ]
+  indentation <- stringr::str_extract( lines[ line_index ], "^\\s*" )
+  lines[ line_index ] <- paste0( indentation, trimws( new ) )
+  lines
+}
+extract_r_chunks <- function( rmd_path, r_script_path
+) {
+  lines <- readLines( rmd_path, warn = FALSE, encoding = "UTF-8" )
+  extracted_lines <- character()
+  in_r_chunk <- FALSE
+  chunk_count <- 0L
+  for ( line in lines
+  ) {
+    if ( !in_r_chunk && grepl( "^\\s*```\\{r(?:[ ,}].*)?$", line )
+    ) {
+      in_r_chunk <- TRUE
+      chunk_count <- chunk_count + 1L
+      next
+    }
+    if ( in_r_chunk && grepl( "^\\s*```\\s*$", line )
+    ) {
+      in_r_chunk <- FALSE
+      extracted_lines <- c( extracted_lines, "" )
+      next
+    }
+    if ( in_r_chunk
+    ) {
+      extracted_lines <- c( extracted_lines, line )
+    }
+  }
+  if ( in_r_chunk
+  ) {
+    stop( paste0( "Unclosed R chunk detected in: ", rmd_path ) )
+  }
+  if ( chunk_count == 0L
+  ) {
+    stop( paste0( "No R code chunks were found in: ", rmd_path ) )
+  }
+  writeLines( extracted_lines, r_script_path, useBytes = TRUE )
+  invisible( list( chunk_count = chunk_count, r_lines = length( extracted_lines ) ) )
+}
+write_patched_case_script <- function( template_path, patched_rmd_path, r_script_path, replacements
+) {
+  lines <- readLines( template_path, warn = FALSE, encoding = "UTF-8" )
+  for ( replacement in replacements
+  ) {
+    lines <- replace_once_line( lines = lines, old = replacement$old, new = replacement$new, label =
+          replacement$label )
+  }
+  writeLines( lines, patched_rmd_path, useBytes = TRUE )
+  extraction_info <- extract_r_chunks( rmd_path = patched_rmd_path, r_script_path = r_script_path )
+  tryCatch(
+    {
+      parse( file = r_script_path, keep.source = FALSE )
+    },
+    error = function(e) {
+      stop( paste0( "Generated case script is not valid R: ", r_script_path, ". ", conditionMessage( e ) ) )
+    } )
+  invisible( extraction_info )
+  r_script_path
+}
+run_script_isolated <- function( script_path, module_label
+) {
+  message( "    Running ", module_label, " in isolated R process..." )
+  rscript_path <- file.path( R.home( "bin" ), "Rscript" )
+  if ( !file.exists( rscript_path )
+  ) {
+    rscript_path <- Sys.which( "Rscript" )
+  }
+  if ( !nzchar( rscript_path ) || !file.exists( rscript_path )
+  ) {
+    stop( "Could not locate the Rscript executable required for isolated sensitivity runs." )
+  }
+  log_path <- sub( "\\.R$", "_run.log", script_path )
+  original_working_directory <- getwd()
+  on.exit(
+    {
+      setwd( original_working_directory )
+      # Keep the Module 7 controller process small. All large model objects live
+      # only inside the child Rscript process and disappear when it exits.
+      invisible( gc( verbose = FALSE ) )
+    }, add = TRUE )
+  setwd( project_root )
+  status <- tryCatch(
+      {
+        system2( command = rscript_path, args = c( "--vanilla", shQuote( script_path ) ), stdout = log_path,
+          stderr = log_path )
+      },
+      error = function(e) {
+        structure( 1L, controller_error = conditionMessage( e ) )
+      } )
+  if ( is.null( status )
+  ) {
+    status <- 0L
+  }
+  status <- as.integer( status )
+  if ( identical( status, 0L )
+  ) {
+    return( list( success = TRUE, error_message = NA_character_, log_path = log_path ) )
+  }
+  controller_error <- attr( status, "controller_error" )
+  log_tail <- character()
+  if ( file.exists( log_path )
+  ) {
+    log_lines <- tryCatch( readLines( log_path, warn = FALSE, encoding = "UTF-8" ),
+        error = function(e) {
+          character()
+        } )
+    if ( length( log_lines ) > 0L
+    ) {
+      log_tail <- tail( log_lines, 40L )
+    }
+  }
+  error_text <- paste( c( if ( !is.null( controller_error )
+        ) {
+          controller_error
+        } else {
+          NULL
+        }, log_tail ), collapse = "\n" )
+  if ( !nzchar( error_text )
+  ) {
+    error_text <- paste0( "Rscript exited with status ", status, ". See log: ", log_path )
+  }
+  list( success = FALSE, error_message = paste0( module_label, " runtime failure in ", script_path,
+        " (isolated Rscript status ", status, "): ", error_text ), log_path = log_path )
+}
+all_checks_pass <- function( file_path
+) {
+  if ( !file.exists( file_path )
+  ) {
+    return( FALSE )
+  }
+  checks <- suppressMessages( readr::read_csv( file_path, show_col_types = FALSE ) )
+  if ( !"pass" %in% names( checks ) || nrow( checks ) == 0L
+  ) {
+    return( FALSE )
+  }
+  # Modules 5 and 6 deliberately include substantive diagnostic rows with
+  # required_for_progress = FALSE (for example whether GAM clears the
+  # complexity-selection threshold). Those are robustness RESULTS, not
+  # mechanical pipeline failures. When that flag exists, only required rows
+  # determine whether the module itself passed.
+  if ( "required_for_progress" %in% names( checks )
+  ) {
+    required_flag <- as.logical( checks$required_for_progress )
+    required_flag[ is.na( required_flag ) ] <- TRUE
+    checks <- checks[ required_flag, , drop = FALSE ]
+  }
+  if ( nrow( checks ) == 0L
+  ) {
+    return( FALSE )
+  }
+  all( as.logical( checks$pass ) )
+}
+case_complete <- function( case_root
+) {
+  required_case_outputs <- c( file.path( case_root, "conversion_models", "model_validation_checks.csv" ),
+    file.path( case_root, "conversion_models", "final_selected_test_metrics.csv" ), file.path( case_root,
+      "pricing_simulation", "test_strategy_comparison.csv" ), file.path( case_root, "pricing_simulation",
+      "pricing_validation_checks.csv" ), file.path( case_root, "pricing_simulation",
+      "pricing_sample_architecture.csv" ), file.path( case_root, "pricing_simulation",
+      "targeted_strategy_selection_summary.csv" ), file.path( case_root, "pricing_simulation",
+      "selected_segment_multipliers.csv" ), file.path( case_root, "pricing_simulation",
+      "selected_conversion_model_interface.csv" ), file.path( case_root, "pricing_simulation",
+      "prediction_interface_reconstruction.csv" ), file.path( case_root, "pricing_simulation",
+      "neutral_targeted_feasibility.csv" ) )
+  all( file.exists( required_case_outputs ) )
+}
+first_or_na <- function( x
+) {
+  if ( length( x ) == 0L
+  ) {
+    NA_real_
+  } else {
+    x[ 1 ]
+  }
+}
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 5. MODULE PATCHING FUNCTIONS
+patch_module3 <- function( case_row, case_root
+) {
+  quote_market_dir <- file.path( case_root, "quote_market" )
+  scripts_dir <- file.path( case_root, "scripts" )
+  dir.create(
+    quote_market_dir, recursive = TRUE, showWarnings = FALSE )
+  dir.create(
+    scripts_dir, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( scripts_dir, "03_quote_market_case.Rmd" )
+  r_script <- file.path( scripts_dir, "03_quote_market_case.R" )
+  replacements <- list( list( old = 'output_dir = file.path("outputs", "quote_market"),', new = path_config_line(
+          "output_dir", quote_market_dir ), label = "Module 3 output_dir" ), list( old =
+        'scenarios_to_run = c("baseline"),', new = paste0( 'scenarios_to_run = c("', case_row$market_scenario_id[ 1
+          ], '"),' ), label = "Module 3 scenarios_to_run" ) )
+  write_patched_case_script( template_path = config$module3_template, patched_rmd_path = patched_rmd,
+    r_script_path = r_script, replacements = replacements )
+}
+patch_module4 <- function( case_row, case_root, quote_market_dir
+) {
+  conversion_dir <- file.path( case_root, "conversion_generation" )
+  scripts_dir <- file.path( case_root, "scripts" )
+  dir.create(
+    conversion_dir, recursive = TRUE, showWarnings = FALSE )
+  dir.create(
+    scripts_dir, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( scripts_dir, "04_conversion_case.Rmd" )
+  r_script <- file.path( scripts_dir, "04_conversion_case.R" )
+  replacements <- list( list( old = 'input_dir = file.path("outputs", "quote_market"),', new = path_config_line(
+          "input_dir", quote_market_dir ), label = "Module 4 input_dir" ), list( old =
+        'output_dir = file.path("outputs", "conversion_generation"),', new = path_config_line( "output_dir",
+          conversion_dir ), label = "Module 4 output_dir" ), list( old =
+        'demand_scenarios_to_run = c("baseline"),', new = paste0( 'demand_scenarios_to_run = c("',
+          case_row$demand_scenario_id[ 1 ], '"),' ), label = "Module 4 demand_scenarios_to_run" ) )
+  write_patched_case_script( template_path = config$module4_template, patched_rmd_path = patched_rmd,
+    r_script_path = r_script, replacements = replacements )
+}
+patch_module5 <- function( case_row, case_root, conversion_dir
+) {
+  model_dir <- file.path( case_root, "conversion_models" )
+  scripts_dir <- file.path( case_root, "scripts" )
+  dir.create(
+    model_dir, recursive = TRUE, showWarnings = FALSE )
+  dir.create(
+    scripts_dir, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( scripts_dir, "05_conversion_models_case.Rmd" )
+  r_script <- file.path( scripts_dir, "05_conversion_models_case.R" )
+  replacements <- list( list( old = 'input_dir = file.path("outputs", "conversion_generation"),', new =
+        path_config_line( "input_dir", conversion_dir ), label = "Module 5 input_dir" ), list( old =
+        'output_dir = file.path("outputs", "conversion_models"),', new = path_config_line( "output_dir", model_dir
+        ), label = "Module 5 output_dir" ), list( old = 'market_scenario_id = "baseline",', new = paste0(
+          'market_scenario_id = "', case_row$market_scenario_id[ 1 ], '",' ), label = "Module 5 market_scenario_id"
+    ), list( old = 'demand_scenario_id = "baseline",', new = paste0( 'demand_scenario_id = "',
+          case_row$demand_scenario_id[ 1 ], '",' ), label = "Module 5 demand_scenario_id" ) )
+  generated_script <- write_patched_case_script( template_path = config$module5_template, patched_rmd_path =
+        patched_rmd, r_script_path = r_script, replacements = replacements )
+  # In Module 7, final TEST O/E and calibration slope are robustness outcomes,
+  # not mechanical reasons to abort a sensitivity case before Module 6.
+  parse( file = generated_script, keep.source = FALSE )
+  generated_script
+}
+patch_module6 <- function( case_row, case_root, quote_market_dir, conversion_dir, model_dir
+) {
+  pricing_dir <- file.path( case_root, "pricing_simulation" )
+  scripts_dir <- file.path( case_root, "scripts" )
+  dir.create(
+    pricing_dir, recursive = TRUE, showWarnings = FALSE )
+  dir.create(
+    scripts_dir, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( scripts_dir, "06_pricing_case.Rmd" )
+  r_script <- file.path( scripts_dir, "06_pricing_case.R" )
+  replacements <- list( list( old = 'conversion_model_dir = file.path("outputs", "conversion_models"),', new =
+        path_config_line( "conversion_model_dir", model_dir ), label = "Module 6 conversion_model_dir" ), list(
+      old = 'quote_market_dir = file.path("outputs", "quote_market"),', new = path_config_line( "quote_market_dir",
+          quote_market_dir ), label = "Module 6 quote_market_dir" ), list( old =
+        'conversion_generation_dir = file.path("outputs", "conversion_generation"),', new = path_config_line(
+          "conversion_generation_dir", conversion_dir ), label = "Module 6 conversion_generation_dir" ), list(
+      old = 'output_dir = file.path("outputs", "pricing_simulation"),', new = path_config_line( "output_dir",
+          pricing_dir ), label = "Module 6 output_dir" ), list( old = 'market_scenario_id = "baseline",', new =
+        paste0( 'market_scenario_id = "', case_row$market_scenario_id[ 1 ], '",' ), label =
+        "Module 6 market_scenario_id" ), list( old = 'demand_scenario_id = "baseline",', new = paste0(
+          'demand_scenario_id = "', case_row$demand_scenario_id[ 1 ], '",' ), label = "Module 6 demand_scenario_id"
+    ), list( old = 'multiplier_lower = 0.95,', new = paste0( "multiplier_lower = ", format(
+            case_row$multiplier_lower[ 1 ], trim = TRUE ), "," ), label = "Module 6 multiplier_lower" ), list(
+      old = 'multiplier_upper = 1.05,', new = paste0( "multiplier_upper = ", format( case_row$multiplier_upper[ 1
+            ], trim = TRUE ), "," ), label = "Module 6 multiplier_upper" ), list( old = 'multiplier_step = 0.01,',
+      new = paste0( "multiplier_step = ", format( case_row$multiplier_step[ 1 ], trim = TRUE ), "," ), label =
+        "Module 6 multiplier_step" ), list( old = 'maximum_admissible_claim_ratio = 0.800,', new = paste0(
+          "maximum_admissible_claim_ratio = ", format( case_row$maximum_admissible_claim_ratio[ 1 ], nsmall = 3,
+            trim = TRUE ), "," ), label = "Module 6 maximum_admissible_claim_ratio" ), list( old =
+        'minimum_portfolio_margin_retention = 1.00,', new = paste0( "minimum_portfolio_margin_retention = ",
+          format( case_row$minimum_portfolio_margin_retention[ 1 ], nsmall = 2, trim = TRUE ), "," ), label =
+        "Module 6 minimum_portfolio_margin_retention" ), list( old = 'minimum_unit_margin_retention = 0.90,', new =
+        paste0( "minimum_unit_margin_retention = ", format( case_row$minimum_unit_margin_retention[ 1 ],
+            nsmall = 2, trim = TRUE ), "," ), label = "Module 6 minimum_unit_margin_retention" ), list( old =
+        'targeted_rate_level_lower = 0.995,', new = paste0( "targeted_rate_level_lower = ", format(
+            case_row$targeted_rate_level_lower[ 1 ], nsmall = 3, trim = TRUE ), "," ), label =
+        "Module 6 targeted_rate_level_lower" ), list( old = 'targeted_rate_level_upper = 1.005,', new = paste0(
+          "targeted_rate_level_upper = ", format( case_row$targeted_rate_level_upper[ 1 ], nsmall = 3, trim = TRUE
+          ), "," ), label = "Module 6 targeted_rate_level_upper" ) )
+  write_patched_case_script( template_path = config$module6_template, patched_rmd_path = patched_rmd,
+    r_script_path = r_script, replacements = replacements )
+}
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 6. RUN SENSITIVITY CASES
+case_status_rows <- list()
+baseline_root <- file.path( config$cases_dir, "baseline" )
+baseline_quote_dir <- file.path( baseline_root, "quote_market" )
+baseline_conversion_dir <- file.path( baseline_root, "conversion_generation" )
+baseline_model_dir <- file.path( baseline_root, "conversion_models" )
+for ( case_index in seq_len( nrow( scenario_register ) )
+) {
+  case_row <- scenario_register[ case_index, ]
+  case_id <- case_row$case_id[ 1 ]
+  scenario_group <- case_row$scenario_group[ 1 ]
+  case_root <- file.path( config$cases_dir, case_id )
+  message( "" )
+  message( "============================================================" )
+  message( "Sensitivity case ", case_row$case_order[ 1 ], ": ", case_id )
+  message( case_row$scenario_description[ 1 ] )
+  message( "============================================================" )
+  # Demand and pricing cases depend on baseline outputs.
+  if ( case_id != "baseline" && scenario_group %in% c( "Demand", "Pricing rule" )
+  ) {
+    baseline_status <- case_status_rows[[ "baseline" ]]
+    if ( is.null( baseline_status ) || !isTRUE( baseline_status$case_success[ 1 ] )
+    ) {
+      message( "  Skipped because the baseline dependency did not complete successfully." )
+      case_status_rows[[ case_id ]] <- tibble( case_id = case_id, case_success = FALSE, module_failed =
+            "Baseline dependency", error_message = "Skipped because baseline case outputs were unavailable.",
+          reused_existing_outputs = FALSE )
+      next
+    }
+  }
+  dir.create(
+    case_root, recursive = TRUE, showWarnings = FALSE )
+  if ( !config$overwrite_existing_cases && case_complete( case_root )
+  ) {
+    message( "  Existing completed case found; reusing outputs." )
+    case_status_rows[[ case_id ]] <- tibble( case_id = case_id, case_success = TRUE, module_failed = NA_character_,
+        error_message = NA_character_, reused_existing_outputs = TRUE )
+    next
+  }
+  case_success <- TRUE
+  module_failed <- NA_character_
+  error_message <- NA_character_
+  # 6.1 Resolve / run Module 3
+  if ( case_id == "baseline" || scenario_group == "Market structure"
+  ) {
+    quote_market_dir <- file.path( case_root, "quote_market" )
+    module3_script <- tryCatch( patch_module3( case_row = case_row, case_root = case_root ),
+        error = function(e) {
+          e
+        } )
+    if ( inherits( module3_script, "error" )
+    ) {
+      case_success <- FALSE
+      module_failed <- "Module 3 patch/parse"
+      error_message <- conditionMessage( module3_script )
+    } else {
+      result3 <- run_script_isolated( script_path = module3_script, module_label = "Module 3" )
+      if ( !result3$success
+      ) {
+        case_success <- FALSE
+        module_failed <- "Module 3"
+        error_message <- result3$error_message
+      }
+    }
+  } else {
+    quote_market_dir <- baseline_quote_dir
+  }
+  # 6.2 Resolve / run Module 4
+  if ( case_success
+  ) {
+    if ( case_id == "baseline" || scenario_group %in% c( "Market structure", "Demand" )
+    ) {
+      conversion_dir <- file.path( case_root, "conversion_generation" )
+      module4_script <- tryCatch( patch_module4( case_row = case_row, case_root = case_root, quote_market_dir =
+              quote_market_dir ),
+          error = function(e) {
+            e
+          } )
+      if ( inherits( module4_script, "error" )
+      ) {
+        case_success <- FALSE
+        module_failed <- "Module 4 patch/parse"
+        error_message <- conditionMessage( module4_script )
+      } else {
+        result4 <- run_script_isolated( script_path = module4_script, module_label = "Module 4" )
+        if ( !result4$success
+        ) {
+          case_success <- FALSE
+          module_failed <- "Module 4"
+          error_message <- result4$error_message
+        }
+      }
+    } else {
+      conversion_dir <- baseline_conversion_dir
+    }
+  }
+  # 6.3 Resolve / run Module 5
+  if ( case_success
+  ) {
+    if ( case_id == "baseline" || scenario_group %in% c( "Market structure", "Demand" )
+    ) {
+      model_dir <- file.path( case_root, "conversion_models" )
+      module5_script <- tryCatch( patch_module5( case_row = case_row, case_root = case_root, conversion_dir =
+              conversion_dir ),
+          error = function(e) {
+            e
+          } )
+      if ( inherits( module5_script, "error" )
+      ) {
+        case_success <- FALSE
+        module_failed <- "Module 5 patch/parse"
+        error_message <- conditionMessage( module5_script )
+      } else {
+        result5 <- run_script_isolated( script_path = module5_script, module_label = "Module 5" )
+        if ( !result5$success
+        ) {
+          case_success <- FALSE
+          module_failed <- "Module 5"
+          error_message <- result5$error_message
+        }
+      }
+    } else {
+      model_dir <- baseline_model_dir
+    }
+  }
+  # 6.4 Run Module 6 for every case
+  if ( case_success
+  ) {
+    module6_script <- tryCatch( patch_module6( case_row = case_row, case_root = case_root, quote_market_dir =
+            quote_market_dir, conversion_dir = conversion_dir, model_dir = model_dir ),
+        error = function(e) {
+          e
+        } )
+    if ( inherits( module6_script, "error" )
+    ) {
+      case_success <- FALSE
+      module_failed <- "Module 6 patch/parse"
+      error_message <- conditionMessage( module6_script )
+    } else {
+      result6 <- run_script_isolated( script_path = module6_script, module_label = "Module 6" )
+      if ( !result6$success
+      ) {
+        case_success <- FALSE
+        module_failed <- "Module 6"
+        error_message <- result6$error_message
+      }
+    }
+  }
+  # 6.5 Save case status
+  case_status_rows[[ case_id ]] <- tibble( case_id = case_id, case_success = case_success, module_failed =
+        module_failed, error_message = error_message, reused_existing_outputs = FALSE )
+  if ( !case_success
+  ) {
+    warning( paste0( "Sensitivity case '", case_id, "' failed in ", module_failed,
+        ". The runner will continue to later independent cases." ) )
+  }
+}
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 7. WRITE CASE STATUS
+case_status <- bind_rows( case_status_rows ) %>% left_join( scenario_register %>% dplyr::select( case_order,
+        case_id, scenario_group, scenario_description ), by = "case_id" ) %>% arrange( case_order )
+case_status_output_path <- write_csv_resilient( case_status, file.path( config$output_dir,
+      "sensitivity_case_status.csv" ) )
+if ( !any( case_status$case_id == "baseline" & case_status$case_success )
+) {
+  stop( paste( "Baseline sensitivity case failed.",
+      "Review sensitivity_case_status.csv before interpreting sensitivity results." ) )
+}
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 8. COLLECT CASE RESULTS
+collect_case_results <- function( case_row, status_row
+) {
+  case_id <- case_row$case_id[ 1 ]
+  case_root <- file.path( config$cases_dir, case_id )
+  if ( !isTRUE( status_row$case_success[ 1 ] )
+  ) {
+    return( tibble( case_id = case_id, collection_success = FALSE ) )
+  }
+  pricing_dir <- file.path( case_root, "pricing_simulation" )
+  if ( case_row$scenario_group[ 1 ] == "Pricing rule"
+  ) {
+    # Pricing-rule cases reuse the entire frozen baseline Modules 3-5.
+    quote_dir <- baseline_quote_dir
+    conversion_dir <- baseline_conversion_dir
+    model_dir <- baseline_model_dir
+  } else if ( case_row$scenario_group[ 1 ] == "Demand"
+  ) {
+    # Demand cases reuse the baseline Module 3 quote market, but have their own
+    # Module 4 conversion generation and Module 5 fitted conversion models.
+    quote_dir <- baseline_quote_dir
+    conversion_dir <- file.path( case_root, "conversion_generation" )
+    model_dir <- file.path( case_root, "conversion_models" )
+  } else {
+    # Baseline and market-structure cases have case-specific Modules 3-5.
+    quote_dir <- file.path( case_root, "quote_market" )
+    conversion_dir <- file.path( case_root, "conversion_generation" )
+    model_dir <- file.path( case_root, "conversion_models" )
+  }
+  required_files <- c( file.path( pricing_dir, "test_strategy_comparison.csv" ), file.path( pricing_dir,
+      "selected_segment_multipliers.csv" ), file.path( pricing_dir, "targeted_strategy_selection_summary.csv" ),
+    file.path( pricing_dir, "pricing_validation_checks.csv" ), file.path( model_dir,
+      "final_selected_test_metrics.csv" ), file.path( model_dir, "incremental_model_value.csv" ), file.path(
+      model_dir, "truth_probability_recovery.csv" ), file.path( model_dir, "full_model_selection_table.csv" ),
+    file.path( pricing_dir, "selected_conversion_model_interface.csv" ), file.path( pricing_dir,
+      "prediction_interface_reconstruction.csv" ), file.path( pricing_dir, "neutral_targeted_feasibility.csv" ),
+    file.path( pricing_dir, "pricing_sample_architecture.csv" ) )
+  missing_files <- required_files[ !file.exists( required_files ) ]
+  if ( length( missing_files ) > 0L
+  ) {
+    warning( paste0( "Missing collected output(s) for sensitivity case ", case_id, ": ", paste( missing_files,
+          collapse = "; " ) ) )
+    return( tibble( case_id = case_id, collection_success = FALSE ) )
+  }
+  strategy_comparison <- readr::read_csv( file.path( pricing_dir, "test_strategy_comparison.csv" ),
+      show_col_types = FALSE )
+  segment_multipliers <- readr::read_csv( file.path( pricing_dir, "selected_segment_multipliers.csv" ),
+      show_col_types = FALSE )
+  targeted_selection <- readr::read_csv( file.path( pricing_dir, "targeted_strategy_selection_summary.csv" ),
+      show_col_types = FALSE )
+  final_model_metrics <- readr::read_csv( file.path( model_dir, "final_selected_test_metrics.csv" ),
+      show_col_types = FALSE )
+  incremental_value <- readr::read_csv( file.path( model_dir, "incremental_model_value.csv" ),
+      show_col_types = FALSE )
+  truth_recovery <- readr::read_csv( file.path( model_dir, "truth_probability_recovery.csv" ),
+      show_col_types = FALSE )
+  full_model_selection <- readr::read_csv( file.path( model_dir, "full_model_selection_table.csv" ),
+      show_col_types = FALSE )
+  selected_model_interface <- readr::read_csv( file.path( pricing_dir, "selected_conversion_model_interface.csv" ),
+      show_col_types = FALSE )
+  prediction_interface_reconstruction <- readr::read_csv( file.path( pricing_dir,
+        "prediction_interface_reconstruction.csv" ), show_col_types = FALSE )
+  neutral_targeted_feasibility <- readr::read_csv( file.path( pricing_dir, "neutral_targeted_feasibility.csv" ),
+      show_col_types = FALSE )
+  pricing_sample_architecture <- readr::read_csv( file.path( pricing_dir, "pricing_sample_architecture.csv" ),
+      show_col_types = FALSE )
+  if ( nrow( pricing_sample_architecture ) != 1L
+  ) {
+    stop( paste0( "pricing_sample_architecture.csv must contain exactly one row for case ", case_id, "." ) )
+  }
+  required_strategy_names <- c( "Technical-pricing benchmark", "Own-price uniform strategy",
+    "Market-position uniform strategy", "Market-position targeted strategy" )
+  missing_strategy_names <- setdiff( required_strategy_names, strategy_comparison$strategy )
+  if ( length( missing_strategy_names ) > 0L
+  ) {
+    stop( paste0( "Strategy comparison is missing required row(s) for case ", case_id, ": ", paste(
+          missing_strategy_names, collapse = ", " ) ) )
+  }
+  technical <- strategy_comparison %>% filter( strategy == "Technical-pricing benchmark" )
+  own_price <- strategy_comparison %>% filter( strategy == "Own-price uniform strategy" )
+  market_uniform <- strategy_comparison %>% filter( strategy == "Market-position uniform strategy" )
+  targeted <- strategy_comparison %>% filter( strategy == "Market-position targeted strategy" )
+  selected_model_name <- final_model_metrics$model[ 1 ]
+  selected_truth <- truth_recovery %>% filter( model == selected_model_name )
+  own_truth <- truth_recovery %>% filter( model == "Own-price GLM" )
+  selected_incremental <- incremental_value %>% filter( evaluation_split == "test", model == selected_model_name )
+  selected_model_type <- final_model_metrics$model_type[ 1 ]
+  if ( nrow( selected_model_interface ) != 1L || selected_model_interface$selected_model_name[ 1 ] !=
+        selected_model_name || selected_model_interface$selected_model_type[ 1 ] != selected_model_type ||
+      !selected_model_type %in% config$expected_conversion_model_families
+  ) {
+    stop( paste0( "Selected model/interface mismatch in sensitivity case ", case_id, "." ) )
+  }
+  gam_selection_row <- full_model_selection %>% filter( model == "Market-position GAM" )
+  glm_selection_row <- full_model_selection %>% filter( model == "Market-position GLM" )
+  if ( nrow( gam_selection_row ) != 1L || nrow( glm_selection_row ) != 1L || nrow( full_model_selection ) != 2L
+  ) {
+    stop( paste0( "Full-model selection table must contain exactly Market-position GLM ",
+        "and Market-position GAM for sensitivity case ", case_id, "." ) )
+  }
+  if ( !setequal( full_model_selection$model, c( "Market-position GLM", "Market-position GAM" ) )
+  ) {
+    stop( paste0( "Unexpected full-market candidate model in sensitivity case ", case_id, "." ) )
+  }
+  module5_contract_pass <- nrow( selected_model_interface ) == 1L && identical( as.character(
+        selected_model_interface$module5_version[ 1 ] ), config$expected_module5_version ) && identical(
+      as.character( selected_model_interface$model_family_scope[ 1 ] ), paste(
+        config$expected_conversion_model_families, collapse = ";" ) ) && as.integer(
+      selected_model_interface$candidate_model_count[ 1 ] ) == length( config$expected_conversion_candidates ) &&
+    selected_model_interface$selected_model_type[ 1 ] %in% config$expected_conversion_model_families
+  selected_model_interface_max_difference <- prediction_interface_reconstruction %>% filter( difference_scale ==
+        "probability", model == selected_model_name ) %>% pull( max_absolute_difference )
+  original_price_reconstruction_max_difference <- prediction_interface_reconstruction %>% filter( model ==
+        "Original focal quote" ) %>% pull( max_absolute_difference )
+  multiplier_summary <- segment_multipliers %>% summarise( targeted_multiplier_min = min( selected_multiplier ),
+      targeted_multiplier_max = max( selected_multiplier ), targeted_multiplier_mean = mean( selected_multiplier ),
+      targeted_multiplier_sd = sd( selected_multiplier ), targeted_multiplier_range = max( selected_multiplier ) -
+        min( selected_multiplier ), targeted_distinct_multipliers = n_distinct( selected_multiplier ) )
+  market_checks_path <- file.path( quote_dir, "quote_market_validation_checks.csv" )
+  conversion_checks_path <- file.path( conversion_dir, "conversion_generation_validation_checks.csv" )
+  model_checks_path <- file.path( model_dir, "model_validation_checks.csv" )
+  pricing_checks_path <- file.path( pricing_dir, "pricing_validation_checks.csv" )
+  market_checks_pass <- all_checks_pass( market_checks_path )
+  conversion_checks_pass <- all_checks_pass( conversion_checks_path )
+  model_checks_pass <- all_checks_pass( model_checks_path )
+  pricing_checks_pass <- all_checks_pass( pricing_checks_path )
+  all_pipeline_checks_pass <- all( market_checks_pass, conversion_checks_pass, model_checks_pass,
+      pricing_checks_pass )
+  architecture_contract_pass <- nrow( pricing_sample_architecture ) == 1L && as.integer(
+      pricing_sample_architecture$policy_year[ 1 ] ) == config$expected_policy_year && as.integer(
+      pricing_sample_architecture$total_profiles[ 1 ] ) == config$expected_profiles && identical( as.character(
+        pricing_sample_architecture$technical_data_split[ 1 ] ), "test" ) && as.integer(
+      pricing_sample_architecture$conversion_train_profiles[ 1 ] ) == config$expected_conversion_train_rows &&
+    as.integer( pricing_sample_architecture$conversion_validation_profiles[ 1 ] ) ==
+      config$expected_conversion_validation_rows && as.integer(
+      pricing_sample_architecture$conversion_test_profiles[ 1 ] ) == config$expected_conversion_test_rows &&
+    !isTRUE( as.logical( pricing_sample_architecture$test_outcome_used_for_strategy_selection[ 1 ] ) ) && !isTRUE(
+      as.logical( pricing_sample_architecture$latent_truth_used_for_strategy_selection[ 1 ] ) )
+  selected_segmentation_id <- targeted_selection$selected_segmentation_id[ 1 ]
+  selected_segmentation_name <- targeted_selection$selected_segmentation_name[ 1 ]
+  selected_segmentation_category <- targeted_selection$selected_segmentation_category[ 1 ]
+  selected_source_variable <- targeted_selection$selected_source_variable[ 1 ]
+  selected_number_segments <- targeted_selection$selected_number_segments[ 1 ]
+  tibble( case_id = case_id, collection_success = TRUE, scenario_group = case_row$scenario_group[ 1 ],
+    scenario_description = case_row$scenario_description[ 1 ], market_scenario_id = case_row$market_scenario_id[ 1
+      ], demand_scenario_id = case_row$demand_scenario_id[ 1 ], multiplier_lower = case_row$multiplier_lower[ 1 ],
+    multiplier_upper = case_row$multiplier_upper[ 1 ], multiplier_step = case_row$multiplier_step[ 1 ],
+    maximum_admissible_claim_ratio = case_row$maximum_admissible_claim_ratio[ 1 ], minimum_unit_margin_retention =
+      case_row$minimum_unit_margin_retention[ 1 ], architecture_contract_pass = architecture_contract_pass,
+    quote_market_policy_year = pricing_sample_architecture$policy_year[ 1 ], quote_market_profiles =
+      pricing_sample_architecture$total_profiles[ 1 ], conversion_train_profiles =
+      pricing_sample_architecture$conversion_train_profiles[ 1 ], conversion_validation_profiles =
+      pricing_sample_architecture$conversion_validation_profiles[ 1 ], conversion_test_profiles =
+      pricing_sample_architecture$conversion_test_profiles[ 1 ], selected_targeting_segmentation_id =
+      selected_segmentation_id, selected_targeting_segmentation_name = selected_segmentation_name,
+    selected_targeting_segmentation_category = selected_segmentation_category, selected_targeting_source_variable =
+      selected_source_variable, selected_targeting_number_segments = selected_number_segments,
+    selected_conversion_model = selected_model_name, selected_conversion_model_type = selected_model_type,
+    module5_contract_pass = module5_contract_pass, selected_model_is_flexible = identical( selected_model_type,
+        "gam" ), gam_selected = identical( selected_model_name, "Market-position GAM" ), glm_selected = identical(
+        selected_model_name, "Market-position GLM" ), gam_validation_relative_logloss_improvement_vs_glm =
+      gam_selection_row$relative_logloss_improvement_vs_glm[ 1 ], gam_validation_calibration_slope =
+      gam_selection_row$calibration_slope[ 1 ], gam_validation_calibration_acceptable = as.logical(
+        gam_selection_row$calibration_acceptable[ 1 ] ), gam_complexity_threshold_met = as.logical(
+        gam_selection_row$complexity_threshold_met[ 1 ] ), gam_eligible_for_selection = as.logical(
+        gam_selection_row$eligible_for_selection[ 1 ] ), selected_model_interface_max_probability_difference =
+      first_or_na( selected_model_interface_max_difference ), neutral_targeted_strategy_feasible = all( as.logical(
+          neutral_targeted_feasibility$pass ) ), original_quote_reconstruction_max_absolute_difference =
+      first_or_na( original_price_reconstruction_max_difference ), selected_model_test_log_loss =
+      final_model_metrics$log_loss[ 1 ], selected_model_test_auc = final_model_metrics$auc[ 1 ],
+    selected_log_loss_improvement_vs_own_price = first_or_na(
+        selected_incremental$log_loss_improvement_vs_own_price ),
+    selected_relative_log_loss_improvement_vs_own_price = first_or_na(
+        selected_incremental$relative_log_loss_improvement_vs_own_price ), selected_auc_improvement_vs_own_price =
+      first_or_na( selected_incremental$auc_improvement_vs_own_price ), selected_truth_probability_spearman =
+      first_or_na( selected_truth$probability_spearman_correlation ), own_price_truth_probability_spearman =
+      first_or_na( own_truth$probability_spearman_correlation ), truth_recovery_spearman_gain = first_or_na(
+        selected_truth$probability_spearman_correlation ) - first_or_na( own_truth$probability_spearman_correlation
+      ), own_price_uniform_multiplier = own_price$mean_multiplier[ 1 ], market_uniform_multiplier =
+      market_uniform$mean_multiplier[ 1 ], targeted_test_mean_multiplier = targeted$mean_multiplier[ 1 ],
+    targeted_test_rate_level = targeted$aggregate_rate_level[ 1 ], targeted_test_mean_rank =
+      targeted$mean_selected_rank[ 1 ], targeted_test_top_three_share = targeted$top_three_share[ 1 ],
+    technical_true_conversion_rate = technical$true_expected_conversion_rate[ 1 ],
+    own_price_uniform_true_conversion_rate = own_price$true_expected_conversion_rate[ 1 ],
+    own_price_uniform_true_margin_retention = own_price$true_margin_retention[ 1 ],
+    market_uniform_true_conversion_rate = market_uniform$true_expected_conversion_rate[ 1 ],
+    market_uniform_true_margin_retention = market_uniform$true_margin_retention[ 1 ],
+    targeted_true_conversion_rate = targeted$true_expected_conversion_rate[ 1 ],
+    targeted_true_conversion_uplift_pp = targeted$true_conversion_uplift[ 1 ],
+    targeted_true_relative_conversion_uplift = targeted$true_relative_conversion_uplift[ 1 ],
+    technical_true_expected_margin = technical$true_expected_underwriting_margin[ 1 ],
+    targeted_true_expected_margin = targeted$true_expected_underwriting_margin[ 1 ],
+    targeted_true_margin_retention = targeted$true_margin_retention[ 1 ], targeted_true_claim_ratio =
+      targeted$true_expected_claim_ratio[ 1 ], targeted_model_expected_conversion_rate =
+      targeted$market_model_expected_conversion_rate[ 1 ], targeted_model_relative_conversion_uplift =
+      targeted$market_model_relative_conversion_uplift[ 1 ], targeted_model_margin_retention =
+      targeted$market_model_margin_retention[ 1 ], targeted_development_rate_level =
+      targeted_selection$selected_rate_level[ 1 ], targeted_development_margin_retention =
+      targeted_selection$selected_portfolio_margin_retention[ 1 ],
+    targeted_development_minimum_segment_margin_retention =
+      targeted_selection$selected_minimum_segment_margin_retention[ 1 ], targeted_development_claim_ratio =
+      targeted_selection$selected_model_expected_claim_ratio[ 1 ], targeted_development_conversion_retention =
+      targeted_selection$selected_model_conversion_retention[ 1 ], targeted_multiplier_min =
+      multiplier_summary$targeted_multiplier_min[ 1 ], targeted_multiplier_max =
+      multiplier_summary$targeted_multiplier_max[ 1 ], targeted_multiplier_mean =
+      multiplier_summary$targeted_multiplier_mean[ 1 ], targeted_multiplier_sd =
+      multiplier_summary$targeted_multiplier_sd[ 1 ], targeted_multiplier_range =
+      multiplier_summary$targeted_multiplier_range[ 1 ], targeted_distinct_multipliers =
+      multiplier_summary$targeted_distinct_multipliers[ 1 ], market_checks_pass = market_checks_pass,
+    conversion_checks_pass = conversion_checks_pass, model_checks_pass = model_checks_pass, pricing_checks_pass =
+      pricing_checks_pass, all_pipeline_checks_pass = all_pipeline_checks_pass )
+}
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 9. COLLECT ALL CASES
+collected_rows <- list()
+for ( case_index in seq_len( nrow( scenario_register ) )
+) {
+  case_row <- scenario_register[ case_index, ]
+  case_id <- case_row$case_id[ 1 ]
+  status_row <- case_status %>% filter( case_id == .env$case_id )
+  collected_rows[[ case_id ]] <- collect_case_results( case_row = case_row, status_row = status_row )
+}
+sensitivity_summary <- bind_rows( collected_rows ) %>% left_join( scenario_register %>% dplyr::select( case_order,
+        case_id, scenario_note ), by = "case_id" ) %>% arrange( case_order )
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 10. CENTRAL STABILITY ASSESSMENT
+successful_summary <- sensitivity_summary %>% filter( collection_success )
+if ( nrow( successful_summary ) == 0L
+) {
+  stop( "No sensitivity results were successfully collected." )
+}
+baseline_summary <- successful_summary %>% filter( case_id == "baseline" )
+if ( nrow( baseline_summary ) != 1L
+) {
+  stop( "Exactly one successfully collected baseline sensitivity result is required." )
+}
+baseline_truth_relative_conversion_uplift <- baseline_summary$targeted_true_relative_conversion_uplift[ 1 ]
+baseline_truth_margin_retention <- baseline_summary$targeted_true_margin_retention[ 1 ]
+baseline_targeted_mean_multiplier <- baseline_summary$targeted_multiplier_mean[ 1 ]
+baseline_selected_model <- baseline_summary$selected_conversion_model[ 1 ]
+baseline_targeting_segmentation <- baseline_summary$selected_targeting_segmentation_id[ 1 ]
+sensitivity_summary <- sensitivity_summary %>% mutate( development_rate_neutral_pass = collection_success & abs(
+        targeted_development_rate_level - 1 ) <= config$development_rate_neutral_tolerance + 1e-12,
+    truth_conversion_improvement_pass = collection_success & targeted_true_conversion_uplift_pp >
+        config$minimum_truth_conversion_uplift, truth_margin_preservation_pass = collection_success &
+      targeted_true_margin_retention + 1e-12 >= config$minimum_truth_margin_retention,
+    market_information_recovery_gain_pass = collection_success & truth_recovery_spearman_gain > 0,
+    market_information_logloss_gain_pass = collection_success & selected_log_loss_improvement_vs_own_price > 0,
+    selected_model_interface_pass = collection_success & selected_model_interface_max_probability_difference <=
+        1e-8, neutral_targeted_feasibility_pass = collection_success & neutral_targeted_strategy_feasible,
+    gam_material_improvement = collection_success & gam_complexity_threshold_met &
+      gam_validation_calibration_acceptable, predictive_conclusion_stable = collection_success &
+      all_pipeline_checks_pass & architecture_contract_pass & module5_contract_pass &
+      selected_model_interface_pass & market_information_recovery_gain_pass & market_information_logloss_gain_pass,
+    pricing_conclusion_stable = collection_success & all_pipeline_checks_pass & architecture_contract_pass &
+      module5_contract_pass & selected_model_interface_pass & neutral_targeted_feasibility_pass &
+      development_rate_neutral_pass & truth_conversion_improvement_pass & truth_margin_preservation_pass,
+    central_conclusion_stable = predictive_conclusion_stable & pricing_conclusion_stable,
+    selected_model_same_as_baseline = collection_success & selected_conversion_model == baseline_selected_model,
+    targeting_basis_same_as_baseline = collection_success & selected_targeting_segmentation_id ==
+        baseline_targeting_segmentation, targeted_true_uplift_change_vs_baseline =
+      targeted_true_relative_conversion_uplift - baseline_truth_relative_conversion_uplift,
+    targeted_true_margin_change_vs_baseline = targeted_true_margin_retention - baseline_truth_margin_retention,
+    targeted_mean_multiplier_change_vs_baseline = targeted_multiplier_mean - baseline_targeted_mean_multiplier )
+write_csv_resilient( sensitivity_summary, file.path( config$output_dir, "sensitivity_summary.csv" ) )
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 11. STABILITY SUMMARY BY ASSUMPTION GROUP
+sensitivity_stability_summary <- sensitivity_summary %>% filter( collection_success ) %>% group_by( scenario_group
+  ) %>% summarise( scenarios_completed = n(), scenarios_with_all_pipeline_checks = sum( all_pipeline_checks_pass ),
+    scenarios_with_architecture_contract = sum( architecture_contract_pass ),
+    scenarios_predictive_conclusion_stable = sum( predictive_conclusion_stable ), predictive_stability_rate = mean(
+        predictive_conclusion_stable ), scenarios_pricing_conclusion_stable = sum( pricing_conclusion_stable ),
+    pricing_stability_rate = mean( pricing_conclusion_stable ), scenarios_central_conclusion_stable = sum(
+        central_conclusion_stable ), central_stability_rate = mean( central_conclusion_stable ),
+    scenarios_with_market_information_truth_gain = sum( market_information_recovery_gain_pass ),
+    scenarios_with_market_information_logloss_gain = sum( market_information_logloss_gain_pass ),
+    scenarios_selecting_market_glm = sum( glm_selected ), scenarios_selecting_market_gam = sum( gam_selected ),
+    scenarios_selecting_same_model_as_baseline = sum( selected_model_same_as_baseline ),
+    scenarios_selecting_same_targeting_basis_as_baseline = sum( targeting_basis_same_as_baseline ),
+    scenarios_where_gam_met_complexity_and_calibration_rule = sum( gam_material_improvement ),
+    minimum_gam_relative_logloss_improvement_vs_glm = min( gam_validation_relative_logloss_improvement_vs_glm,
+        na.rm = TRUE ), maximum_gam_relative_logloss_improvement_vs_glm = max(
+        gam_validation_relative_logloss_improvement_vs_glm, na.rm = TRUE ),
+    minimum_true_relative_conversion_uplift = min( targeted_true_relative_conversion_uplift, na.rm = TRUE ),
+    maximum_true_relative_conversion_uplift = max( targeted_true_relative_conversion_uplift, na.rm = TRUE ),
+    minimum_true_margin_retention = min( targeted_true_margin_retention, na.rm = TRUE ),
+    maximum_true_margin_retention = max( targeted_true_margin_retention, na.rm = TRUE ),
+    minimum_truth_recovery_spearman_gain = min( truth_recovery_spearman_gain, na.rm = TRUE ),
+    minimum_selected_logloss_gain_vs_own_price = min( selected_log_loss_improvement_vs_own_price, na.rm = TRUE ),
+    .groups = "drop" )
+write_csv_resilient( sensitivity_stability_summary, file.path( config$output_dir,
+    "sensitivity_stability_summary.csv" ) )
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 12. CONVERSION-MODEL SELECTION ACROSS CASES
+conversion_model_selection_summary <- sensitivity_summary %>% filter( collection_success ) %>% count(
+    scenario_group, selected_conversion_model, selected_conversion_model_type, name = "scenarios" ) %>% mutate(
+    approved_model_family_scope = "GLM/GAM only" ) %>% arrange( scenario_group, desc( scenarios ),
+    selected_conversion_model )
+write_csv_resilient( conversion_model_selection_summary, file.path( config$output_dir,
+    "conversion_model_selection_summary.csv" ) )
+# 12A. TARGETING-BASIS SELECTION ACROSS CASES
+targeting_basis_selection_summary <- sensitivity_summary %>% filter( collection_success ) %>% count(
+    scenario_group, selected_targeting_segmentation_id, selected_targeting_segmentation_name,
+    selected_targeting_segmentation_category, selected_targeting_source_variable, name = "scenarios" ) %>% arrange(
+    scenario_group, desc( scenarios ), selected_targeting_segmentation_id )
+write_csv_resilient( targeting_basis_selection_summary, file.path( config$output_dir,
+    "targeting_basis_selection_summary.csv" ) )
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 13. DETAILED SELECTED MULTIPLIERS ACROSS CASES
+multiplier_case_rows <- list()
+for ( case_id in successful_summary$case_id
+) {
+  case_row <- scenario_register %>% filter( case_id == .env$case_id )
+  multiplier_path <- file.path( config$cases_dir, case_id, "pricing_simulation", "selected_segment_multipliers.csv"
+    )
+  if ( file.exists( multiplier_path )
+  ) {
+    case_multipliers <- readr::read_csv( multiplier_path, show_col_types = FALSE )
+    required_multiplier_fields <- c( "segmentation_id", "segmentation_name", "segmentation_category",
+      "source_variable", "pricing_segment", "selected_multiplier" )
+    missing_multiplier_fields <- setdiff( required_multiplier_fields, names( case_multipliers ) )
+    if ( length( missing_multiplier_fields ) > 0L
+    ) {
+      stop( paste0( "selected_segment_multipliers.csv is missing required field(s) for case ", case_id, ": ",
+          paste( missing_multiplier_fields, collapse = ", " ) ) )
+    }
+    multiplier_case_rows[[ case_id ]] <- case_multipliers %>% mutate( case_id = .env$case_id, scenario_group =
+          case_row$scenario_group[ 1 ], case_order = case_row$case_order[ 1 ], .before = 1 )
+  }
+}
+selected_multipliers_all_cases <- bind_rows( multiplier_case_rows )
+if ( nrow( selected_multipliers_all_cases ) > 0L
+) {
+  baseline_multipliers <- selected_multipliers_all_cases %>% filter( case_id == "baseline" ) %>% dplyr::select(
+      segmentation_id, pricing_segment, baseline_selected_multiplier = selected_multiplier )
+  selected_multipliers_all_cases <- selected_multipliers_all_cases %>% left_join( baseline_multipliers, by = c(
+          "segmentation_id", "pricing_segment" ) ) %>% mutate( comparable_to_baseline_segment = !is.na(
+          baseline_selected_multiplier ), multiplier_change_vs_baseline = if_else( comparable_to_baseline_segment,
+          selected_multiplier - baseline_selected_multiplier, NA_real_ ) ) %>% arrange( case_order,
+      segmentation_id, pricing_segment )
+  write_csv_resilient( selected_multipliers_all_cases, file.path( config$output_dir,
+      "selected_multipliers_all_cases.csv" ) )
+}
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 14. SENSITIVITY VALIDATION CHECK TABLE
+sensitivity_validation_checks <- sensitivity_summary %>% transmute( case_order, case_id, scenario_group,
+    collection_success, all_pipeline_checks_pass, architecture_contract_pass, module5_contract_pass,
+    selected_model_interface_pass, neutral_targeted_feasibility_pass, development_rate_neutral_pass,
+    market_information_recovery_gain_pass, market_information_logloss_gain_pass, predictive_conclusion_stable,
+    truth_conversion_improvement_pass, truth_margin_preservation_pass, pricing_conclusion_stable,
+    gam_material_improvement, gam_validation_relative_logloss_improvement_vs_glm, gam_validation_calibration_slope,
+    gam_validation_calibration_acceptable, gam_complexity_threshold_met, selected_conversion_model,
+    selected_conversion_model_type, selected_targeting_segmentation_id, selected_targeting_segmentation_name,
+    targeting_basis_same_as_baseline, selected_model_same_as_baseline, central_conclusion_stable )
+write_csv_resilient( sensitivity_validation_checks, file.path( config$output_dir,
+    "sensitivity_validation_checks.csv" ) )
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 15. FAILED-CASE LOG
+failed_case_log <- case_status %>% filter( !case_success ) %>% dplyr::select( case_order, case_id, scenario_group,
+    module_failed, error_message )
+write_csv_resilient( failed_case_log, file.path( config$output_dir, "sensitivity_failed_cases.csv" ) )
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 16. OVERALL ROBUSTNESS SUMMARY
+completed_case_count <- sum( sensitivity_summary$collection_success )
+predictive_stable_case_count <- sum( sensitivity_summary$predictive_conclusion_stable, na.rm = TRUE )
+pricing_stable_case_count <- sum( sensitivity_summary$pricing_conclusion_stable, na.rm = TRUE )
+stable_case_count <- sum( sensitivity_summary$central_conclusion_stable, na.rm = TRUE )
+overall_robustness_summary <- tibble( registered_cases = nrow( scenario_register ), completed_cases =
+    completed_case_count, failed_or_uncollected_cases = nrow( scenario_register ) - completed_case_count,
+  architecture_contract_pass_cases = sum( sensitivity_summary$architecture_contract_pass, na.rm = TRUE ),
+  final_module5_contract_pass_cases = sum( sensitivity_summary$module5_contract_pass, na.rm = TRUE ),
+  predictive_conclusion_stable_cases = predictive_stable_case_count, predictive_conclusion_stability_rate =
+    safe_divide( predictive_stable_case_count, completed_case_count ), pricing_conclusion_stable_cases =
+    pricing_stable_case_count, pricing_conclusion_stability_rate = safe_divide( pricing_stable_case_count,
+      completed_case_count ), central_conclusion_stable_cases = stable_case_count,
+  central_conclusion_stability_rate = safe_divide( stable_case_count, completed_case_count ),
+  cases_with_market_information_truth_gain = sum( sensitivity_summary$market_information_recovery_gain_pass,
+      na.rm = TRUE ), cases_with_market_information_logloss_gain = sum(
+      sensitivity_summary$market_information_logloss_gain_pass, na.rm = TRUE ),
+  cases_selecting_baseline_model_family = sum( sensitivity_summary$selected_model_same_as_baseline, na.rm = TRUE ),
+  cases_selecting_baseline_targeting_basis = sum( sensitivity_summary$targeting_basis_same_as_baseline,
+      na.rm = TRUE ), cases_selecting_market_glm = sum( sensitivity_summary$glm_selected, na.rm = TRUE ),
+  cases_selecting_market_gam = sum( sensitivity_summary$gam_selected, na.rm = TRUE ),
+  cases_where_gam_met_complexity_and_calibration_rule = sum( sensitivity_summary$gam_material_improvement,
+      na.rm = TRUE ), minimum_gam_relative_logloss_improvement_vs_glm = min(
+      sensitivity_summary$gam_validation_relative_logloss_improvement_vs_glm[
+        sensitivity_summary$collection_success ], na.rm = TRUE ), maximum_gam_relative_logloss_improvement_vs_glm =
+    max( sensitivity_summary$gam_validation_relative_logloss_improvement_vs_glm[
+        sensitivity_summary$collection_success ], na.rm = TRUE ), minimum_true_relative_conversion_uplift = min(
+      sensitivity_summary$targeted_true_relative_conversion_uplift[ sensitivity_summary$collection_success ],
+      na.rm = TRUE ), maximum_true_relative_conversion_uplift = max(
+      sensitivity_summary$targeted_true_relative_conversion_uplift[ sensitivity_summary$collection_success ],
+      na.rm = TRUE ), minimum_true_margin_retention = min( sensitivity_summary$targeted_true_margin_retention[
+        sensitivity_summary$collection_success ], na.rm = TRUE ), maximum_true_margin_retention = max(
+      sensitivity_summary$targeted_true_margin_retention[ sensitivity_summary$collection_success ], na.rm = TRUE )
+)
+write_csv_resilient( overall_robustness_summary, file.path( config$output_dir, "overall_robustness_summary.csv" ) )
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 17. DIAGNOSTIC PLOTS
+if ( isTRUE( config$write_plots )
+) {
+  plot_summary <- sensitivity_summary %>% filter( collection_success ) %>% mutate( case_label = factor( case_id,
+          levels = rev( case_id[ order( case_order ) ] ) ) )
+  # 17.1 True conversion uplift
+  p_true_conversion_uplift <- ggplot( plot_summary, aes( x = case_label, y =
+          targeted_true_relative_conversion_uplift ) ) + geom_col() + geom_hline( yintercept = 0, linetype = 2 ) +
+    coord_flip() + labs( x = NULL, y = "True relative conversion uplift",
+      title = "Targeted-strategy conversion uplift across sensitivity cases" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "01_true_conversion_uplift_by_case.png" ), p_true_conversion_uplift,
+    width = 10, height = 6, dpi = 300 )
+  # 17.2 True margin retention
+  p_true_margin_retention <- ggplot( plot_summary, aes( x = case_label, y = targeted_true_margin_retention ) ) +
+    geom_col() + geom_hline( yintercept = 1, linetype = 2 ) + coord_flip() + labs( x = NULL,
+      y = "True underwriting-margin retention", title = "Targeted-strategy true margin retention" ) +
+    theme_minimal()
+  ggsave( file.path( config$output_dir, "02_true_margin_retention_by_case.png" ), p_true_margin_retention,
+    width = 10, height = 6, dpi = 300 )
+  # 17.3 Market-position recovery gain
+  p_market_information_gain <- ggplot( plot_summary, aes( x = case_label, y = truth_recovery_spearman_gain ) ) +
+    geom_col() + geom_hline( yintercept = 0, linetype = 2 ) + coord_flip() + labs( x = NULL,
+      y = "Spearman recovery gain over Own-price GLM",
+      title = "Incremental truth recovery from market-position information" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "03_market_information_truth_gain.png" ), p_market_information_gain,
+    width = 10, height = 6, dpi = 300 )
+  # 17.4 Selected conversion-model family
+  p_selected_model_family <- ggplot( plot_summary, aes( x = case_label, y = selected_conversion_model_type ) ) +
+    geom_point( size = 3 ) + coord_flip() + labs( x = NULL, y = "Selected model family",
+      title = "Selected conversion-model family across sensitivity cases" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "04_selected_conversion_model_family.png" ), p_selected_model_family,
+    width = 10, height = 6, dpi = 300 )
+  # 17.5 Targeted multiplier profiles
+  if ( nrow( selected_multipliers_all_cases ) > 0L
+  ) {
+    p_multiplier_profiles <- selected_multipliers_all_cases %>% mutate( pricing_segment = factor( pricing_segment,
+            levels = unique( pricing_segment ) ) ) %>% ggplot( aes( x = pricing_segment, y = selected_multiplier,
+          group = 1 ) ) + geom_line() + geom_point() + facet_wrap( vars( case_id, segmentation_name ), scales =
+          "free_x" ) + labs( x = "Selected pricing segment", y = "Selected multiplier",
+        title = "Validation-selected targeted pricing pattern across sensitivity cases" ) + theme_minimal() +
+      theme( axis.text.x = element_text( angle = 45, hjust = 1 ) )
+    ggsave( file.path( config$output_dir, "05_targeted_multiplier_profiles.png" ), p_multiplier_profiles,
+      width = 12, height = 9, dpi = 300 )
+  }
+  # 17.6 Selected targeting basis
+  p_targeting_basis <- ggplot( plot_summary, aes( x = case_label, y = selected_targeting_segmentation_name ) ) +
+    geom_point( size = 3 ) + coord_flip() + labs( x = NULL, y = "Validation-selected targeting basis",
+      title = "Selected targeting basis across sensitivity cases" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "06_selected_targeting_basis.png" ), p_targeting_basis, width = 10,
+    height = 6, dpi = 300 )
+}
+```
+
+
+```{r module-7-sensitivity, message=FALSE, warning=TRUE}
+# 18. PRINT KEY RESULTS
+cat( "\n", "============================================================\n", "MODULE 7 COMPLETE\n",
+  "============================================================\n", sep = "" )
+cat( "\nCase execution status:\n" )
+print( case_status, n = Inf )
+cat( "\nSensitivity summary:\n" )
+print( sensitivity_summary, n = Inf )
+cat( "\nStability by scenario group:\n" )
+print( sensitivity_stability_summary, n = Inf )
+cat( "\nOverall robustness summary:\n" )
+print( overall_robustness_summary, n = Inf )
+cat( "\nConversion-model selection summary:\n" )
+print( conversion_model_selection_summary, n = Inf )
+cat( "\nTargeting-basis selection summary:\n" )
+print( targeting_basis_selection_summary, n = Inf )
+cat( "\nPrimary output files:\n", case_status_output_path, "\n", file.path( config$output_dir,
+    "sensitivity_summary.csv" ), "\n", file.path( config$output_dir, "sensitivity_stability_summary.csv" ), "\n",
+  file.path( config$output_dir, "selected_multipliers_all_cases.csv" ), "\n", file.path( config$output_dir,
+    "conversion_model_selection_summary.csv" ), "\n", file.path( config$output_dir,
+    "targeting_basis_selection_summary.csv" ), "\n", file.path( config$output_dir,
+    "sensitivity_validation_checks.csv" ), "\n", sep = "" )
+```

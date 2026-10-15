@@ -1,0 +1,708 @@
+```{r module-2-setup, message=FALSE, warning=TRUE}
+# 1. SETUP ---------------------------------------------------------------------
+required_packages <- "tidyverse"
+missing_packages <- required_packages[!required_packages %in% rownames(installed.packages())]
+if (length(missing_packages) > 0L) {
+  stop("Install before running Module 2: ", paste(missing_packages, collapse = ", "))
+}
+suppressPackageStartupMessages(library(tidyverse))
+source(file.path("R", "helpers.R"))
+options(dplyr.summarise.inform = FALSE, scipen = 999)
+config <- list( input_file = file.path( "outputs", "synthetic_generator_multiyear", "synthetic_motor_modelling.csv"
+  ), claims_file = file.path( "outputs", "synthetic_generator_multiyear", "synthetic_motor_claims.rds" ),
+  truth_file = file.path( "outputs", "synthetic_generator_multiyear", "synthetic_motor_full_truth.rds" ),
+  output_dir = file.path("outputs", "technical_pricing"),
+  # Frozen out-of-time development structure inherited from Module 1.
+  training_years = 2021:2023, validation_year = 2024L, test_year = 2025L, cost_basis_year = 2025L,
+  expected_policies_per_year = 10000L,
+  # Transparent scenario assumption. A 30% loading corresponds to an indicative
+  # technical loss ratio of 1 / 1.30 = 76.9%. It is not calibrated to Module 1 truth.
+  technical_loading = 0.30,
+  # Numerical prediction floors only.
+  minimum_frequency = 1e-8, minimum_severity = 1,
+  # Broad 2025 out-of-time TEST reasonableness checks, not fitting/calibration targets.
+  test_frequency_oe_lower = 0.90, test_frequency_oe_upper = 1.10, test_severity_oe_lower = 0.85,
+  test_severity_oe_upper = 1.15, test_loss_cost_oe_lower = 0.80, test_loss_cost_oe_upper = 1.20 )
+dir.create(config$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r module-2-read-input, message=FALSE, warning=TRUE}
+# 2. READ AND VALIDATE MODULE 1 INPUT -----------------------------------------
+# Claims below the excess produce no insurer payment. The fitted models
+# therefore use paid-claim counts and severity conditional on payment:
+# Module 2 therefore reconstructs:
+#   (i) paid-claim frequency; and
+#   (ii) mean insurer payment per paid claim.
+# This is algebraically coherent for net loss cost and avoids treating valid
+# below-excess claims as data errors.
+assert_file(config$input_file, "clean Module 1 modelling file")
+assert_file(config$claims_file, "Module 1 claim-level file")
+modelling_data <- readr::read_csv(config$input_file, show_col_types = FALSE)
+claims_data <- safe_read_rds(config$claims_file, "Module 1 claim-level file")
+required_columns <- c( "policy_id", "quote_profile_id", "policy_year", "data_split", "state", "remoteness_area",
+  "driver_age", "licence_years", "vehicle_age", "vehicle_segment", "motive_power",
+  "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm", "unladen_weight_kg", "transmission",
+  "vehicle_value", "annual_km", "voluntary_excess", "exposure",
+  "prior_claims_5yr", "claim_free_years", "claim_count", "incurred_claim_cost", "average_paid_claim_cost" )
+assert_columns(modelling_data, required_columns, "synthetic_motor_modelling.csv")
+assert_columns( claims_data, c("policy_id", "policy_year", "claim_number", "incurred_claim_cost"),
+  "synthetic_motor_claims.rds" )
+if (nrow(modelling_data) == 0L) stop("Module 1 modelling file contains zero rows.")
+if (anyDuplicated(modelling_data$policy_id)) stop("policy_id is not unique.")
+if (anyDuplicated(modelling_data$quote_profile_id)) stop("quote_profile_id is not unique.")
+modelling_data <- modelling_data %>% mutate( policy_year = as.integer(policy_year),
+    data_split = tolower(trimws(as.character(data_split))) )
+claims_data <- claims_data %>% mutate( policy_year = as.integer(policy_year),
+    incurred_claim_cost = as.numeric(incurred_claim_cost) )
+if (any(!is.finite(claims_data$incurred_claim_cost)) ||
+    any(claims_data$incurred_claim_cost < 0)) {
+  stop("Claim-level incurred_claim_cost contains invalid values.")
+}
+expected_policy_years <- c(config$training_years, config$validation_year, config$test_year)
+if (!setequal(sort(unique(modelling_data$policy_year)), expected_policy_years)) {
+  stop( "Module 2 requires policy years 2021-2025 only. Observed years: ",
+    paste(sort(unique(modelling_data$policy_year)), collapse = ", ") )
+}
+expected_split_by_year <- case_when( modelling_data$policy_year %in% config$training_years ~ "train",
+  modelling_data$policy_year == config$validation_year ~ "validation",
+  modelling_data$policy_year == config$test_year ~ "test", TRUE ~ NA_character_ )
+if (anyNA(expected_split_by_year)) {
+  stop("Unable to assign the frozen out-of-time split to every policy year.")
+}
+if (!all(modelling_data$data_split == expected_split_by_year)) {
+  stop( paste( "Module 2 temporal split does not match the frozen design:",
+      "2021-2023 TRAIN, 2024 VALIDATION, 2025 TEST." ) )
+}
+expected_splits <- c("train", "validation", "test")
+missing_splits <- setdiff(expected_splits, unique(modelling_data$data_split))
+if (length(missing_splits) > 0L) {
+  stop("Missing required data split(s): ", paste(missing_splits, collapse = ", "))
+}
+vehicle_spec_numeric_fields <- c(
+  "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm", "unladen_weight_kg" )
+nonfinite_vehicle_spec <- vehicle_spec_numeric_fields[
+  map_lgl(vehicle_spec_numeric_fields, ~ any(!is.finite(modelling_data[[.x]]))) ]
+if (length(nonfinite_vehicle_spec) > 0L) {
+  stop( "Module 1 contains non-finite vehicle specification values: ",
+    paste(nonfinite_vehicle_spec, collapse = ", ") )
+}
+if (any(modelling_data$engine_capacity_l < 0) || any(modelling_data$cylinder_count < 0) ||
+    any(modelling_data$power_kw <= 0) || any(modelling_data$torque_nm <= 0) ||
+    any(modelling_data$unladen_weight_kg <= 0)) {
+  stop("Module 1 contains invalid vehicle specification values.")
+}
+if (anyNA(modelling_data$transmission) ||
+    any(trimws(as.character(modelling_data$transmission)) == "")) {
+  stop("Module 1 transmission contains missing/blank values.")
+}
+if (any(!is.finite(modelling_data$incurred_claim_cost)) ||
+    any(modelling_data$incurred_claim_cost < 0)) {
+  stop("Policy-level incurred_claim_cost contains invalid values.")
+}
+# Reconstruct reported and positive-paid claims from the claim-level file.
+claim_pricing_summary <- claims_data %>% group_by(policy_id) %>% summarise(
+    reconstructed_reported_claim_count = n(), pricing_claim_count = sum(incurred_claim_cost > 0),
+    reconstructed_incurred_claim_cost = sum(incurred_claim_cost), pricing_average_paid_claim_cost = if_else(
+      pricing_claim_count > 0, reconstructed_incurred_claim_cost / pricing_claim_count, NA_real_ ),
+    .groups = "drop" )
+modelling_data <- modelling_data %>% left_join(claim_pricing_summary, by = "policy_id") %>% mutate(
+    reconstructed_reported_claim_count = replace_na( reconstructed_reported_claim_count, 0L ),
+    pricing_claim_count = replace_na(pricing_claim_count, 0L), reconstructed_incurred_claim_cost = replace_na(
+      reconstructed_incurred_claim_cost, 0 ), pricing_average_paid_claim_cost = if_else( pricing_claim_count > 0,
+      pricing_average_paid_claim_cost, NA_real_ ) )
+reported_count_mismatch <- sum( modelling_data$claim_count != modelling_data$reconstructed_reported_claim_count )
+incurred_reconstruction_error <- max( abs( modelling_data$incurred_claim_cost -
+      modelling_data$reconstructed_incurred_claim_cost ) )
+if (reported_count_mismatch > 0L) {
+  stop( "Claim-level file does not reconcile to policy-level reported claim_count for ",
+    reported_count_mismatch, " policies." )
+}
+if (!is.finite(incurred_reconstruction_error) ||
+    incurred_reconstruction_error > 0.011) {
+  stop( "Claim-level incurred costs do not reconcile to policy-level incurred costs. ",
+    "Maximum absolute difference = ", incurred_reconstruction_error )
+}
+if (any(modelling_data$pricing_claim_count > modelling_data$claim_count)) {
+  stop("Positive-paid claim count cannot exceed reported claim count.")
+}
+if (any( modelling_data$pricing_claim_count > 0 & (!is.finite(modelling_data$pricing_average_paid_claim_cost) |
+       modelling_data$pricing_average_paid_claim_cost <= 0)
+)) {
+  stop("Positive-paid claims contain invalid pricing severity values.")
+}
+zero_paid_reported_claims <- sum(modelling_data$claim_count) - sum(modelling_data$pricing_claim_count)
+# Module 1 deliberately supplies incurred costs on a common 2025 AUD basis.
+claims_cost_basis_label <- paste0( config$cost_basis_year, " AUD (Module 1 on-levelled)" )
+frequency_definition_label <- "Positive insurer-paid claims after voluntary excess"
+severity_definition_label <- "Mean insurer-paid cost conditional on positive payment"
+```
+
+```{r module-2-leakage-controls, message=FALSE, warning=TRUE}
+# 3. LEAKAGE CONTROLS ----------------------------------------------------------
+forbidden_truth_columns <- names(modelling_data)[str_detect( names(modelling_data),
+  regex("^true_|frailty|^latent_|^premium_loading_factor$|^technical_premium$", ignore_case = TRUE) )]
+if (length(forbidden_truth_columns) > 0L) {
+  stop( "Module 2 input contains forbidden truth/latent columns: ", paste(forbidden_truth_columns, collapse = ", ")
+  )
+}
+# Defensive compatibility only; the clean Module 1 file already removes this.
+if ("driver_sex_audit" %in% names(modelling_data)) {
+  warning("driver_sex_audit was present and has been removed from Module 2 input.")
+  modelling_data <- modelling_data %>% select(-driver_sex_audit)
+}
+```
+
+```{r module-2-prepare-features, message=FALSE, warning=TRUE}
+# 4. PREPARE OBSERVABLE PRICING FEATURES --------------------------------------
+modelling_data <- modelling_data %>% mutate( data_split = factor(data_split, levels = expected_splits),
+    state = factor(state), remoteness_area = factor(remoteness_area), vehicle_segment = factor(vehicle_segment),
+    motive_power = factor(motive_power), transmission = factor(transmission),
+    excess_factor = factor(voluntary_excess), prior_claims_band = case_when( prior_claims_5yr <= 0 ~ "0",
+      prior_claims_5yr == 1 ~ "1", prior_claims_5yr == 2 ~ "2", prior_claims_5yr == 3 ~ "3", TRUE ~ "4+" ),
+    prior_claims_band = factor(prior_claims_band, levels = c("0", "1", "2", "3", "4+")),
+    log_annual_km = log(pmax(annual_km, 1)), log_vehicle_value = log(pmax(vehicle_value, 1)) )
+if (any(!is.finite(modelling_data$log_annual_km)) ||
+    any(!is.finite(modelling_data$log_vehicle_value))) {
+  stop("Non-finite transformed pricing features detected.")
+}
+if (any(modelling_data$exposure <= 0)) stop("Exposure must be strictly positive.")
+# Use calendar year directly for development partitions so accidental split-label
+# changes cannot move future observations into model development.
+training_data <- modelling_data %>% filter(policy_year %in% config$training_years)
+validation_data <- modelling_data %>% filter(policy_year == config$validation_year)
+test_data <- modelling_data %>% filter(policy_year == config$test_year)
+development_data <- modelling_data %>% filter(policy_year %in% c(config$training_years, config$validation_year))
+expected_training_rows <- length(config$training_years) * config$expected_policies_per_year
+expected_validation_rows <- config$expected_policies_per_year
+expected_test_rows <- config$expected_policies_per_year
+expected_development_rows <- expected_training_rows + expected_validation_rows
+if (nrow(training_data) != expected_training_rows) {
+  stop( "TRAIN must contain exactly ", expected_training_rows,
+    " policies from 2021-2023; observed ", nrow(training_data), "." )
+}
+if (nrow(validation_data) != expected_validation_rows) {
+  stop( "VALIDATION must contain exactly ", expected_validation_rows,
+    " policies from 2024; observed ", nrow(validation_data), "." )
+}
+if (nrow(test_data) != expected_test_rows) {
+  stop( "TEST must contain exactly ", expected_test_rows, " policies from 2025; observed ", nrow(test_data), "." )
+}
+if (nrow(development_data) != expected_development_rows) {
+  stop( "DEVELOPMENT must contain exactly ", expected_development_rows,
+    " policies from 2021-2024; observed ", nrow(development_data), "." )
+}
+development_test_overlap <- intersect(development_data$policy_id, test_data$policy_id)
+if (length(development_test_overlap) > 0L) {
+  stop("2025 TEST policies have leaked into the 2021-2024 development sample.")
+}
+if (!all(training_data$policy_year %in% config$training_years) ||
+    !all(validation_data$policy_year == config$validation_year) ||
+    !all(test_data$policy_year == config$test_year) ||
+    !all(development_data$policy_year <= config$validation_year)) {
+  stop("Calendar-year development partition failed an internal consistency check.")
+}
+```
+
+```{r module-2-factor-support, message=FALSE, warning=TRUE}
+# 5. FACTOR-LEVEL SUPPORT ------------------------------------------------------
+factor_variables <- c( "state", "remoteness_area", "vehicle_segment", "motive_power", "transmission",
+  "excess_factor", "prior_claims_band" )
+training_factor_level_check <- map_dfr(factor_variables, function(variable_name) {
+  full_values <- modelling_data[[variable_name]]
+  train_values <- training_data[[variable_name]]
+  full_levels <- levels(full_values)
+  tibble( variable = variable_name, level = full_levels,
+    full_count = map_int(full_levels, ~ sum(as.character(full_values) == .x)),
+    training_count = map_int(full_levels, ~ sum(as.character(train_values) == .x)) )
+})
+unsupported_training_levels <- training_factor_level_check %>% filter(full_count > 0, training_count == 0)
+if (nrow(unsupported_training_levels) > 0L) {
+  stop("At least one factor level is present in the portfolio but absent from TRAIN.")
+}
+```
+
+```{r module-2-frequency-models, message=FALSE, warning=TRUE}
+# 6. FREQUENCY MODEL DEVELOPMENT: 2021-2023 TRAIN -> 2024 VALIDATION ---------
+# The pricing frequency outcome is the number of claims with positive insurer-paid
+# incurred cost after the voluntary excess. This aligns the frequency component
+# with the strictly positive Gamma severity component.
+frequency_model_definitions <- list( "Frequency benchmark" =
+    pricing_claim_count ~ driver_age + licence_years + log_annual_km +
+      prior_claims_band + state + remoteness_area + offset(log(exposure)), "Frequency flexible" =
+    pricing_claim_count ~ splines::ns(driver_age, df = 4) + splines::ns(licence_years, df = 3) +
+      splines::ns(log_annual_km, df = 3) + prior_claims_band + state +
+      remoteness_area + vehicle_segment + offset(log(exposure)), "Frequency flexible + motive power" =
+    pricing_claim_count ~ splines::ns(driver_age, df = 4) + splines::ns(licence_years, df = 3) +
+      splines::ns(log_annual_km, df = 3) + prior_claims_band + state +
+      remoteness_area + vehicle_segment + motive_power + offset(log(exposure)),
+  "Frequency flexible + vehicle specifications" = pricing_claim_count ~ splines::ns(driver_age, df = 4) +
+      splines::ns(licence_years, df = 3) + splines::ns(log_annual_km, df = 3) + prior_claims_band + state +
+      remoteness_area + vehicle_segment + motive_power + transmission +
+      splines::ns(engine_capacity_l, df = 3) + cylinder_count +
+      splines::ns(power_kw, df = 3) + splines::ns(torque_nm, df = 3) +
+      splines::ns(unladen_weight_kg, df = 3) + offset(log(exposure)) )
+frequency_models <- imap(frequency_model_definitions, function(model_formula, model_name) {
+  fit <- glm( model_formula, data = training_data, family = quasipoisson(link = "log"),
+    control = glm.control(maxit = 100) )
+  if (!isTRUE(fit$converged)) stop(model_name, " did not converge.")
+  fit
+})
+frequency_model_comparison <- imap_dfr(frequency_models, function(model_object, model_name) {
+  pred <- pmax( predict(model_object, newdata = validation_data, type = "response"), config$minimum_frequency )
+  tibble( model = model_name, observed_claim_count = sum(validation_data$pricing_claim_count),
+    predicted_claim_count = sum(pred), observed_to_expected = safe_divide(
+      sum(validation_data$pricing_claim_count), sum(pred) ), mean_poisson_deviance = mean_poisson_deviance(
+      validation_data$pricing_claim_count, pred ), rmse = rmse(validation_data$pricing_claim_count, pred),
+    mae = mae(validation_data$pricing_claim_count, pred) )
+}) %>% arrange(mean_poisson_deviance)
+selected_frequency_model_name <- frequency_model_comparison$model[[1]]
+selected_frequency_formula <- frequency_model_definitions[[selected_frequency_model_name]]
+```
+
+```{r module-2-severity-models, message=FALSE, warning=TRUE}
+# 7. SEVERITY MODEL DEVELOPMENT: 2021-2023 TRAIN -> 2024 VALIDATION ----------
+# Severity uses a Gamma GLM with log link on policies with at least one positive
+# insurer payment. pricing_average_paid_claim_cost is reconstructed from the
+# claim-level Module 1 file using positive-paid claims only; weighting by
+# pricing_claim_count gives each positive-paid realised claim equal influence.
+claimant_filter <- function(data) {
+  data %>% filter( pricing_claim_count > 0, is.finite(pricing_average_paid_claim_cost),
+      pricing_average_paid_claim_cost > 0 )
+}
+training_claimants <- claimant_filter(training_data)
+validation_claimants <- claimant_filter(validation_data)
+development_claimants <- claimant_filter(development_data)
+if (nrow(training_claimants) == 0L || nrow(validation_claimants) == 0L) {
+  stop("Insufficient positive-paid claim observations for severity modelling.")
+}
+severity_model_definitions <- list( "Severity benchmark" =
+    pricing_average_paid_claim_cost ~ log_vehicle_value + excess_factor + vehicle_segment, "Severity flexible" =
+    pricing_average_paid_claim_cost ~ splines::ns(log_vehicle_value, df = 4) +
+      splines::ns(vehicle_age, df = 3) + excess_factor + vehicle_segment, "Severity flexible + motive power" =
+    pricing_average_paid_claim_cost ~ splines::ns(log_vehicle_value, df = 4) +
+      splines::ns(vehicle_age, df = 3) + excess_factor + vehicle_segment + motive_power,
+  "Severity flexible + vehicle specifications" =
+    pricing_average_paid_claim_cost ~ splines::ns(log_vehicle_value, df = 4) +
+      splines::ns(vehicle_age, df = 3) + excess_factor + vehicle_segment + motive_power + transmission +
+      splines::ns(engine_capacity_l, df = 3) + cylinder_count +
+      splines::ns(power_kw, df = 3) + splines::ns(torque_nm, df = 3) + splines::ns(unladen_weight_kg, df = 3) )
+severity_models <- imap(severity_model_definitions, function(model_formula, model_name) {
+  fit <- glm( model_formula, data = training_claimants, weights = pricing_claim_count,
+    family = Gamma(link = "log"), control = glm.control(maxit = 100) )
+  if (!isTRUE(fit$converged)) stop(model_name, " did not converge.")
+  fit
+})
+severity_model_comparison <- imap_dfr(severity_models, function(model_object, model_name) {
+  pred <- pmax( predict(model_object, newdata = validation_claimants, type = "response"), config$minimum_severity )
+  tibble( model = model_name, observed_total_claim_cost = sum(validation_claimants$incurred_claim_cost),
+    predicted_total_claim_cost = sum( pred * validation_claimants$pricing_claim_count ),
+    observed_to_expected = safe_divide( sum(validation_claimants$incurred_claim_cost),
+      sum(pred * validation_claimants$pricing_claim_count) ), mean_gamma_deviance = mean_gamma_deviance(
+      validation_claimants$pricing_average_paid_claim_cost, pred, validation_claimants$pricing_claim_count ),
+    weighted_rmse = rmse( validation_claimants$pricing_average_paid_claim_cost, pred,
+      validation_claimants$pricing_claim_count ), weighted_mae = mae(
+      validation_claimants$pricing_average_paid_claim_cost, pred, validation_claimants$pricing_claim_count ) )
+}) %>% arrange(mean_gamma_deviance)
+selected_severity_model_name <- severity_model_comparison$model[[1]]
+selected_severity_formula <- severity_model_definitions[[selected_severity_model_name]]
+# Retain incremental predictor-block results in the compact summary/metadata.
+frequency_base <- frequency_model_comparison %>% filter(model == "Frequency flexible")
+frequency_mp <- frequency_model_comparison %>% filter(model == "Frequency flexible + motive power")
+frequency_specs <- frequency_model_comparison %>% filter(model == "Frequency flexible + vehicle specifications")
+severity_base <- severity_model_comparison %>% filter(model == "Severity flexible")
+severity_mp <- severity_model_comparison %>% filter(model == "Severity flexible + motive power")
+severity_specs <- severity_model_comparison %>% filter(model == "Severity flexible + vehicle specifications")
+frequency_uses_motive_power <- selected_frequency_model_name %in% c( "Frequency flexible + motive power",
+  "Frequency flexible + vehicle specifications" )
+severity_uses_motive_power <- selected_severity_model_name %in% c( "Severity flexible + motive power",
+  "Severity flexible + vehicle specifications" )
+frequency_uses_vehicle_specs <- identical( selected_frequency_model_name,
+  "Frequency flexible + vehicle specifications" )
+severity_uses_vehicle_specs <- identical( selected_severity_model_name,
+  "Severity flexible + vehicle specifications" )
+motive_power_incremental_value <- bind_rows( tibble( component = "Frequency", base_model = "Frequency flexible",
+    enriched_model = "Frequency flexible + motive power", base_deviance = frequency_base$mean_poisson_deviance,
+    enriched_deviance = frequency_mp$mean_poisson_deviance, relative_deviance_improvement = safe_divide(
+      frequency_base$mean_poisson_deviance - frequency_mp$mean_poisson_deviance,
+      frequency_base$mean_poisson_deviance ) ), tibble( component = "Severity", base_model = "Severity flexible",
+    enriched_model = "Severity flexible + motive power", base_deviance = severity_base$mean_gamma_deviance,
+    enriched_deviance = severity_mp$mean_gamma_deviance, relative_deviance_improvement = safe_divide(
+      severity_base$mean_gamma_deviance - severity_mp$mean_gamma_deviance, severity_base$mean_gamma_deviance ) ) )
+vehicle_specification_incremental_value <- bind_rows( tibble( component = "Frequency",
+    base_model = "Frequency flexible + motive power",
+    enriched_model = "Frequency flexible + vehicle specifications",
+    base_deviance = frequency_mp$mean_poisson_deviance, enriched_deviance = frequency_specs$mean_poisson_deviance,
+    relative_deviance_improvement = safe_divide(
+      frequency_mp$mean_poisson_deviance - frequency_specs$mean_poisson_deviance,
+      frequency_mp$mean_poisson_deviance ) ), tibble( component = "Severity",
+    base_model = "Severity flexible + motive power", enriched_model = "Severity flexible + vehicle specifications",
+    base_deviance = severity_mp$mean_gamma_deviance, enriched_deviance = severity_specs$mean_gamma_deviance,
+    relative_deviance_improvement = safe_divide(
+      severity_mp$mean_gamma_deviance - severity_specs$mean_gamma_deviance, severity_mp$mean_gamma_deviance ) ) )
+```
+
+```{r module-2-refit-models, message=FALSE, warning=TRUE}
+# 8. REFIT SELECTED MODELS ON 2021-2024 DEVELOPMENT SAMPLE --------------------
+# Candidate specifications were selected using 2024 VALIDATION performance only.
+# After selection, the winning formulas are refitted on all information available
+# before the 2025 out-of-time TEST year.
+final_frequency_model <- glm( selected_frequency_formula, data = development_data,
+  family = quasipoisson(link = "log"), control = glm.control(maxit = 100) )
+if (!isTRUE(final_frequency_model$converged)) stop("Final frequency model did not converge.")
+final_severity_model <- glm( selected_severity_formula, data = development_claimants,
+  weights = pricing_claim_count, family = Gamma(link = "log"), control = glm.control(maxit = 100) )
+if (!isTRUE(final_severity_model$converged)) stop("Final severity model did not converge.")
+frequency_dispersion <- summary(final_frequency_model)$dispersion
+severity_dispersion <- summary(final_severity_model)$dispersion
+```
+
+```{r module-2-balancing, message=FALSE, warning=TRUE}
+# 9. 2021-2024 DEVELOPMENT-SAMPLE BALANCING -----------------------------------
+# Multiplicative calibration is estimated only on 2021-2024 DEVELOPMENT data.
+# The 2025 TEST cohort is untouched. Frequency is balanced to positive-paid claim
+# counts and severity to the corresponding positive-paid aggregate claim cost.
+development_frequency_raw <- predict( final_frequency_model, newdata = development_data, type = "response" )
+frequency_balance_factor <- safe_divide( sum(development_data$pricing_claim_count), sum(development_frequency_raw)
+)
+development_severity_raw <- predict( final_severity_model, newdata = development_claimants, type = "response" )
+severity_balance_factor <- safe_divide( sum(development_claimants$incurred_claim_cost), sum(
+    development_severity_raw * development_claimants$pricing_claim_count ) )
+if (!is.finite(frequency_balance_factor) || frequency_balance_factor <= 0) {
+  stop("Invalid frequency balance factor.")
+}
+if (!is.finite(severity_balance_factor) || severity_balance_factor <= 0) {
+  stop("Invalid severity balance factor.")
+}
+```
+
+```{r module-2-final-predictions, message=FALSE, warning=TRUE}
+# 10. FINAL PREDICTIONS AND TECHNICAL PREMIUM ---------------------------------
+estimated_claim_frequency <- pmax(
+  predict(final_frequency_model, newdata = modelling_data, type = "response") * frequency_balance_factor,
+  config$minimum_frequency )
+estimated_claim_severity <- pmax(
+  predict(final_severity_model, newdata = modelling_data, type = "response") * severity_balance_factor,
+  config$minimum_severity )
+estimated_expected_claim_cost <- estimated_claim_frequency * estimated_claim_severity
+technical_premium <- estimated_expected_claim_cost * (1 + config$technical_loading)
+if (any(!is.finite(estimated_claim_frequency)) || any(!is.finite(estimated_claim_severity)) ||
+    any(!is.finite(estimated_expected_claim_cost)) || any(!is.finite(technical_premium)) ||
+    any(technical_premium <= 0)) {
+  stop("Invalid technical-pricing predictions were generated.")
+}
+evaluation_data <- modelling_data %>% mutate( estimated_claim_frequency = estimated_claim_frequency,
+    estimated_claimant_probability = 1 - exp(-estimated_claim_frequency),
+    estimated_claim_severity = estimated_claim_severity,
+    estimated_expected_claim_cost = estimated_expected_claim_cost, technical_loading = config$technical_loading,
+    technical_premium = technical_premium )
+```
+
+```{r module-2-test-evaluation, message=FALSE, warning=TRUE}
+# 11. HELD-OUT 2025 OUT-OF-TIME TEST EVALUATION -------------------------------
+test_results <- evaluation_data %>% filter(policy_year == config$test_year)
+if (nrow(test_results) != expected_test_rows) {
+  stop("Final 2025 TEST extraction did not preserve the full out-of-time cohort.")
+}
+test_claimants <- claimant_filter(test_results)
+test_frequency_metrics <- tibble( component = "Positive-paid claim frequency", observations = nrow(test_results),
+  observed = sum(test_results$pricing_claim_count), predicted = sum(test_results$estimated_claim_frequency),
+  observed_to_expected = safe_divide( sum(test_results$pricing_claim_count),
+    sum(test_results$estimated_claim_frequency) ), deviance = mean_poisson_deviance(
+    test_results$pricing_claim_count, test_results$estimated_claim_frequency ), rmse = rmse(
+    test_results$pricing_claim_count, test_results$estimated_claim_frequency ), mae = mae(
+    test_results$pricing_claim_count, test_results$estimated_claim_frequency ) )
+test_severity_metrics <- tibble( component = "Positive-paid claim severity", observations = nrow(test_claimants),
+  observed = sum(test_claimants$incurred_claim_cost), predicted = sum( test_claimants$estimated_claim_severity *
+      test_claimants$pricing_claim_count ), observed_to_expected = safe_divide(
+    sum(test_claimants$incurred_claim_cost), sum( test_claimants$estimated_claim_severity *
+        test_claimants$pricing_claim_count ) ), deviance = mean_gamma_deviance(
+    test_claimants$pricing_average_paid_claim_cost, test_claimants$estimated_claim_severity,
+    test_claimants$pricing_claim_count ), rmse = rmse( test_claimants$pricing_average_paid_claim_cost,
+    test_claimants$estimated_claim_severity, test_claimants$pricing_claim_count ), mae = mae(
+    test_claimants$pricing_average_paid_claim_cost, test_claimants$estimated_claim_severity,
+    test_claimants$pricing_claim_count ) )
+test_loss_cost_metrics <- tibble( component = "Expected annual claims cost", observations = nrow(test_results),
+  observed = sum(test_results$incurred_claim_cost), predicted = sum(test_results$estimated_expected_claim_cost),
+  observed_to_expected = safe_divide( sum(test_results$incurred_claim_cost),
+    sum(test_results$estimated_expected_claim_cost) ), deviance = NA_real_, rmse = rmse(
+    test_results$incurred_claim_cost, test_results$estimated_expected_claim_cost ), mae = mae(
+    test_results$incurred_claim_cost, test_results$estimated_expected_claim_cost ) )
+technical_pricing_test_metrics <- bind_rows( test_frequency_metrics, test_severity_metrics, test_loss_cost_metrics
+)
+```
+
+```{r module-2-module3-profile, message=FALSE, warning=TRUE}
+# 12. LEAKAGE-SAFE 2025 MODULE 3 PRICING PROFILE ------------------------------
+# The 2021-2024 cohorts exist only to develop the technical pricing model.
+# The canonical downstream quote-market population is the untouched 2025 cohort.
+# All current-year claims outcomes are removed, including both 2025-basis and
+# nominal aliases retained by Module 1 for audit purposes.
+current_year_outcome_columns <- c( "claim_count", "pricing_claim_count", "incurred_claim_cost",
+  "reconstructed_incurred_claim_cost", "gross_claim_cost", "average_paid_claim_cost",
+  "pricing_average_paid_claim_cost", "largest_paid_claim", "total_loss_claim_count", "any_total_loss",
+  "reconstructed_reported_claim_count", "incurred_claim_cost_nominal", "gross_claim_cost_nominal",
+  "average_paid_claim_cost_nominal", "largest_paid_claim_nominal" )
+module3_pricing_profiles <- evaluation_data %>% filter(policy_year == config$test_year) %>% select(
+    -any_of(current_year_outcome_columns), -excess_factor, -prior_claims_band, -log_annual_km, -log_vehicle_value )
+downstream_outcome_leakage <- intersect( current_year_outcome_columns, names(module3_pricing_profiles) )
+downstream_truth_leakage <- names(module3_pricing_profiles)[str_detect( names(module3_pricing_profiles),
+  regex("^true_|frailty|^latent_", ignore_case = TRUE) )]
+if (nrow(module3_pricing_profiles) != expected_test_rows) {
+  stop( "Canonical Module 3 profile must contain exactly the 10,000-policy 2025 cohort." )
+}
+if (!all(module3_pricing_profiles$policy_year == config$test_year)) {
+  stop("Non-2025 policies remain in the canonical Module 3 pricing profile.")
+}
+if (!all(as.character(module3_pricing_profiles$data_split) == "test")) {
+  stop("Canonical Module 3 pricing profile is not exclusively the 2025 TEST cohort.")
+}
+if (length(downstream_outcome_leakage) > 0L) {
+  stop( "Current-year outcomes remain in Module 3 pricing profile: ",
+    paste(downstream_outcome_leakage, collapse = ", ") )
+}
+if (length(downstream_truth_leakage) > 0L) {
+  stop( "Truth/latent variables remain in Module 3 pricing profile: ",
+    paste(downstream_truth_leakage, collapse = ", ") )
+}
+```
+
+```{r module-2-summary, message=FALSE, warning=TRUE}
+# 13. COMPACT TECHNICAL-PRICING SUMMARY ---------------------------------------
+frequency_mp_improvement <- motive_power_incremental_value %>%
+  filter(component == "Frequency") %>% pull(relative_deviance_improvement)
+severity_mp_improvement <- motive_power_incremental_value %>%
+  filter(component == "Severity") %>% pull(relative_deviance_improvement)
+frequency_spec_improvement <- vehicle_specification_incremental_value %>%
+  filter(component == "Frequency") %>% pull(relative_deviance_improvement)
+severity_spec_improvement <- vehicle_specification_incremental_value %>%
+  filter(component == "Severity") %>% pull(relative_deviance_improvement)
+technical_pricing_summary <- tibble( metric = c( "Policies available to technical-pricing evaluation",
+    "Canonical downstream quote-market policies", "Claims-cost monetary basis", "Technical frequency definition",
+    "Technical severity definition", "Reported claims in Module 1",
+    "Positive-paid claims used in Module 2 frequency", "Zero-paid reported claims absorbed by excess",
+    "Candidate-model fitting years", "Model-selection validation year", "Final model refit years",
+    "Held-out out-of-time test year", "Training rows", "Validation rows", "Development rows", "Test rows",
+    "Selected frequency model", "Selected severity model", "Motive power retained in selected frequency model",
+    "Motive power retained in selected severity model", "Vehicle specifications selected in frequency model",
+    "Vehicle specifications selected in severity model",
+    "Frequency motive-power relative validation deviance improvement",
+    "Severity motive-power relative validation deviance improvement",
+    "Frequency vehicle-spec relative validation deviance improvement vs motive-power model",
+    "Severity vehicle-spec relative validation deviance improvement vs motive-power model", "Frequency dispersion",
+    "Severity dispersion", "Frequency balance factor", "Severity balance factor", "Technical loading",
+    "Mean estimated annual positive-paid claim frequency - all cohorts",
+    "Mean estimated positive-paid claim severity - all cohorts",
+    "Mean estimated expected claims cost - all cohorts", "Mean technical premium - all cohorts",
+    "Mean estimated expected claims cost - 2025 quote market", "Mean technical premium - 2025 quote market",
+    "Median technical premium - 2025 quote market", "P95 technical premium - 2025 quote market",
+    "Minimum technical premium - 2025 quote market", "Maximum technical premium - 2025 quote market",
+    "2025 out-of-time test positive-paid frequency O/E", "2025 out-of-time test positive-paid severity O/E",
+    "2025 out-of-time test loss-cost O/E" ), value = as.character(c( nrow(evaluation_data),
+    nrow(module3_pricing_profiles), claims_cost_basis_label, frequency_definition_label, severity_definition_label,
+    sum(modelling_data$claim_count), sum(modelling_data$pricing_claim_count), zero_paid_reported_claims,
+    paste0(min(config$training_years), "-", max(config$training_years)), config$validation_year,
+    paste0(min(config$training_years), "-", config$validation_year), config$test_year, nrow(training_data),
+    nrow(validation_data), nrow(development_data), nrow(test_data), selected_frequency_model_name,
+    selected_severity_model_name, frequency_uses_motive_power, severity_uses_motive_power,
+    frequency_uses_vehicle_specs, severity_uses_vehicle_specs, frequency_mp_improvement, severity_mp_improvement,
+    frequency_spec_improvement, severity_spec_improvement, frequency_dispersion, severity_dispersion,
+    frequency_balance_factor, severity_balance_factor, config$technical_loading,
+    mean(evaluation_data$estimated_claim_frequency), mean(evaluation_data$estimated_claim_severity),
+    mean(evaluation_data$estimated_expected_claim_cost), mean(evaluation_data$technical_premium),
+    mean(module3_pricing_profiles$estimated_expected_claim_cost), mean(module3_pricing_profiles$technical_premium),
+    median(module3_pricing_profiles$technical_premium),
+    quantile(module3_pricing_profiles$technical_premium, 0.95, names = FALSE),
+    min(module3_pricing_profiles$technical_premium), max(module3_pricing_profiles$technical_premium),
+    test_frequency_metrics$observed_to_expected, test_severity_metrics$observed_to_expected,
+    test_loss_cost_metrics$observed_to_expected )) )
+```
+
+
+```{r module-2-truth-recovery, message=FALSE, warning=TRUE}
+# 14. SYNTHETIC-TRUTH RECOVERY — EVALUATION ONLY ------------------------------
+# The truth file is deliberately opened only after model selection, 2021-2024
+# refitting/balancing, 2025 TEST prediction and the downstream Module 3 profile
+# are complete.
+truth_recovery <- tibble(metric = character(), value = numeric())
+truth_file_used <- FALSE
+if (file.exists(config$truth_file)) {
+  truth_data <- safe_read_rds(config$truth_file, "Module 1 truth file")
+  assert_columns( truth_data, c( "policy_id", "policy_year", "data_split",
+      "true_annual_loss_cost", "true_technical_premium" ), "synthetic_motor_full_truth.rds" )
+  truth_test <- truth_data %>% mutate(policy_year = as.integer(policy_year)) %>%
+    filter(policy_year == config$test_year) %>%
+    select(policy_id, true_annual_loss_cost, true_technical_premium) %>% inner_join(
+      test_results %>% select(policy_id, estimated_expected_claim_cost, technical_premium), by = "policy_id" )
+  if (nrow(truth_test) != nrow(test_results)) {
+    stop("Truth-recovery join did not preserve all held-out 2025 TEST policies.")
+  }
+  truth_recovery <- tibble( metric = c( "2025 test Spearman correlation: estimated vs true annual loss cost",
+      "2025 test mean estimated / true annual loss cost", "2025 test RMSE: estimated vs true annual loss cost",
+      "2025 test MAE: estimated vs true annual loss cost",
+      "2025 test Spearman correlation: technical premium vs true technical premium",
+      "2025 test mean technical premium / true technical premium" ), value = c(
+      cor(truth_test$estimated_expected_claim_cost, truth_test$true_annual_loss_cost, method = "spearman"),
+      safe_divide(mean(truth_test$estimated_expected_claim_cost), mean(truth_test$true_annual_loss_cost)),
+      rmse(truth_test$true_annual_loss_cost, truth_test$estimated_expected_claim_cost),
+      mae(truth_test$true_annual_loss_cost, truth_test$estimated_expected_claim_cost),
+      cor(truth_test$technical_premium, truth_test$true_technical_premium, method = "spearman"),
+      safe_divide(mean(truth_test$technical_premium), mean(truth_test$true_technical_premium)) ) )
+  truth_file_used <- TRUE
+}
+```
+
+
+```{r module-2-validation, message=FALSE, warning=TRUE}
+# 15. VALIDATION CHECKS --------------------------------------------------------
+technical_pricing_validation_checks <- tribble(
+  ~check_name, ~observed_value, ~lower_bound, ~upper_bound, ~required_for_progress,
+  "Input policy rows", nrow(modelling_data), 50000, 50000, TRUE,
+  "Unique policy IDs", n_distinct(modelling_data$policy_id), nrow(modelling_data), nrow(modelling_data), TRUE,
+  "Policy years 2021-2025 present",
+    as.numeric(setequal(sort(unique(modelling_data$policy_year)), 2021:2025)), 1, 1, TRUE,
+  "Exact out-of-time split mapping",
+    as.numeric(all(as.character(modelling_data$data_split) == expected_split_by_year)), 1, 1, TRUE,
+  "Required train-validation-test splits", length(unique(as.character(modelling_data$data_split))), 3, 3, TRUE,
+  "Training rows 2021-2023", nrow(training_data), expected_training_rows, expected_training_rows, TRUE,
+  "Validation rows 2024", nrow(validation_data), expected_validation_rows, expected_validation_rows, TRUE,
+  "Development rows 2021-2024", nrow(development_data), expected_development_rows, expected_development_rows, TRUE,
+  "Test rows 2025", nrow(test_data), expected_test_rows, expected_test_rows, TRUE,
+  "No 2025 policies in development", sum(development_data$policy_year == config$test_year), 0, 0, TRUE,
+  "No development-test policy overlap", length(development_test_overlap), 0, 0, TRUE,
+  "Technical-pricing claims cost basis year", config$cost_basis_year, 2025, 2025, TRUE,
+  "Reported claim counts reconcile to claim-level file", reported_count_mismatch, 0, 0, TRUE,
+  "Maximum policy incurred-cost reconstruction difference", incurred_reconstruction_error, 0, 0.011, TRUE,
+  "Positive-paid claims do not exceed reported claims",
+    as.numeric(all(modelling_data$pricing_claim_count <= modelling_data$claim_count)), 1, 1, TRUE,
+  "Positive-paid severity values valid", as.numeric(all( is.finite( modelling_data$pricing_average_paid_claim_cost[
+          modelling_data$pricing_claim_count > 0 ] ) & modelling_data$pricing_average_paid_claim_cost[
+        modelling_data$pricing_claim_count > 0 ] > 0 )), 1, 1, TRUE,
+  "Unsupported training factor levels", nrow(unsupported_training_levels), 0, 0, TRUE,
+  "Motive power present in Module 1 input", as.numeric("motive_power" %in% names(modelling_data)), 1, 1, TRUE,
+  "CarExpert vehicle-spec fields present in Module 1 input", as.numeric(all(c(
+      "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm", "unladen_weight_kg", "transmission"
+    ) %in% names(modelling_data))), 1, 1, TRUE,
+  "Finite positive power", mean(is.finite(modelling_data$power_kw) & modelling_data$power_kw > 0), 1, 1, TRUE,
+  "Finite positive torque", mean(is.finite(modelling_data$torque_nm) & modelling_data$torque_nm > 0), 1, 1, TRUE,
+  "Finite positive unladen weight",
+    mean(is.finite(modelling_data$unladen_weight_kg) & modelling_data$unladen_weight_kg > 0), 1, 1, TRUE,
+  "All motive-power levels supported in training",
+    nrow(unsupported_training_levels %>% filter(variable == "motive_power")), 0, 0, TRUE,
+  "All transmission levels supported in training",
+    nrow(unsupported_training_levels %>% filter(variable == "transmission")), 0, 0, TRUE,
+  "Final frequency model converged", as.numeric(isTRUE(final_frequency_model$converged)), 1, 1, TRUE,
+  "Final severity model converged", as.numeric(isTRUE(final_severity_model$converged)), 1, 1, TRUE,
+  "Finite positive technical premiums",
+    mean(is.finite(evaluation_data$technical_premium) & evaluation_data$technical_premium > 0), 1, 1, TRUE,
+  "Canonical Module 3 pricing-profile rows",
+    nrow(module3_pricing_profiles), expected_test_rows, expected_test_rows, TRUE,
+  "Canonical Module 3 profile contains 2025 only",
+    as.numeric(all(module3_pricing_profiles$policy_year == config$test_year)), 1, 1, TRUE,
+  "Canonical Module 3 profile contains TEST split only",
+    as.numeric(all(as.character(module3_pricing_profiles$data_split) == "test")), 1, 1, TRUE,
+  "Current-year outcomes absent from Module 3 profile", length(downstream_outcome_leakage), 0, 0, TRUE,
+  "Truth/latent variables absent from Module 3 profile", length(downstream_truth_leakage), 0, 0, TRUE,
+  "Motive power retained in Module 3 profile",
+    as.numeric("motive_power" %in% names(module3_pricing_profiles)), 1, 1, TRUE,
+  "CarExpert vehicle-spec fields retained in Module 3 profile", as.numeric(all(c(
+      "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm", "unladen_weight_kg", "transmission"
+    ) %in% names(module3_pricing_profiles))), 1, 1, TRUE, "2025 out-of-time test positive-paid frequency O/E",
+    test_frequency_metrics$observed_to_expected,
+    config$test_frequency_oe_lower, config$test_frequency_oe_upper, TRUE,
+  "2025 out-of-time test positive-paid severity O/E", test_severity_metrics$observed_to_expected,
+    config$test_severity_oe_lower, config$test_severity_oe_upper, TRUE, "2025 out-of-time test loss-cost O/E",
+    test_loss_cost_metrics$observed_to_expected,
+    config$test_loss_cost_oe_lower, config$test_loss_cost_oe_upper, TRUE ) %>%
+  mutate(pass = observed_value >= lower_bound & observed_value <= upper_bound)
+failed_required_checks <- technical_pricing_validation_checks %>% filter(required_for_progress, !pass)
+if (nrow(failed_required_checks) > 0L) {
+  warning("At least one required Module 2 validation check failed. Review the validation CSV before Module 3.")
+}
+```
+
+
+```{r module-2-write-outputs, message=FALSE, warning=TRUE}
+# 16. WRITE ONLY REQUIRED / DECISION-RELEVANT OUTPUTS -------------------------
+# Required by Modules 3, 7 and/or 8.
+readr::write_csv(module3_pricing_profiles, file.path(config$output_dir, "technical_pricing_profiles.csv"))
+readr::write_csv(technical_pricing_summary, file.path(config$output_dir, "technical_pricing_summary.csv"))
+readr::write_csv(technical_pricing_validation_checks, file.path(config$output_dir, "technical_pricing_validation_checks.csv"))
+readr::write_csv( vehicle_specification_incremental_value,
+  file.path(config$output_dir, "technical_pricing_vehicle_spec_incremental_value.csv") )
+if (truth_file_used) {
+  readr::write_csv(truth_recovery, file.path(config$output_dir, "technical_pricing_truth_recovery.csv"))
+}
+saveRDS(final_frequency_model, file.path(config$output_dir, "final_frequency_model.rds"))
+saveRDS(final_severity_model, file.path(config$output_dir, "final_severity_model.rds"))
+technical_pricing_metadata <- list( selected_frequency_model = selected_frequency_model_name,
+  selected_severity_model = selected_severity_model_name, frequency_definition = frequency_definition_label,
+  severity_definition = severity_definition_label, reported_claim_count = sum(modelling_data$claim_count),
+  positive_paid_claim_count = sum(modelling_data$pricing_claim_count),
+  zero_paid_reported_claim_count = zero_paid_reported_claims,
+  motive_power_retained_in_frequency_model = frequency_uses_motive_power,
+  motive_power_retained_in_severity_model = severity_uses_motive_power,
+  vehicle_specification_frequency_candidate_selected = frequency_uses_vehicle_specs,
+  vehicle_specification_severity_candidate_selected = severity_uses_vehicle_specs,
+  motive_power_incremental_value = motive_power_incremental_value,
+  vehicle_specification_incremental_value = vehicle_specification_incremental_value,
+  vehicle_specification_fields = c( "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm",
+    "unladen_weight_kg", "transmission" ), frequency_formula = selected_frequency_formula,
+  severity_formula = selected_severity_formula, technical_loading = config$technical_loading,
+  claims_cost_basis = claims_cost_basis_label, training_years = config$training_years,
+  validation_year = config$validation_year, development_years = c(config$training_years, config$validation_year),
+  test_year = config$test_year, frequency_balance_factor = frequency_balance_factor,
+  severity_balance_factor = severity_balance_factor, frequency_dispersion = frequency_dispersion,
+  severity_dispersion = severity_dispersion, model_selection_sample = "2024 validation",
+  final_fitting_sample = "2021-2024 development", final_evaluation_sample = "2025 out-of-time test" )
+saveRDS( technical_pricing_metadata, file.path(config$output_dir, "technical_pricing_metadata.rds") )
+```
+
+
+```{r module-2-console-summary, message=FALSE, warning=TRUE}
+# 17. FINAL CONSOLE SUMMARY ----------------------------------------------------
+cat("
+Module 2 complete.
+")
+cat("Claims-cost basis:", claims_cost_basis_label, "
+")
+cat("Frequency definition:", frequency_definition_label, "
+")
+cat("Severity definition:", severity_definition_label, "
+")
+cat("Reported claims:", sum(modelling_data$claim_count), "
+")
+cat("Positive-paid claims used for pricing:", sum(modelling_data$pricing_claim_count), "
+")
+cat("Zero-paid reported claims absorbed by excess:", zero_paid_reported_claims, "
+")
+cat("Candidate fitting years:", paste0(min(config$training_years), "-", max(config$training_years)), "
+")
+cat("Model-selection validation year:", config$validation_year, "
+")
+cat("Final refit years:", paste0(min(config$training_years), "-", config$validation_year), "
+")
+cat("Held-out out-of-time test year:", config$test_year, "
+")
+cat("Canonical Module 3 quote-market rows:", nrow(module3_pricing_profiles), "
+")
+cat("Selected frequency model:", selected_frequency_model_name, "
+")
+cat("Selected severity model:", selected_severity_model_name, "
+")
+cat("Vehicle specifications selected in frequency model:", frequency_uses_vehicle_specs, "
+")
+cat("Vehicle specifications selected in severity model:", severity_uses_vehicle_specs, "
+")
+cat("2025 TEST positive-paid frequency O/E:", round(test_frequency_metrics$observed_to_expected, 4), "
+")
+cat("2025 TEST positive-paid severity O/E:", round(test_severity_metrics$observed_to_expected, 4), "
+")
+cat("2025 TEST loss-cost O/E:", round(test_loss_cost_metrics$observed_to_expected, 4), "
+")
+cat("2025 mean technical premium:", round(mean(module3_pricing_profiles$technical_premium), 2), "
+")
+cat("All required validation checks passed:", all(technical_pricing_validation_checks$pass), "
+")
+cat("Canonical Module 3 input:", file.path(config$output_dir, "technical_pricing_profiles.csv"), "
+")
+```

@@ -1,0 +1,1201 @@
+```{r module-8-monte-carlo, message=FALSE, warning=TRUE}
+# Regenerate Modules 1–6 under independent seed sets with structural assumptions fixed.
+# Refit models and reselect pricing for each replication.
+
+required_packages <- c( "tidyverse", "broom", "mgcv", "lpSolve" )
+missing_packages <- required_packages[ !required_packages %in% rownames( installed.packages() ) ]
+if ( length( missing_packages ) > 0L
+) {
+  stop( paste0( "Install the following packages before running Module 8: ", paste( missing_packages,
+        collapse = ", " ) ) )
+}
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+options( dplyr.summarise.inform = FALSE, scipen = 999 )
+project_root <- normalizePath( getwd(), winslash = "/", mustWork = TRUE )
+cat( "\nModule 8 project root: ", project_root, "\n", sep = "" )
+config <- list( n_replications = 10L, base_seed = 20262000L, seed_stride = 100L, output_dir = file.path(
+      project_root, "outputs", "monte_carlo_stability" ), replications_dir = file.path( project_root, "outputs",
+      "monte_carlo_stability", "replications" ), module1_template =
+    file.path(project_root, "01_generate_synthetic_motor_portfolio.Rmd"), module2_template =
+    file.path(project_root, "02_fit_technical_pricing_model.Rmd"), module3_template =
+    file.path(project_root, "03_construct_synthetic_quote_market.Rmd"), module4_template =
+    file.path(project_root, "04_generate_conversion_outcomes.Rmd"), module5_template =
+    file.path(project_root, "05_fit_conversion_models.Rmd"), module6_template =
+    file.path(project_root, "06_constrained_pricing_simulation.Rmd"), overwrite_existing_replications = FALSE,
+  # Stability criteria.
+  minimum_replication_completion_rate = 0.90, minimum_central_stability_rate = 0.90,
+  minimum_truth_margin_retention = 1.00, minimum_truth_conversion_uplift = 0.00,
+  development_rate_neutral_tolerance = 0.005, expected_module1_version = "M1-MULTIYEAR-2026-09-09",
+  expected_module1_policies = 50000L, expected_policy_year = 2025L, expected_quote_profiles = 10000L,
+  expected_conversion_train_rows = 6000L, expected_conversion_validation_rows = 2000L,
+  expected_conversion_test_rows = 2000L, expected_module5_version = "M5-GLMGAM-OOT-2026-09-18",
+  expected_module5_mc_safe_marker = "M5-GLMGAM-OOT-2026-09-18-MC-SAFE", expected_module6_version =
+    "M6-GLMGAM-OOT-2026-09-18", expected_conversion_model_families = c( "glm", "gam" ),
+  expected_conversion_candidates = c( "Technical-only GLM", "Own-price GLM", "Relative-price GLM", "Rank GLM",
+      "Market-position GLM", "Market-position GAM" ), baseline_targeting_basis_id = "vehicle_value_band",
+  write_plots = TRUE )
+dir.create(
+  config$output_dir, recursive = TRUE, showWarnings = FALSE )
+dir.create(
+  config$replications_dir, recursive = TRUE, showWarnings = FALSE )
+# 0.1 EARLY OUTPUT-DIRECTORY WRITE TEST
+write_probe_path <- file.path( config$output_dir, paste0( ".module8_write_probe_", Sys.getpid(), ".tmp" ) )
+write_probe_connection <- tryCatch( file( write_probe_path, open = "w" ),
+    error = function(e) {
+      NULL
+    } )
+if ( is.null( write_probe_connection )
+) {
+  stop( paste0( "Module 8 cannot create files in its output directory.\n", "Project root: ", project_root, "\n",
+      "Resolved output directory: ", config$output_dir, "\n", "Current working directory: ", getwd(), "\n",
+      "Directory exists: ", dir.exists( config$output_dir ), "\n", "file.access(write) result: ", file.access(
+        config$output_dir, 2 ) ) )
+}
+close( write_probe_connection )
+unlink( write_probe_path, force = TRUE )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 1. CORE HELPERS
+safe_divide <- function( numerator, denominator
+) {
+  result <- numerator / denominator
+  result[ !is.finite( result ) ] <- NA_real_
+  result
+}
+normalise_r_path <- function( path
+) {
+  gsub( "\\\\", "/", path )
+}
+r_string <- function( x
+) {
+  paste0( '"', normalise_r_path( x ), '"' )
+}
+write_csv_resilient <- function(x, file, ...) {
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  tryCatch({
+    readr::write_csv(x, file, ...)
+    invisible(file)
+  }, error = function(e) {
+    stop("Unable to write output ", file, ": ", conditionMessage(e), call. = FALSE)
+  })
+}
+all_checks_pass <- function( file_path
+) {
+  if ( !file.exists( file_path )
+  ) {
+    return( FALSE )
+  }
+  checks <- suppressMessages( readr::read_csv( file_path, show_col_types = FALSE ) )
+  if ( !"pass" %in% names( checks ) || nrow( checks ) == 0L
+  ) {
+    return( FALSE )
+  }
+  # Modules 2 and 5 contain diagnostic rows that may be labelled
+  # required_for_progress = FALSE. Those are substantive results rather than
+  # mechanical pipeline failures.
+  if ( "required_for_progress" %in% names( checks )
+  ) {
+    required_flag <- as.logical( checks$required_for_progress )
+    required_flag[ is.na( required_flag ) ] <- TRUE
+    checks <- checks[ required_flag, , drop = FALSE ]
+  }
+  if ( nrow( checks ) == 0L
+  ) {
+    return( FALSE )
+  }
+  all( as.logical( checks$pass ) )
+}
+named_metric <- function( data, metric_name, name_column = "metric", value_column = "value"
+) {
+  if ( !all( c( name_column, value_column ) %in% names( data ) )
+  ) {
+    return( NA )
+  }
+  value <- data[ as.character( data[[ name_column ]] ) == metric_name, value_column, drop = TRUE ]
+  if ( length( value ) == 0L
+  ) {
+    NA
+  } else {
+    value[ 1 ]
+  }
+}
+first_or_na <- function(x) {
+  if ( length( x ) == 0L
+  ) {
+    return( NA_real_ )
+  }
+  x[ 1 ]
+}
+check_observed_value <- function( checks, check_name
+) {
+  if ( !all( c( "check_name", "observed_value" ) %in% names( checks ) )
+  ) {
+    return( NA_real_ )
+  }
+  value <- checks$observed_value[ checks$check_name == check_name ]
+  if ( length( value ) == 0L
+  ) {
+    NA_real_
+  } else {
+    as.numeric( value[ 1 ] )
+  }
+}
+check_observed_value_pattern <- function( checks, pattern
+) {
+  if ( !all( c( "check_name", "observed_value" ) %in% names( checks ) )
+  ) {
+    return( NA_real_ )
+  }
+  hit <- grepl( pattern, checks$check_name, ignore.case = TRUE )
+  value <- checks$observed_value[ hit ]
+  if ( length( value ) == 0L
+  ) {
+    NA_real_
+  } else {
+    as.numeric( value[ 1 ] )
+  }
+}
+module1_monte_carlo_checks_pass <- function( checks
+) {
+  required_columns <- c( "check_name", "pass" )
+  if ( !all( required_columns %in% names( checks ) )
+  ) {
+    return( FALSE )
+  }
+  nonblocking_checks <- c( "Mean annual kilometres", "Vehicle-value floor share", "Annual claimant rate",
+      "Mean paid claim severity", "Total-loss cost share", "Standardised non-total-loss severity mean",
+      "Conditional non-total-loss gross CV", "Mean true technical premium", "Mean latent geographic effect",
+      "Maximum motive-power probability deviation", "Maximum finance-status probability deviation",
+      "Maximum vehicle-colour probability deviation", "Vehicle-modification prevalence",
+      "Pre-existing-damage prevalence", "Policyholder is regular-driver prevalence",
+      "Vehicle-segment fallback share", "Vehicle-specification donor fallback share",
+      "Each cohort annual-km mean within 250 km of target" )
+  blocking_failures <- checks %>% filter( !pass, !check_name %in% nonblocking_checks )
+  nrow( blocking_failures ) == 0L
+}
+count_module1_policies <- function( modelling_file
+) {
+  if ( !file.exists( modelling_file )
+  ) {
+    return( NA_integer_ )
+  }
+  nrow( readr::read_csv( modelling_file, col_select = 1, show_col_types = FALSE ) )
+}
+extract_r_chunks <- function( rmd_path, r_script_path
+) {
+  lines <- readLines( rmd_path, warn = FALSE, encoding = "UTF-8" )
+  extracted_lines <- character()
+  in_r_chunk <- FALSE
+  chunk_count <- 0L
+  for ( line in lines
+  ) {
+    if ( !in_r_chunk && grepl( "^\\s*```\\{r(?:[ ,}].*)?$", line )
+    ) {
+      in_r_chunk <- TRUE
+      chunk_count <- chunk_count + 1L
+      next
+    }
+    if ( in_r_chunk && grepl( "^\\s*```\\s*$", line )
+    ) {
+      in_r_chunk <- FALSE
+      extracted_lines <- c( extracted_lines, "" )
+      next
+    }
+    if ( in_r_chunk
+    ) {
+      extracted_lines <- c( extracted_lines, line )
+    }
+  }
+  if ( in_r_chunk
+  ) {
+    stop( paste0( "Unclosed R code chunk in: ", rmd_path ) )
+  }
+  if ( chunk_count == 0L
+  ) {
+    stop( paste0( "No R code chunks found in: ", rmd_path ) )
+  }
+  writeLines( extracted_lines, r_script_path, useBytes = TRUE )
+  invisible( chunk_count )
+}
+insert_before_first_active_line <- function( lines, target_line, inserted_lines, label
+) {
+  matches <- which( trimws( lines ) == target_line )
+  if ( length( matches ) == 0L
+  ) {
+    stop( paste0( "Could not find insertion target '", target_line, "' while patching ", label, "." ) )
+  }
+  insert_at <- matches[ 1 ]
+  c( if ( insert_at > 1L
+    ) {
+      lines[ seq_len( insert_at - 1L ) ]
+    } else {
+      character()
+    }, "",
+    "# --------------------------------------------------------------------------",
+    "# MODULE 8 REPLICATION OVERRIDES",
+    "# --------------------------------------------------------------------------",
+    inserted_lines, "", lines[ insert_at:length( lines ) ] )
+}
+write_replication_script <- function( template_path, patched_rmd_path, r_script_path, insertion_target,
+    override_lines, module_label
+) {
+  lines <- readLines( template_path, warn = FALSE, encoding = "UTF-8" )
+  patched_lines <- insert_before_first_active_line( lines = lines, target_line = insertion_target, inserted_lines =
+        override_lines, label = module_label )
+  writeLines( patched_lines, patched_rmd_path, useBytes = TRUE )
+  extract_r_chunks( rmd_path = patched_rmd_path, r_script_path = r_script_path )
+  tryCatch(
+    {
+      parse( file = r_script_path, keep.source = FALSE )
+    },
+    error = function(e) {
+      stop( paste0( module_label, " generated an invalid R script: ", conditionMessage( e ) ) )
+    } )
+  r_script_path
+}
+run_script_isolated <- function( script_path, module_label
+) {
+  message( "    Running ", module_label, " in isolated R process..." )
+  rscript_path <- file.path( R.home( "bin" ), "Rscript" )
+  if ( !file.exists( rscript_path )
+  ) {
+    rscript_path <- Sys.which( "Rscript" )
+  }
+  if ( !nzchar( rscript_path ) || !file.exists( rscript_path )
+  ) {
+    stop( "Could not locate the Rscript executable required for Module 8." )
+  }
+  log_path <- sub( "\\.R$", "_run.log", script_path )
+  original_working_directory <- getwd()
+  on.exit(
+    {
+      setwd( original_working_directory )
+      invisible( gc( verbose = FALSE ) )
+    }, add = TRUE )
+  setwd( project_root )
+  status <- tryCatch(
+      {
+        system2( command = rscript_path, args = c( "--vanilla", shQuote( script_path ) ), stdout = log_path,
+          stderr = log_path )
+      },
+      error = function(e) {
+        structure( 1L, controller_error = conditionMessage( e ) )
+      } )
+  if ( is.null( status )
+  ) {
+    status <- 0L
+  }
+  status <- as.integer( status )
+  if ( identical( status, 0L )
+  ) {
+    return( list( success = TRUE, error_message = NA_character_, log_path = log_path ) )
+  }
+  log_tail <- character()
+  if ( file.exists( log_path )
+  ) {
+    log_lines <- tryCatch( readLines( log_path, warn = FALSE, encoding = "UTF-8" ),
+        error = function(e) {
+          character()
+        } )
+    if ( length( log_lines ) > 0L
+    ) {
+      log_tail <- tail( log_lines, 150L )
+    }
+  }
+  error_text <- paste( log_tail, collapse = "\n" )
+  if ( !nzchar( error_text )
+  ) {
+    error_text <- paste0( "Rscript exited with status ", status, ". See log: ", log_path )
+  }
+  list( success = FALSE, error_message = paste0( module_label, " runtime failure in isolated R process (status ",
+        status, "): ", error_text, "\nFull module log: ", log_path ), log_path = log_path )
+}
+assert_template_contains <- function( file_path, required_text, template_label
+) {
+  if ( !file.exists( file_path )
+  ) {
+    stop( paste0( template_label, " template not found: ", file_path ) )
+  }
+  template_text <- paste( readLines( file_path, warn = FALSE, encoding = "UTF-8" ), collapse = "\n" )
+  if ( !grepl( required_text, template_text, fixed = TRUE )
+  ) {
+    stop( paste0( template_label, " does not match the final frozen contract. Expected marker: ", required_text,
+        ". Resolved file: ", file_path ) )
+  }
+  invisible( TRUE )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 2. VERIFY FROZEN MODULE TEMPLATES
+template_paths <- c( Module_1 = config$module1_template, Module_2 = config$module2_template, Module_3 =
+    config$module3_template, Module_4 = config$module4_template, Module_5 = config$module5_template, Module_6 =
+    config$module6_template )
+missing_templates <- template_paths[ !file.exists( template_paths ) ]
+if ( length( missing_templates ) > 0L
+) {
+  stop( paste0( "Module 8 cannot find the following frozen template file(s):\n", paste( paste0( names(
+            missing_templates ), ": ", unname( missing_templates ) ), collapse = "\n" ),
+      "\n\nIf one of your files has a different name, change ONLY the corresponding ",
+      "module*_template line in the Module 8 configuration block." ) )
+}
+assert_template_contains( config$module1_template, config$expected_module1_version, "Module 1" )
+assert_template_contains( config$module5_template, config$expected_module5_version, "Module 5" )
+assert_template_contains( config$module5_template, config$expected_module5_mc_safe_marker,
+  "Module 5 Monte Carlo-safe" )
+assert_template_contains( config$module6_template, config$expected_module6_version, "Module 6" )
+# 2.1 TEMPLATE PATCH-TARGET PREFLIGHT
+count_exact_template_line <- function( template_path, target_line
+) {
+  template_lines <- readLines( template_path, warn = FALSE, encoding = "UTF-8" )
+  sum( trimws( template_lines ) == target_line )
+}
+template_patch_preflight <- tibble::tribble( ~module, ~template_path, ~insertion_target, "Module 1",
+  config$module1_template, "set.seed(config$seed)", "Module 2", config$module2_template,
+  "dir.create(config$output_dir, recursive = TRUE, showWarnings = FALSE)", "Module 3", config$module3_template,
+  "dir.create(", "Module 4", config$module4_template, "dir.create(", "Module 5", config$module5_template,
+  "set.seed(", "Module 6", config$module6_template, "set.seed(" ) %>% mutate( exact_target_matches =
+      purrr::map2_int( template_path, insertion_target, count_exact_template_line ), pass = exact_target_matches >=
+        1L )
+write_csv_resilient( template_patch_preflight, file.path( config$output_dir,
+    "monte_carlo_template_patch_preflight.csv" ) )
+if ( !all( template_patch_preflight$pass )
+) {
+  stop( paste0( "At least one frozen module template does not contain its expected ",
+      "Module 8 patch insertion point. Review ", "monte_carlo_template_patch_preflight.csv." ) )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 3. REPLICATION SEED REGISTER
+replication_register <- tibble( replication_id = seq_len( config$n_replications ) ) %>% mutate( replication_label =
+      sprintf( "rep_%02d", replication_id ), replication_seed_base = config$base_seed + ( replication_id - 1L ) *
+        config$seed_stride, module1_seed = replication_seed_base + 1L, module3_focal_seed = replication_seed_base +
+        2L, module3_conversion_split_seed = replication_seed_base + 3L, module3_competitor_seed_base =
+      replication_seed_base + 10L, module4_price_sensitivity_seed = replication_seed_base + 20L,
+    module4_taste_seed = replication_seed_base + 21L, module4_purchase_seed = replication_seed_base + 22L,
+    module4_choice_seed = replication_seed_base + 23L, module5_seed = replication_seed_base + 30L, module6_seed =
+      replication_seed_base + 40L )
+write_csv_resilient( replication_register, file.path( config$output_dir, "monte_carlo_replication_register.csv" ) )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 4. REPLICATION PATH HELPERS
+replication_paths <- function( replication_label
+) {
+  root <- file.path( config$replications_dir, replication_label )
+  list( root = root, scripts = file.path( root, "scripts" ), module1 = file.path( root, "01_synthetic_generator" ),
+    module2 = file.path( root, "02_technical_pricing" ), module3 = file.path( root, "03_quote_market" ), module4 =
+      file.path( root, "04_conversion_generation" ), module5 = file.path( root, "05_conversion_models" ), module6 =
+      file.path( root, "06_pricing_simulation" ) )
+}
+replication_complete <- function( paths
+) {
+  required_files <- c( file.path( paths$module1, "module1_validation_checks.csv" ), file.path( paths$module2,
+      "technical_pricing_validation_checks.csv" ), file.path( paths$module3, "quote_market_validation_checks.csv"
+    ), file.path( paths$module4, "conversion_generation_validation_checks.csv" ), file.path( paths$module5,
+      "model_validation_checks.csv" ), file.path( paths$module5, "full_model_selection_table.csv" ), file.path(
+      paths$module5, "selected_model_metadata.rds" ), file.path( paths$module6, "pricing_sample_architecture.csv"
+    ), file.path( paths$module6, "pricing_strategy_metadata.rds" ), file.path( paths$module6,
+      "pricing_validation_checks.csv" ), file.path( paths$module6, "selected_conversion_model_interface.csv" ),
+    file.path( paths$module6, "prediction_interface_reconstruction.csv" ), file.path( paths$module6,
+      "neutral_targeted_feasibility.csv" ), file.path( paths$module6, "test_strategy_comparison.csv" ) )
+  files_exist <- all( file.exists( required_files ) )
+  if ( !files_exist
+  ) {
+    return( FALSE )
+  }
+  module5_metadata <- tryCatch( readRDS( file.path( paths$module5, "selected_model_metadata.rds" ) ),
+      error = function(e) {
+        NULL
+      } )
+  module6_metadata <- tryCatch( readRDS( file.path( paths$module6, "pricing_strategy_metadata.rds" ) ),
+      error = function(e) {
+        NULL
+      } )
+  if ( is.null( module5_metadata ) || is.null( module6_metadata )
+  ) {
+    return( FALSE )
+  }
+  identical( as.character( module5_metadata$module_version ), config$expected_module5_version ) && identical(
+      as.character( module6_metadata$module_version ), config$expected_module6_version )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 5. MODULE PATCH FUNCTIONS
+set_module1_monte_carlo_validation_policy <- function( file_path
+) {
+  lines <- readLines( file_path, warn = FALSE, encoding = "UTF-8" )
+  start_matches <- which( trimws( lines ) == "if (!all(validation_checks$pass)) {" )
+  if ( length( start_matches ) != 1L
+  ) {
+    stop( paste0( "Could not locate the frozen Module 1 final validation gate in ", file_path, "." ) )
+  }
+  start <- start_matches[ 1 ]
+  stop_matches <- which( grepl(
+        'stop("One or more required Module 1 validation checks are outside their stated bounds.")', lines,
+        fixed = TRUE ) & seq_along( lines ) >= start )
+  if ( length( stop_matches ) != 1L
+  ) {
+    stop( paste0( "Could not locate the frozen Module 1 validation stop in ", file_path, "." ) )
+  }
+  close_candidates <- which( trimws( lines ) == "}" & seq_along( lines ) > stop_matches[ 1 ] )
+  if ( length( close_candidates ) == 0L
+  ) {
+    stop( "Could not locate the end of the Module 1 validation gate." )
+  }
+  end <- close_candidates[ 1 ]
+  replacement <- c(
+    "# --------------------------------------------------------------------------",
+    "# MODULE 8 MONTE CARLO VALIDATION POLICY",
+    "# --------------------------------------------------------------------------",
+    "# Frozen Module 1 uses tight baseline calibration bounds. Across random seeds,",
+    "# moderate misses are Monte Carlo outcomes rather than reasons to discard a",
+    "# replication. Structural/data-integrity failures remain blocking.",
+    "module8_nonblocking_module1_checks <- c(", '  "Mean annual kilometres",', '  "Vehicle-value floor share",',
+    '  "Annual claimant rate",', '  "Mean paid claim severity",', '  "Total-loss cost share",',
+    '  "Standardised non-total-loss severity mean",', '  "Conditional non-total-loss gross CV",',
+    '  "Mean true technical premium",', '  "Mean latent geographic effect",',
+    '  "Maximum motive-power probability deviation",', '  "Maximum finance-status probability deviation",',
+    '  "Maximum vehicle-colour probability deviation",', '  "Vehicle-modification prevalence",',
+    '  "Pre-existing-damage prevalence",', '  "Policyholder is regular-driver prevalence",',
+    '  "Vehicle-segment fallback share",', '  "Vehicle-specification donor fallback share",',
+    '  "Each cohort annual-km mean within 250 km of target"', ")", "", "module8_failed_module1_checks <-",
+    "  validation_checks |>", "  dplyr::filter(!pass)", "", "module8_blocking_module1_failures <-",
+    "  module8_failed_module1_checks |>", "  dplyr::filter(!check_name %in% module8_nonblocking_module1_checks)",
+    "", "if (nrow(module8_failed_module1_checks) > 0L) {",
+    '  cat("\\nModule 1 Monte Carlo validation misses:\\n")', "  print(module8_failed_module1_checks, n = Inf)",
+    "}", "", "if (nrow(module8_blocking_module1_failures) > 0L) {",
+    '  stop("One or more structural Module 1 validation checks failed in Monte Carlo.")', "}", "",
+    "if (nrow(module8_failed_module1_checks) > 0L) {", "  warning(",
+    '    "One or more non-structural Module 1 calibration checks were outside ",',
+    '    "their baseline bounds in this Monte Carlo draw. Outputs are retained ",',
+    '    "and the misses are treated as stochastic stability diagnostics."', "  )", "}" )
+  lines <- c( if ( start > 1L
+      ) {
+        lines[ seq_len( start - 1L ) ]
+      } else {
+        character()
+      }, replacement, if ( end < length( lines )
+      ) {
+        lines[ (end + 1L): length( lines ) ]
+      } else {
+        character()
+      } )
+  writeLines( lines, file_path, useBytes = TRUE )
+  invisible( file_path )
+}
+patch_module1 <- function( replication_row, paths
+) {
+  dir.create(
+    paths$scripts, recursive = TRUE, showWarnings = FALSE )
+  dir.create(
+    paths$module1, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( paths$scripts, "01_module1_replication.Rmd" )
+  r_script <- file.path( paths$scripts, "01_module1_replication.R" )
+  override_lines <- c( paste0( "config$seed <- ", replication_row$module1_seed[ 1 ], "L" ), paste0(
+      "config$output_dir <- ", r_string( paths$module1 ) ), "config$write_plots <- FALSE" )
+  generated_script <- write_replication_script( template_path = config$module1_template, patched_rmd_path =
+        patched_rmd, r_script_path = r_script, insertion_target = "set.seed(config$seed)", override_lines =
+        override_lines, module_label = "Module 1" )
+  set_module1_monte_carlo_validation_policy( patched_rmd )
+  set_module1_monte_carlo_validation_policy( generated_script )
+  parse( file = generated_script, keep.source = FALSE )
+  generated_script
+}
+patch_module2 <- function( replication_row, paths
+) {
+  dir.create(
+    paths$module2, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( paths$scripts, "02_module2_replication.Rmd" )
+  r_script <- file.path( paths$scripts, "02_module2_replication.R" )
+  override_lines <- c( paste0( "config$input_file <- ", r_string( file.path( paths$module1,
+          "synthetic_motor_modelling.csv" ) ) ), paste0( "config$claims_file <- ", r_string( file.path(
+          paths$module1, "synthetic_motor_claims.rds" ) ) ), paste0( "config$truth_file <- ", r_string( file.path(
+          paths$module1, "synthetic_motor_full_truth.rds" ) ) ), paste0( "config$output_dir <- ", r_string(
+        paths$module2 ) ), "config$write_plots <- FALSE" )
+  write_replication_script( template_path = config$module2_template, patched_rmd_path = patched_rmd,
+    r_script_path = r_script, insertion_target =
+      "dir.create(config$output_dir, recursive = TRUE, showWarnings = FALSE)", override_lines = override_lines,
+    module_label = "Module 2" )
+}
+patch_module3 <- function( replication_row, paths
+) {
+  dir.create(
+    paths$module3, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( paths$scripts, "03_module3_replication.Rmd" )
+  r_script <- file.path( paths$scripts, "03_module3_replication.R" )
+  override_lines <- c( paste0( "config$input_file <- ", r_string( file.path( paths$module2,
+          "technical_pricing_profiles.csv" ) ) ), paste0( "config$output_dir <- ", r_string( paths$module3 ) ),
+    'config$scenarios_to_run <- c("baseline")', paste0( "config$focal_seed <- ",
+      replication_row$module3_focal_seed[ 1 ], "L" ), paste0( "config$conversion_split_seed <- ",
+      replication_row$module3_conversion_split_seed[ 1 ], "L" ), paste0( "config$competitor_seed_base <- ",
+      replication_row$module3_competitor_seed_base[ 1 ], "L" ), "config$write_plots <- FALSE" )
+  write_replication_script( template_path = config$module3_template, patched_rmd_path = patched_rmd,
+    r_script_path = r_script, insertion_target = "dir.create(", override_lines = override_lines, module_label =
+      "Module 3" )
+}
+patch_module4 <- function( replication_row, paths
+) {
+  dir.create(
+    paths$module4, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( paths$scripts, "04_module4_replication.Rmd" )
+  r_script <- file.path( paths$scripts, "04_module4_replication.R" )
+  override_lines <- c( paste0( "config$input_dir <- ", r_string( paths$module3 ) ), paste0(
+      "config$output_dir <- ", r_string( paths$module4 ) ), 'config$demand_scenarios_to_run <- c("baseline")',
+    paste0( "config$profile_price_sensitivity_seed <- ", replication_row$module4_price_sensitivity_seed[ 1 ], "L"
+    ), paste0( "config$alternative_taste_seed <- ", replication_row$module4_taste_seed[ 1 ], "L" ), paste0(
+      "config$purchase_draw_seed <- ", replication_row$module4_purchase_seed[ 1 ], "L" ), paste0(
+      "config$choice_draw_seed <- ", replication_row$module4_choice_seed[ 1 ], "L" ), "config$write_plots <- FALSE"
+  )
+  write_replication_script( template_path = config$module4_template, patched_rmd_path = patched_rmd,
+    r_script_path = r_script, insertion_target = "dir.create(", override_lines = override_lines, module_label =
+      "Module 4" )
+}
+patch_module5 <- function( replication_row, paths
+) {
+  dir.create(
+    paths$module5, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( paths$scripts, "05_module5_replication.Rmd" )
+  r_script <- file.path( paths$scripts, "05_module5_replication.R" )
+  override_lines <- c( paste0( "config$seed <- ", replication_row$module5_seed[ 1 ], "L" ), paste0(
+      "config$input_dir <- ", r_string( paths$module4 ) ), paste0( "config$output_dir <- ", r_string( paths$module5
+      ) ), 'config$market_scenario_id <- "baseline"', 'config$demand_scenario_id <- "baseline"',
+    "config$write_plots <- FALSE" )
+  write_replication_script( template_path = config$module5_template, patched_rmd_path = patched_rmd,
+    r_script_path = r_script, insertion_target = "set.seed(", override_lines = override_lines, module_label =
+      "Module 5" )
+}
+patch_module6 <- function( replication_row, paths
+) {
+  dir.create(
+    paths$module6, recursive = TRUE, showWarnings = FALSE )
+  patched_rmd <- file.path( paths$scripts, "06_module6_replication.Rmd" )
+  r_script <- file.path( paths$scripts, "06_module6_replication.R" )
+  override_lines <- c( paste0( "config$seed <- ", replication_row$module6_seed[ 1 ], "L" ), paste0(
+      "config$conversion_model_dir <- ", r_string( paths$module5 ) ), paste0( "config$quote_market_dir <- ",
+      r_string( paths$module3 ) ), paste0( "config$conversion_generation_dir <- ", r_string( paths$module4 ) ),
+    paste0( "config$output_dir <- ", r_string( paths$module6 ) ), 'config$market_scenario_id <- "baseline"',
+    'config$demand_scenario_id <- "baseline"', paste0( "config$module1_truth_file <- ", r_string( file.path(
+          paths$module1, "synthetic_motor_full_truth.rds" ) ) ), "config$write_plots <- FALSE" )
+  write_replication_script( template_path = config$module6_template, patched_rmd_path = patched_rmd,
+    r_script_path = r_script, insertion_target = "set.seed(", override_lines = override_lines, module_label =
+      "Module 6" )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 6. RUN COMPLETE BASELINE PIPELINE FOR EACH REPLICATION
+replication_status_rows <- list()
+for ( replication_index in seq_len( nrow( replication_register ) )
+) {
+  replication_row <- replication_register[ replication_index, ]
+  replication_id <- replication_row$replication_id[ 1 ]
+  replication_label <- replication_row$replication_label[ 1 ]
+  paths <- replication_paths( replication_label )
+  message( "" )
+  message( "============================================================" )
+  message( "Monte Carlo replication ", replication_id, " of ", config$n_replications, ": ", replication_label )
+  message( "============================================================" )
+  dir.create(
+    paths$root, recursive = TRUE, showWarnings = FALSE )
+  if ( !config$overwrite_existing_replications && replication_complete( paths )
+  ) {
+    message( "  Existing completed replication found; reusing outputs." )
+    replication_status_rows[[ replication_label ]] <- tibble( replication_id = replication_id, replication_label =
+          replication_label, replication_success = TRUE, module_failed = NA_character_, error_message =
+          NA_character_, reused_existing_outputs = TRUE )
+  } else {
+    replication_success <- TRUE
+    module_failed <- NA_character_
+    error_message <- NA_character_
+    patchers <- list( "Module 1" = patch_module1, "Module 2" = patch_module2, "Module 3" = patch_module3,
+      "Module 4" = patch_module4, "Module 5" = patch_module5, "Module 6" = patch_module6 )
+    for ( module_name in names( patchers )
+    ) {
+      if ( !replication_success
+      ) {
+        break
+      }
+      patched_script <- tryCatch( patchers[[ module_name ]]( replication_row = replication_row, paths = paths ),
+          error = function(e) {
+            e
+          } )
+      if ( inherits( patched_script, "error" )
+      ) {
+        replication_success <- FALSE
+        module_failed <- paste( module_name, "patch/parse" )
+        error_message <- conditionMessage( patched_script )
+        break
+      }
+      module_result <- run_script_isolated( script_path = patched_script, module_label = module_name )
+      if ( !module_result$success
+      ) {
+        replication_success <- FALSE
+        module_failed <- module_name
+        error_message <- module_result$error_message
+        break
+      }
+    }
+    replication_status_rows[[ replication_label ]] <- tibble( replication_id = replication_id, replication_label =
+          replication_label, replication_success = replication_success, module_failed = module_failed,
+        error_message = error_message, reused_existing_outputs = FALSE )
+  }
+  # Write an incremental status checkpoint after every replication.
+  current_status <- bind_rows( replication_status_rows ) %>% arrange( replication_id )
+  write_csv_resilient( current_status, file.path( config$output_dir, "monte_carlo_replication_status.csv" ) )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 7. FINAL EXECUTION STATUS
+replication_status <- bind_rows( replication_status_rows ) %>% left_join( replication_register, by = c(
+      "replication_id", "replication_label" ) ) %>% arrange( replication_id )
+write_csv_resilient( replication_status, file.path( config$output_dir, "monte_carlo_replication_status.csv" ) )
+if ( !any( replication_status$replication_success )
+) {
+  cat( "\nNo replication completed successfully. Failure details:\n" )
+  print( replication_status %>% dplyr::select( replication_id, replication_label, module_failed, error_message ),
+    n = Inf, width = Inf )
+  stop( paste( "No Monte Carlo replication completed successfully.",
+      "The failure details are printed above and saved in", "monte_carlo_replication_status.csv." ) )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 8. COLLECT REPLICATION RESULTS
+collect_replication <- function( replication_row, status_row
+) {
+  replication_id <- replication_row$replication_id[ 1 ]
+  replication_label <- replication_row$replication_label[ 1 ]
+  paths <- replication_paths( replication_label )
+  if ( !isTRUE( status_row$replication_success[ 1 ] )
+  ) {
+    return( tibble( replication_id = replication_id, replication_label = replication_label, collection_success =
+          FALSE ) )
+  }
+  required_files <- c( file.path( paths$module1, "module1_validation_checks.csv" ), file.path( paths$module2,
+      "technical_pricing_validation_checks.csv" ), file.path( paths$module2, "technical_pricing_summary.csv" ),
+    file.path( paths$module2, "technical_pricing_truth_recovery.csv" ), file.path( paths$module3,
+      "quote_market_validation_checks.csv" ), file.path( paths$module3, "focal_price_summary.csv" ), file.path(
+      paths$module4, "conversion_generation_validation_checks.csv" ), file.path( paths$module4,
+      "conversion_generation_summary.csv" ), file.path( paths$module5, "model_validation_checks.csv" ), file.path(
+      paths$module5, "final_selected_test_metrics.csv" ), file.path( paths$module5, "incremental_model_value.csv"
+    ), file.path( paths$module5, "truth_probability_recovery.csv" ), file.path( paths$module5,
+      "full_model_selection_table.csv" ), file.path( paths$module5, "selected_model_metadata.rds" ), file.path(
+      paths$module6, "pricing_sample_architecture.csv" ), file.path( paths$module6, "pricing_strategy_metadata.rds"
+    ), file.path( paths$module6, "pricing_validation_checks.csv" ), file.path( paths$module6,
+      "selected_conversion_model_interface.csv" ), file.path( paths$module6,
+      "prediction_interface_reconstruction.csv" ), file.path( paths$module6, "neutral_targeted_feasibility.csv" ),
+    file.path( paths$module6, "test_strategy_comparison.csv" ), file.path( paths$module6,
+      "selected_segment_multipliers.csv" ), file.path( paths$module6, "targeted_strategy_selection_summary.csv" ) )
+  missing_files <- required_files[ !file.exists( required_files ) ]
+  if ( length( missing_files ) > 0L
+  ) {
+    warning( paste0( "Replication ", replication_label, " is missing collected output(s): ", paste( missing_files,
+          collapse = "; " ) ) )
+    return( tibble( replication_id = replication_id, replication_label = replication_label, collection_success =
+          FALSE ) )
+  }
+  module1_checks <- readr::read_csv( file.path( paths$module1, "module1_validation_checks.csv" ),
+      show_col_types = FALSE )
+  module2_checks <- readr::read_csv( file.path( paths$module2, "technical_pricing_validation_checks.csv" ),
+      show_col_types = FALSE )
+  module2_summary <- readr::read_csv( file.path( paths$module2, "technical_pricing_summary.csv" ),
+      show_col_types = FALSE )
+  module2_truth <- readr::read_csv( file.path( paths$module2, "technical_pricing_truth_recovery.csv" ),
+      show_col_types = FALSE )
+  module3_checks <- readr::read_csv( file.path( paths$module3, "quote_market_validation_checks.csv" ),
+      show_col_types = FALSE )
+  focal_price_summary <- readr::read_csv( file.path( paths$module3, "focal_price_summary.csv" ),
+      show_col_types = FALSE )
+  module4_checks <- readr::read_csv( file.path( paths$module4, "conversion_generation_validation_checks.csv" ),
+      show_col_types = FALSE )
+  conversion_summary <- readr::read_csv( file.path( paths$module4, "conversion_generation_summary.csv" ),
+      show_col_types = FALSE )
+  module5_checks <- readr::read_csv( file.path( paths$module5, "model_validation_checks.csv" ),
+      show_col_types = FALSE )
+  final_model_metrics <- readr::read_csv( file.path( paths$module5, "final_selected_test_metrics.csv" ),
+      show_col_types = FALSE )
+  incremental_value <- readr::read_csv( file.path( paths$module5, "incremental_model_value.csv" ),
+      show_col_types = FALSE )
+  truth_recovery <- readr::read_csv( file.path( paths$module5, "truth_probability_recovery.csv" ),
+      show_col_types = FALSE )
+  full_model_selection <- readr::read_csv( file.path( paths$module5, "full_model_selection_table.csv" ),
+      show_col_types = FALSE )
+  module5_metadata <- readRDS( file.path( paths$module5, "selected_model_metadata.rds" ) )
+  pricing_architecture <- readr::read_csv( file.path( paths$module6, "pricing_sample_architecture.csv" ),
+      show_col_types = FALSE )
+  module6_metadata <- readRDS( file.path( paths$module6, "pricing_strategy_metadata.rds" ) )
+  module6_checks <- readr::read_csv( file.path( paths$module6, "pricing_validation_checks.csv" ),
+      show_col_types = FALSE )
+  selected_model_interface <- readr::read_csv( file.path( paths$module6, "selected_conversion_model_interface.csv"
+      ), show_col_types = FALSE )
+  prediction_interface_reconstruction <- readr::read_csv( file.path( paths$module6,
+        "prediction_interface_reconstruction.csv" ), show_col_types = FALSE )
+  neutral_targeted_feasibility <- readr::read_csv( file.path( paths$module6, "neutral_targeted_feasibility.csv" ),
+      show_col_types = FALSE )
+  strategy_comparison <- readr::read_csv( file.path( paths$module6, "test_strategy_comparison.csv" ),
+      show_col_types = FALSE )
+  selected_multipliers <- readr::read_csv( file.path( paths$module6, "selected_segment_multipliers.csv" ),
+      show_col_types = FALSE )
+  targeted_selection <- readr::read_csv( file.path( paths$module6, "targeted_strategy_selection_summary.csv" ),
+      show_col_types = FALSE )
+  selected_model_name <- final_model_metrics$model[ 1 ]
+  selected_incremental <- incremental_value %>% filter( evaluation_split == "test", model == selected_model_name )
+  if ( nrow( selected_model_interface ) != 1L || selected_model_interface$selected_model_name[ 1 ] !=
+        selected_model_name || selected_model_interface$selected_model_type[ 1 ] != as.character(
+          module5_metadata$selected_model_type ) || selected_model_interface$module5_version[ 1 ] !=
+        config$expected_module5_version
+  ) {
+    stop( paste0( "Selected model/interface mismatch for ", replication_label, "." ) )
+  }
+  selected_model_type <- selected_model_interface$selected_model_type[ 1 ]
+  gam_selection_row <- full_model_selection %>% filter( model == "Market-position GAM" )
+  glm_selection_row <- full_model_selection %>% filter( model == "Market-position GLM" )
+  if ( nrow( full_model_selection ) != 2L || nrow( gam_selection_row ) != 1L || nrow( glm_selection_row ) != 1L ||
+      !setequal( full_model_selection$model, c( "Market-position GLM", "Market-position GAM" ) )
+  ) {
+    stop( paste0( "Final GLM/GAM selection table is invalid for ", replication_label, "." ) )
+  }
+  module5_contract_pass <- identical( as.character( module5_metadata$module_version ),
+      config$expected_module5_version ) && setequal( as.character( module5_metadata$model_family_scope ),
+      config$expected_conversion_model_families ) && length( module5_metadata$model_family_scope ) == length(
+        config$expected_conversion_model_families ) && identical( as.character( module5_metadata$candidate_models
+      ), config$expected_conversion_candidates ) && as.character( module5_metadata$selected_model_name ) ==
+      selected_model_name && as.character( module5_metadata$selected_model_type ) %in%
+      config$expected_conversion_model_families
+  module6_contract_pass <- identical( as.character( module6_metadata$module_version ),
+      config$expected_module6_version ) && identical( as.character( module6_metadata$module5_version ),
+      config$expected_module5_version ) && setequal( as.character( module6_metadata$conversion_model_family_scope
+      ), config$expected_conversion_model_families ) && identical( as.character(
+        module6_metadata$conversion_candidate_models ), config$expected_conversion_candidates ) && as.character(
+      module6_metadata$selected_conversion_model ) == selected_model_name && identical(
+      module6_metadata$truth_used_for_strategy_selection, FALSE ) && identical(
+      module6_metadata$test_outcome_used_for_strategy_selection, FALSE )
+  architecture_contract_pass <- nrow( pricing_architecture ) == 1L && pricing_architecture$policy_year[ 1 ] ==
+      config$expected_policy_year && pricing_architecture$total_profiles[ 1 ] == config$expected_quote_profiles &&
+    pricing_architecture$technical_data_split[ 1 ] == "test" && pricing_architecture$conversion_train_profiles[ 1
+    ] == config$expected_conversion_train_rows && pricing_architecture$conversion_validation_profiles[ 1 ] ==
+      config$expected_conversion_validation_rows && pricing_architecture$conversion_test_profiles[ 1 ] ==
+      config$expected_conversion_test_rows && !as.logical(
+      pricing_architecture$test_outcome_used_for_strategy_selection[ 1 ] ) && !as.logical(
+      pricing_architecture$latent_truth_used_for_strategy_selection[ 1 ] )
+  selected_interface_difference <- prediction_interface_reconstruction %>% filter( difference_scale ==
+        "probability", model == selected_model_name ) %>% pull( max_absolute_difference )
+  neutral_targeted_strategy_feasible <- all( as.logical( neutral_targeted_feasibility$pass ) )
+  selected_truth <- truth_recovery %>% filter( model == selected_model_name )
+  own_truth <- truth_recovery %>% filter( model == "Own-price GLM" )
+  technical_strategy <- strategy_comparison %>% filter( strategy == "Technical-pricing benchmark" )
+  targeted_strategy <- strategy_comparison %>% filter( strategy == "Market-position targeted strategy" )
+  if ( nrow( technical_strategy ) != 1L || nrow( targeted_strategy ) != 1L
+  ) {
+    stop( paste0( "Required Module 6 strategy rows are missing for ", replication_label, "." ) )
+  }
+  module1_pass <- module1_monte_carlo_checks_pass( module1_checks )
+  module2_pass <- all_checks_pass( file.path( paths$module2, "technical_pricing_validation_checks.csv" ) )
+  module3_pass <- all_checks_pass( file.path( paths$module3, "quote_market_validation_checks.csv" ) )
+  module4_pass <- all_checks_pass( file.path( paths$module4, "conversion_generation_validation_checks.csv" ) )
+  module5_pass <- all_checks_pass( file.path( paths$module5, "model_validation_checks.csv" ) )
+  module6_pass <- all_checks_pass( file.path( paths$module6, "pricing_validation_checks.csv" ) )
+  all_pipeline_checks_pass <- all( module1_pass, module2_pass, module3_pass, module4_pass, module5_pass,
+      module6_pass )
+  selected_truth_spearman <- if ( nrow( selected_truth ) == 1L
+    ) {
+      selected_truth$probability_spearman_correlation[ 1 ]
+    } else {
+      NA_real_
+    }
+  own_truth_spearman <- if ( nrow( own_truth ) == 1L
+    ) {
+      own_truth$probability_spearman_correlation[ 1 ]
+    } else {
+      NA_real_
+    }
+  selected_logloss_gain <- if ( nrow( selected_incremental ) == 1L
+    ) {
+      selected_incremental$log_loss_improvement_vs_own_price[ 1 ]
+    } else {
+      NA_real_
+    }
+  selected_relative_logloss_gain <- if ( nrow( selected_incremental ) == 1L
+    ) {
+      selected_incremental$relative_log_loss_improvement_vs_own_price[ 1 ]
+    } else {
+      NA_real_
+    }
+  selected_auc_gain <- if ( nrow( selected_incremental ) == 1L
+    ) {
+      selected_incremental$auc_improvement_vs_own_price[ 1 ]
+    } else {
+      NA_real_
+    }
+  tibble( replication_id = replication_id, replication_label = replication_label, collection_success = TRUE,
+    module1_seed = replication_row$module1_seed[ 1 ], module3_focal_seed = replication_row$module3_focal_seed[ 1 ],
+    module3_conversion_split_seed = replication_row$module3_conversion_split_seed[ 1 ],
+    module4_price_sensitivity_seed = replication_row$module4_price_sensitivity_seed[ 1 ], module1_checks_pass =
+      module1_pass, module2_checks_pass = module2_pass, module3_checks_pass = module3_pass, module4_checks_pass =
+      module4_pass, module5_checks_pass = module5_pass, module6_checks_pass = module6_pass,
+    all_pipeline_checks_pass = all_pipeline_checks_pass, architecture_contract_pass = architecture_contract_pass,
+    module5_contract_pass = module5_contract_pass, module6_contract_pass = module6_contract_pass,
+    portfolio_size_contract_pass = count_module1_policies( file.path( paths$module1,
+          "synthetic_motor_modelling.csv" ) ) == config$expected_module1_policies,
+    # Module 1 stability
+    module1_claimant_rate = check_observed_value( module1_checks, "Annual claimant rate" ),
+    module1_mean_paid_severity = check_observed_value( module1_checks, "Mean paid claim severity" ),
+    module1_total_loss_cost_share = check_observed_value( module1_checks, "Total-loss cost share" ),
+    module1_mean_true_technical_premium = check_observed_value_pattern( module1_checks, "technical premium" ),
+    # Module 2 stability
+    selected_frequency_model = as.character( named_metric( module2_summary, "Selected frequency model" ) ),
+    selected_severity_model = as.character( named_metric( module2_summary, "Selected severity model" ) ),
+    technical_loss_cost_truth_spearman = as.numeric( named_metric( module2_truth,
+          "2025 test Spearman correlation: estimated vs true annual loss cost" ) ),
+    technical_loss_cost_mean_ratio = as.numeric( named_metric( module2_truth,
+          "2025 test mean estimated / true annual loss cost" ) ),
+    # Module 3 stability
+    focal_commercial_adjustment_r_squared = as.numeric( named_metric( focal_price_summary,
+          "Risk-model R-squared for commercial adjustment" ) ),
+    # Module 4 stability
+    realised_focal_conversion_rate = conversion_summary$realised_focal_conversion_rate[ 1 ],
+    rank_conversion_spearman = conversion_summary$rank_conversion_spearman[ 1 ],
+    relative_price_conversion_spearman = conversion_summary$relative_price_conversion_spearman[ 1 ],
+    # Module 5 stability
+    selected_conversion_model = selected_model_name, selected_conversion_model_type = selected_model_type,
+    selected_model_is_gam = identical( selected_model_name, "Market-position GAM" ), selected_model_is_glm =
+      identical( selected_model_name, "Market-position GLM" ), gam_validation_relative_logloss_improvement_vs_glm =
+      gam_selection_row$relative_logloss_improvement_vs_glm[ 1 ], gam_validation_calibration_slope =
+      gam_selection_row$calibration_slope[ 1 ], gam_validation_calibration_acceptable = as.logical(
+        gam_selection_row$calibration_acceptable[ 1 ] ), gam_complexity_threshold_met = as.logical(
+        gam_selection_row$complexity_threshold_met[ 1 ] ), gam_eligible_for_selection = as.logical(
+        gam_selection_row$eligible_for_selection[ 1 ] ), selected_model_interface_max_probability_difference =
+      first_or_na( selected_interface_difference ), neutral_targeted_strategy_feasible =
+      neutral_targeted_strategy_feasible, selected_model_test_log_loss = final_model_metrics$log_loss[ 1 ],
+    selected_model_test_auc = final_model_metrics$auc[ 1 ], selected_model_test_calibration_slope =
+      final_model_metrics$calibration_slope[ 1 ], selected_log_loss_improvement_vs_own_price =
+      selected_logloss_gain, selected_relative_log_loss_improvement_vs_own_price = selected_relative_logloss_gain,
+    selected_auc_improvement_vs_own_price = selected_auc_gain, selected_truth_probability_spearman =
+      selected_truth_spearman, own_price_truth_probability_spearman = own_truth_spearman,
+    truth_recovery_spearman_gain = selected_truth_spearman - own_truth_spearman,
+    # Module 6 stability
+    selected_targeting_basis_id = targeted_selection$selected_segmentation_id[ 1 ], selected_targeting_basis_name =
+      targeted_selection$selected_segmentation_name[ 1 ], selected_targeting_basis_category =
+      targeted_selection$selected_segmentation_category[ 1 ], selected_targeting_source_variable =
+      targeted_selection$selected_source_variable[ 1 ], selected_targeting_validation_rank =
+      targeted_selection$selected_validation_rank[ 1 ], selected_targeting_number_segments =
+      targeted_selection$selected_number_segments[ 1 ], targeted_development_rate_level =
+      targeted_selection$selected_rate_level[ 1 ], targeted_development_margin_retention =
+      targeted_selection$selected_portfolio_margin_retention[ 1 ],
+    targeted_development_min_segment_margin_retention =
+      targeted_selection$selected_minimum_segment_margin_retention[ 1 ],
+    targeted_development_min_age_margin_retention = targeted_selection$selected_minimum_age_margin_retention[ 1 ],
+    targeted_development_claim_ratio = targeted_selection$selected_model_expected_claim_ratio[ 1 ],
+    targeted_development_conversion_retention = targeted_selection$selected_model_conversion_retention[ 1 ],
+    technical_true_conversion_rate = technical_strategy$true_expected_conversion_rate[ 1 ],
+    targeted_true_conversion_rate = targeted_strategy$true_expected_conversion_rate[ 1 ],
+    targeted_true_conversion_uplift_pp = targeted_strategy$true_conversion_uplift[ 1 ],
+    targeted_true_relative_conversion_uplift = targeted_strategy$true_relative_conversion_uplift[ 1 ],
+    targeted_true_margin_retention = targeted_strategy$true_margin_retention[ 1 ], targeted_true_claim_ratio =
+      targeted_strategy$true_expected_claim_ratio[ 1 ], targeted_test_rate_level =
+      targeted_strategy$aggregate_rate_level[ 1 ], targeted_multiplier_min = min(
+        selected_multipliers$selected_multiplier ), targeted_multiplier_max = max(
+        selected_multipliers$selected_multiplier ), targeted_multiplier_mean = mean(
+        selected_multipliers$selected_multiplier ), targeted_multiplier_sd = sd(
+        selected_multipliers$selected_multiplier ), targeted_multiplier_range = max(
+        selected_multipliers$selected_multiplier ) - min( selected_multipliers$selected_multiplier ),
+    targeted_distinct_multipliers = n_distinct( selected_multipliers$selected_multiplier ) )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 9. COLLECT ALL SUCCESSFUL REPLICATIONS
+collected_rows <- list()
+for ( replication_index in seq_len( nrow( replication_register ) )
+) {
+  replication_row <- replication_register[ replication_index, ]
+  replication_id <- replication_row$replication_id[ 1 ]
+  replication_label <- replication_row$replication_label[ 1 ]
+  status_row <- replication_status %>% filter( replication_id == .env$replication_id )
+  collected_rows[[ replication_label ]] <- collect_replication( replication_row = replication_row, status_row =
+        status_row )
+}
+replication_summary <- bind_rows( collected_rows ) %>% arrange( replication_id )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 10. CENTRAL STABILITY CLASSIFICATION
+replication_summary <- replication_summary %>% mutate( development_rate_neutral_pass = collection_success & abs(
+        targeted_development_rate_level - 1 ) <= config$development_rate_neutral_tolerance + 1e-12,
+    market_information_logloss_gain_pass = collection_success & selected_log_loss_improvement_vs_own_price > 0,
+    market_information_truth_gain_pass = collection_success & truth_recovery_spearman_gain > 0,
+    selected_model_interface_pass = collection_success & selected_model_interface_max_probability_difference <=
+        1e-8, neutral_targeted_feasibility_pass = collection_success & neutral_targeted_strategy_feasible,
+    true_conversion_improvement_pass = collection_success & targeted_true_conversion_uplift_pp >
+        config$minimum_truth_conversion_uplift, true_margin_preservation_pass = collection_success &
+      targeted_true_margin_retention + 1e-12 >= config$minimum_truth_margin_retention,
+    final_architecture_contract_pass = collection_success & architecture_contract_pass & module5_contract_pass &
+      module6_contract_pass & portfolio_size_contract_pass, predictive_conclusion_stable = collection_success &
+      all_pipeline_checks_pass & final_architecture_contract_pass & selected_model_interface_pass &
+      market_information_logloss_gain_pass & market_information_truth_gain_pass, pricing_conclusion_stable =
+      collection_success & all_pipeline_checks_pass & final_architecture_contract_pass &
+      selected_model_interface_pass & neutral_targeted_feasibility_pass & development_rate_neutral_pass &
+      true_conversion_improvement_pass & true_margin_preservation_pass, central_conclusion_stable =
+      predictive_conclusion_stable & pricing_conclusion_stable )
+write_csv_resilient( replication_summary, file.path( config$output_dir, "monte_carlo_replication_summary.csv" ) )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 11. SELECTED MODEL FREQUENCY
+selected_model_frequency <- replication_summary %>% filter( collection_success ) %>% count(
+    selected_conversion_model, selected_conversion_model_type, name = "replications" ) %>% mutate( share =
+      safe_divide( replications, sum( replications ) ), approved_model_family_scope = "GLM/GAM only" ) %>% arrange(
+    desc( replications ) )
+write_csv_resilient( selected_model_frequency, file.path( config$output_dir,
+    "monte_carlo_selected_model_frequency.csv" ) )
+selected_model_family_frequency <- replication_summary %>% filter( collection_success ) %>% count(
+    selected_conversion_model_type, name = "replications" ) %>% mutate( share = safe_divide( replications, sum(
+          replications ) ) ) %>% arrange( desc( replications ) )
+write_csv_resilient( selected_model_family_frequency, file.path( config$output_dir,
+    "monte_carlo_model_family_frequency.csv" ) )
+# 11.1 SELECTED TARGETING-BASIS FREQUENCY
+selected_targeting_basis_frequency <- replication_summary %>% filter( collection_success ) %>% count(
+    selected_targeting_basis_id, selected_targeting_basis_name, selected_targeting_basis_category,
+    selected_targeting_source_variable, name = "replications" ) %>% mutate( share = safe_divide( replications, sum(
+          replications ) ) ) %>% arrange( desc( replications ), selected_targeting_basis_id )
+write_csv_resilient( selected_targeting_basis_frequency, file.path( config$output_dir,
+    "monte_carlo_targeting_basis_frequency.csv" ) )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 12. SELECTED MULTIPLIERS ACROSS REPLICATIONS
+multiplier_rows <- list()
+successful_replication_labels <- replication_summary$replication_label[ replication_summary$collection_success ]
+for ( replication_label in successful_replication_labels
+) {
+  replication_id <- replication_register$replication_id[ replication_register$replication_label ==
+        replication_label ]
+  paths <- replication_paths( replication_label )
+  multiplier_path <- file.path( paths$module6, "selected_segment_multipliers.csv" )
+  if ( file.exists( multiplier_path )
+  ) {
+    multiplier_rows[[ replication_label ]] <- readr::read_csv( multiplier_path, show_col_types = FALSE ) %>%
+      mutate( replication_id = .env$replication_id, replication_label = .env$replication_label, .before = 1 )
+  }
+}
+selected_multipliers_all_replications <- bind_rows( multiplier_rows ) %>% arrange( replication_id, segmentation_id,
+    pricing_segment )
+if ( nrow( selected_multipliers_all_replications ) > 0L
+) {
+  write_csv_resilient( selected_multipliers_all_replications, file.path( config$output_dir,
+      "monte_carlo_selected_multipliers.csv" ) )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 13. CONTINUOUS-METRIC STABILITY SUMMARY
+continuous_metrics <- c( "module1_claimant_rate", "module1_mean_paid_severity", "module1_total_loss_cost_share",
+  "module1_mean_true_technical_premium", "technical_loss_cost_truth_spearman", "technical_loss_cost_mean_ratio",
+  "focal_commercial_adjustment_r_squared", "realised_focal_conversion_rate", "rank_conversion_spearman",
+  "relative_price_conversion_spearman", "selected_model_test_log_loss", "selected_model_test_auc",
+  "selected_model_test_calibration_slope", "gam_validation_relative_logloss_improvement_vs_glm",
+  "gam_validation_calibration_slope", "selected_model_interface_max_probability_difference",
+  "selected_log_loss_improvement_vs_own_price", "selected_relative_log_loss_improvement_vs_own_price",
+  "selected_auc_improvement_vs_own_price", "selected_truth_probability_spearman",
+  "own_price_truth_probability_spearman", "truth_recovery_spearman_gain", "targeted_development_rate_level",
+  "targeted_development_margin_retention", "targeted_development_min_segment_margin_retention",
+  "targeted_development_min_age_margin_retention", "targeted_development_claim_ratio",
+  "targeted_development_conversion_retention", "targeted_true_conversion_rate",
+  "targeted_true_relative_conversion_uplift", "targeted_true_margin_retention", "targeted_true_claim_ratio",
+  "targeted_test_rate_level", "targeted_multiplier_mean", "targeted_multiplier_range" )
+completed_results <- replication_summary %>% filter( collection_success )
+monte_carlo_stability_summary <- completed_results %>% dplyr::select( all_of( continuous_metrics ) ) %>%
+  pivot_longer( cols = everything(), names_to = "metric", values_to = "value" ) %>% group_by( metric ) %>%
+  summarise( replications = sum( is.finite( value ) ), mean = mean( value, na.rm = TRUE ), sd = sd( value,
+        na.rm = TRUE ), minimum = min( value, na.rm = TRUE ), q25 = quantile( value, 0.25, na.rm = TRUE,
+        names = FALSE ), median = median( value, na.rm = TRUE ), q75 = quantile( value, 0.75, na.rm = TRUE,
+        names = FALSE ), maximum = max( value, na.rm = TRUE ), coefficient_of_variation = if_else( is.finite( mean
+        ) && abs( mean ) > 1e-12, abs( sd / mean ), NA_real_ ), .groups = "drop" )
+write_csv_resilient( monte_carlo_stability_summary, file.path( config$output_dir,
+    "monte_carlo_stability_summary.csv" ) )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 14. REPLICATION-LEVEL VALIDATION TABLE
+monte_carlo_validation_checks <- replication_summary %>% transmute( replication_id, replication_label,
+    collection_success, all_pipeline_checks_pass, architecture_contract_pass, module5_contract_pass,
+    module6_contract_pass, portfolio_size_contract_pass, final_architecture_contract_pass,
+    development_rate_neutral_pass, market_information_logloss_gain_pass, market_information_truth_gain_pass,
+    selected_model_interface_pass, neutral_targeted_feasibility_pass, true_conversion_improvement_pass,
+    true_margin_preservation_pass, predictive_conclusion_stable, pricing_conclusion_stable,
+    central_conclusion_stable )
+write_csv_resilient( monte_carlo_validation_checks, file.path( config$output_dir,
+    "monte_carlo_validation_checks.csv" ) )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 15. OVERALL MONTE CARLO SUMMARY
+registered_replications <- nrow( replication_register )
+completed_replications <- sum( replication_summary$collection_success, na.rm = TRUE )
+stable_replications <- sum( replication_summary$central_conclusion_stable, na.rm = TRUE )
+completion_rate <- safe_divide( completed_replications, registered_replications )
+central_stability_rate <- safe_divide( stable_replications, completed_replications )
+overall_monte_carlo_summary <- tibble( registered_replications = registered_replications, completed_replications =
+    completed_replications, completion_rate = completion_rate, central_conclusion_stable_replications =
+    stable_replications, central_conclusion_stability_rate = central_stability_rate,
+  predictive_conclusion_stable_replications = sum( replication_summary$predictive_conclusion_stable, na.rm = TRUE
+    ), predictive_conclusion_stability_rate = safe_divide( sum( replication_summary$predictive_conclusion_stable,
+        na.rm = TRUE ), completed_replications ), pricing_conclusion_stable_replications = sum(
+      replication_summary$pricing_conclusion_stable, na.rm = TRUE ), pricing_conclusion_stability_rate =
+    safe_divide( sum( replication_summary$pricing_conclusion_stable, na.rm = TRUE ), completed_replications ),
+  replications_with_final_architecture_contract = sum( replication_summary$final_architecture_contract_pass,
+      na.rm = TRUE ), replications_with_all_pipeline_checks = sum( replication_summary$all_pipeline_checks_pass,
+      na.rm = TRUE ), replications_with_market_information_logloss_gain = sum(
+      replication_summary$market_information_logloss_gain_pass, na.rm = TRUE ),
+  replications_with_market_information_truth_gain = sum( replication_summary$market_information_truth_gain_pass,
+      na.rm = TRUE ), replications_with_selected_model_interface_pass = sum(
+      replication_summary$selected_model_interface_pass, na.rm = TRUE ),
+  replications_with_neutral_targeted_feasibility_pass = sum( replication_summary$neutral_targeted_feasibility_pass,
+      na.rm = TRUE ), replications_selecting_market_glm = sum( replication_summary$selected_model_is_glm,
+      na.rm = TRUE ), replications_selecting_market_gam = sum( replication_summary$selected_model_is_gam,
+      na.rm = TRUE ), replications_where_gam_met_complexity_and_calibration_rule = sum(
+      replication_summary$gam_complexity_threshold_met & replication_summary$gam_validation_calibration_acceptable,
+      na.rm = TRUE ), minimum_gam_relative_logloss_improvement_vs_glm = min(
+      replication_summary$gam_validation_relative_logloss_improvement_vs_glm[
+        replication_summary$collection_success ], na.rm = TRUE ), mean_gam_relative_logloss_improvement_vs_glm =
+    mean( replication_summary$gam_validation_relative_logloss_improvement_vs_glm[
+        replication_summary$collection_success ], na.rm = TRUE ), maximum_gam_relative_logloss_improvement_vs_glm =
+    max( replication_summary$gam_validation_relative_logloss_improvement_vs_glm[
+        replication_summary$collection_success ], na.rm = TRUE ), replications_selecting_baseline_targeting_basis =
+    sum( replication_summary$selected_targeting_basis_id == config$baseline_targeting_basis_id, na.rm = TRUE ),
+  baseline_targeting_basis_selection_rate = safe_divide( sum( replication_summary$selected_targeting_basis_id ==
+          config$baseline_targeting_basis_id, na.rm = TRUE ), completed_replications ),
+  replications_with_true_conversion_improvement = sum( replication_summary$true_conversion_improvement_pass,
+      na.rm = TRUE ), replications_with_true_margin_preservation = sum(
+      replication_summary$true_margin_preservation_pass, na.rm = TRUE ), minimum_true_relative_conversion_uplift =
+    min( replication_summary$targeted_true_relative_conversion_uplift[ replication_summary$collection_success ],
+      na.rm = TRUE ), mean_true_relative_conversion_uplift = mean(
+      replication_summary$targeted_true_relative_conversion_uplift[ replication_summary$collection_success ],
+      na.rm = TRUE ), maximum_true_relative_conversion_uplift = max(
+      replication_summary$targeted_true_relative_conversion_uplift[ replication_summary$collection_success ],
+      na.rm = TRUE ), minimum_true_margin_retention = min( replication_summary$targeted_true_margin_retention[
+        replication_summary$collection_success ], na.rm = TRUE ), mean_true_margin_retention = mean(
+      replication_summary$targeted_true_margin_retention[ replication_summary$collection_success ], na.rm = TRUE ),
+  maximum_true_margin_retention = max( replication_summary$targeted_true_margin_retention[
+        replication_summary$collection_success ], na.rm = TRUE ), mean_market_information_logloss_gain = mean(
+      replication_summary$selected_log_loss_improvement_vs_own_price[ replication_summary$collection_success ],
+      na.rm = TRUE ), mean_truth_recovery_spearman_gain = mean( replication_summary$truth_recovery_spearman_gain[
+        replication_summary$collection_success ], na.rm = TRUE ), completion_rate_pass = completion_rate >=
+      config$minimum_replication_completion_rate, central_stability_rate_pass = central_stability_rate >=
+      config$minimum_central_stability_rate )
+write_csv_resilient( overall_monte_carlo_summary, file.path( config$output_dir, "overall_monte_carlo_summary.csv" )
+)
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 16. FAILED REPLICATION LOG
+failed_replications <- replication_status %>% filter( !replication_success ) %>% dplyr::select( replication_id,
+    replication_label, module_failed, error_message )
+write_csv_resilient( failed_replications, file.path( config$output_dir, "monte_carlo_failed_replications.csv" ) )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 17. DIAGNOSTIC PLOTS
+if ( isTRUE( config$write_plots ) && nrow( completed_results ) > 0L
+) {
+  # 17.1 True conversion uplift across seeds
+  p_conversion_uplift <- completed_results %>% ggplot( aes( x = factor( replication_id ), y =
+          targeted_true_relative_conversion_uplift, group = 1 ) ) + geom_line() + geom_point() + geom_hline(
+      yintercept = 0, linetype = 2 ) + labs( x = "Replication", y = "True relative conversion uplift",
+      title = "Targeted-strategy conversion uplift across random seeds" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "01_true_conversion_uplift_across_seeds.png" ), p_conversion_uplift,
+    width = 8, height = 5, dpi = 300 )
+  # 17.2 True margin retention across seeds
+  p_margin_retention <- completed_results %>% ggplot( aes( x = factor( replication_id ), y =
+          targeted_true_margin_retention, group = 1 ) ) + geom_line() + geom_point() + geom_hline( yintercept = 1,
+      linetype = 2 ) + labs( x = "Replication", y = "True underwriting-margin retention",
+      title = "Targeted-strategy margin retention across random seeds" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "02_true_margin_retention_across_seeds.png" ), p_margin_retention,
+    width = 8, height = 5, dpi = 300 )
+  # 17.3 Market-information truth-recovery gain
+  p_truth_gain <- completed_results %>% ggplot( aes( x = factor( replication_id ), y =
+          truth_recovery_spearman_gain, group = 1 ) ) + geom_line() + geom_point() + geom_hline( yintercept = 0,
+      linetype = 2 ) + labs( x = "Replication", y = "Spearman recovery gain over Own-price GLM",
+      title = "Incremental market-position truth recovery across seeds" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "03_market_information_truth_gain_across_seeds.png" ), p_truth_gain,
+    width = 8, height = 5, dpi = 300 )
+  # 17.4 Selected conversion-model family across seeds
+  p_model_family <- completed_results %>% ggplot( aes( x = factor( replication_id ), y =
+          selected_conversion_model_type ) ) + geom_point( size = 3 ) + labs( x = "Replication",
+      y = "Selected conversion-model family", title = "Selected conversion-model family across random seeds" ) +
+    theme_minimal()
+  ggsave( file.path( config$output_dir, "04_selected_model_family_across_seeds.png" ), p_model_family, width = 8,
+    height = 5, dpi = 300 )
+  # 17.5 Selected targeting basis across seeds
+  p_target_basis <- completed_results %>% ggplot( aes( x = factor( replication_id ), y =
+          selected_targeting_basis_name ) ) + geom_point( size = 3 ) + labs( x = "Replication",
+      y = "Selected targeting basis", title = "Selected pricing-targeting basis across random seeds" ) +
+    theme_minimal()
+  ggsave( file.path( config$output_dir, "05_selected_targeting_basis_across_seeds.png" ), p_target_basis,
+    width = 9, height = 5, dpi = 300 )
+  # 17.6 Selected targeting multipliers across seeds
+  if ( nrow( selected_multipliers_all_replications ) > 0L
+  ) {
+    p_multipliers <- selected_multipliers_all_replications %>% ggplot( aes( x = pricing_segment, y =
+            selected_multiplier, group = replication_label ) ) + geom_line( alpha = 0.6 ) + geom_point( alpha = 0.6
+      ) + facet_wrap( ~segmentation_name, scales = "free_x" ) + labs( x = "Pricing segment",
+        y = "Selected technical-premium multiplier", title = "Targeted pricing multipliers across random seeds" ) +
+      theme_minimal() + theme( axis.text.x = element_text( angle = 45, hjust = 1 ) )
+    ggsave( file.path( config$output_dir, "06_targeted_multipliers_across_seeds.png" ), p_multipliers, width = 10,
+      height = 6, dpi = 300 )
+  }
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 18. PRINT KEY RESULTS
+cat( "\n", "============================================================\n", "MODULE 8 COMPLETE\n",
+  "============================================================\n", sep = "" )
+cat( "\nConfigured replications: ", config$n_replications, "\n", sep = "" )
+cat( "\nReplication execution status:\n" )
+print( replication_status, n = Inf )
+cat( "\nReplication summary:\n" )
+print( replication_summary, n = Inf )
+cat( "\nSelected conversion-model frequency:\n" )
+print( selected_model_frequency, n = Inf )
+cat( "\nSelected conversion-model family frequency:\n" )
+print( selected_model_family_frequency, n = Inf )
+cat( "\nSelected targeting-basis frequency:\n" )
+print( selected_targeting_basis_frequency, n = Inf )
+cat( "\nOverall Monte Carlo summary:\n" )
+print( overall_monte_carlo_summary, n = Inf )
+cat( "\nPrimary output files:\n", file.path( config$output_dir, "monte_carlo_replication_status.csv" ), "\n",
+  file.path( config$output_dir, "monte_carlo_replication_summary.csv" ), "\n", file.path( config$output_dir,
+    "monte_carlo_stability_summary.csv" ), "\n", file.path( config$output_dir,
+    "monte_carlo_selected_model_frequency.csv" ), "\n", file.path( config$output_dir,
+    "monte_carlo_model_family_frequency.csv" ), "\n", file.path( config$output_dir,
+    "monte_carlo_targeting_basis_frequency.csv" ), "\n", file.path( config$output_dir,
+    "monte_carlo_selected_multipliers.csv" ), "\n", file.path( config$output_dir,
+    "monte_carlo_validation_checks.csv" ), "\n", file.path( config$output_dir, "overall_monte_carlo_summary.csv" ),
+  "\n", sep = "" )
+```

@@ -1,0 +1,1015 @@
+```{r module-0-calibration, message=FALSE, warning=TRUE}
+# Prepare public-data calibration tables for five independent annual cohorts.
+# Keep observed source distributions distinct from simulation assumptions.
+
+required_packages <- c("tidyverse", "readxl", "jsonlite")
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0L) stop("Install before running Module 0: ", paste(missing_packages, collapse = ", "))
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(jsonlite)
+})
+options(dplyr.summarise.inform = FALSE, scipen = 999)
+# MULTI-YEAR DESIGN -------------------------------------------------------------
+module_version <- "M0-MULTIYEAR-2026-09-09"
+module_freeze_date <- as.Date(NA_character_)
+# Output contract: these files are consumed by Module 1 and therefore form part
+# of the frozen interface between the empirical calibration and simulation layers.
+module0_output_contract <- c( "calibration_validation_checks.csv", "state_distribution.csv",
+  "state_distribution_by_policy_year.csv", "state_remoteness_distribution_by_policy_year.csv",
+  "vehicle_year_distribution_by_policy_year_state.csv", "vehicle_make_model_distribution_by_policy_year.csv",
+  "vehicle_segment_motive_power_by_policy_year_yom.csv", "annual_cost_level_indices.csv",
+  "multiyear_calibration_validation_checks.csv", "multiyear_source_requirements.csv",
+  "state_remoteness_distribution.csv", "driver_age_distribution.csv", "vehicle_year_distribution_by_state.csv",
+  "vehicle_year_eligibility_summary.csv", "vehicle_segment_classification_audit.csv",
+  "vehicle_segment_motive_power_by_year.csv", "vehicle_segment_motive_power_overall.csv",
+  "vehicle_make_model_spec_by_year.csv", "vehicle_spec_donor_pool.csv", "vehicle_specification_audit.csv",
+  "motive_power_distribution.csv", "motive_power_km_calibration.csv", "racq_vehicle_values_clean.csv",
+  "additional_quote_variable_calibrations.rds", "module0_freeze_manifest.csv" )
+project_root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+helpers_file <- file.path(project_root, "R", "helpers.R")
+assert_helper_message <- paste0("Missing shared helper file: ", helpers_file, ". Place helpers.R in the project R/ directory.")
+if (!file.exists(helpers_file)) stop(assert_helper_message)
+source(helpers_file)
+config <- list(
+  input_dir = file.path(project_root, "inputs"),
+  raw_dir = file.path(project_root, "inputs", "raw"),
+  calibrated_dir = file.path(project_root, "inputs", "calibrated_multiyear"),
+  multiyear_raw_dir = file.path(project_root, "inputs", "raw", "multiyear"), cohort_years = 2021:2025,
+  bitre_garaging_filename = "fc222132-0efa-4838-97f4-fffa1d40d4da.csv",
+  bitre_year_filename = "026a319d-aee5-445b-a3f9-98412afc68bf (2).csv",
+  bitre_make_model_filename = "6346aa1f-6713-4d51-8f54-6b9282c193b9.csv",
+  bitre_motive_power_make_model_filename = "rva-2025-mvs-vehtype-yom-mtvpwr-mk-mdl-rpc.csv",
+  bitre_road_yearbook_filename = "bitre-yearbook-2025-04-road.xlsx",
+  abs_poa_allocation_filename = "POA_2021_AUST.xlsx", abs_mesh_block_allocation_filename = "MB_2021_AUST.xlsx",
+  abs_remoteness_allocation_filename = "RA_2021_AUST.xlsx",
+  abs_mesh_block_counts_filename = "Mesh Block Counts, 2021.xlsx",
+  vehicle_segment_lookup_filename = "vehicle_segment_lookup.csv",
+  carexpert_vehicle_spec_lookup_filename = "carexpert_vehicle_spec_lookup_95PCT.csv",
+  racq_vehicle_value_filename = "racq_2025_vehicle_values.csv", download_missing_public_workbooks = TRUE,
+  vehicle_reference_year = 2025L, max_standard_vehicle_age = 30L, youngest_band_retained_share = 0.50,
+  uniform_18_19_share_of_15_19 = 0.40, minimum_postcode_vehicle_mapping_share = 0.95,
+  max_unclassified_vehicle_weight = 0.05, max_unclassified_motive_power_weight = 0.01,
+  minimum_vehicle_spec_coverage = 0.95 )
+purrr::walk(c(config$input_dir, config$raw_dir, config$multiyear_raw_dir, config$calibrated_dir),
+            ~dir.create(.x, recursive = TRUE, showWarnings = FALSE))
+search_directories <- c(project_root, config$raw_dir, config$input_dir)
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 1. Source register ------------------------------------------------------------
+source_register <- tribble( ~source_id, ~source_name, ~provider, ~purpose, ~source_url,
+  "BITRE_RVA_2025", "Road vehicles Australia, January 2025", "Bureau of Infrastructure and Transport Research Economics", "Passenger-vehicle State, postcode, manufacture-year and make/model calibration", "https://www.bitre.gov.au/resource/roads-vehicles/road-vehicles-australia-january-2025",
+  "BITRE_YEARBOOK_2025_ROAD", "Australian Infrastructure and Transport Statistics Yearbook 2025 - Roads chapter", "Bureau of Infrastructure and Transport Research Economics", "National licence-holder counts by age", "https://www.bitre.gov.au/resource/roads-vehicles/australian-infrastructure-and-transport-statistics-yearbook-2025-roads-chapter",
+  "ABS_POA_2021", "ASGS Edition 3 Postal Areas - 2021 allocation file", "Australian Bureau of Statistics", "Map 2021 Mesh Blocks to Postal Areas", "https://www.abs.gov.au/statistics/standards/australian-statistical-geography-standard-asgs/edition-3-july-2021-june-2026/access-and-downloads/allocation-files",
+  "ABS_MB_2021", "ASGS Edition 3 Mesh Blocks - 2021 allocation file", "Australian Bureau of Statistics", "Map Mesh Blocks to SA1 and State", "https://www.abs.gov.au/statistics/standards/australian-statistical-geography-standard-asgs/edition-3-july-2021-june-2026/access-and-downloads/allocation-files",
+  "ABS_RA_2021", "ASGS Edition 3 Remoteness Areas - 2021 allocation file", "Australian Bureau of Statistics", "Map SA1 to official Remoteness Area", "https://www.abs.gov.au/statistics/standards/australian-statistical-geography-standard-asgs/edition-3-july-2021-june-2026/access-and-downloads/allocation-files",
+  "ABS_MB_COUNTS_2021", "2021 Census Mesh Block counts", "Australian Bureau of Statistics", "Dwelling-weight Postal Area to Remoteness Area overlaps", "https://www.abs.gov.au/census/guide-census-data/mesh-block-counts/latest-release",
+  "GREEN_VEHICLE_GUIDE", "Green Vehicle Guide", "Australian Government", "Vehicle make/model classification support for curated vehicle-segment lookup", "https://www.greenvehicleguide.gov.au/",
+  "FCAI_SEGMENTATION", "Vehicle Segmentation Criteria", "Federal Chamber of Automotive Industries", "Australian vehicle-segment classification support", "https://www.fcai.com.au/wp-content/uploads/2024/10/FCAI_Segmentation_doc.pdf",
+  "RACQ_2025_RUNNING_COSTS", "Vehicle Running Costs 2025", "RACQ", "On-road price and five-year residual-value calibration", "https://www.racq.com.au/car/research/car-running-costs/running-costs-2025",
+  "ABS_ELECTRIC_VEHICLE_USE_2020", "Electric passenger vehicle use, experimental estimates", "Australian Bureau of Statistics", "Average passenger-vehicle kilometres by petrol, diesel and electric motive power", "https://www.abs.gov.au/articles/electric-passenger-vehicle-use-experimental-estimates"
+)
+source_register <- bind_rows( source_register, tribble( ~source_id, ~source_name, ~provider, ~purpose, ~source_url,
+    "NRMA_MOTOR_PED_2025", "Motor Insurance Premium, Excess & Discounts Guide", "NRMA Insurance", "Evidence that parking location, finance status, vehicle modifications and driver characteristics are used in Australian motor pricing", "https://www.nrma.com.au/content/dam/insurance-brands-aus/nrma/au/en/documents/car/nrma-car-ped-nrmamotped-rev7-0225.pdf",
+    "BUDGET_DIRECT_MODIFIED_CAR", "Modified car insurance guidance", "Budget Direct", "Evidence that declared vehicle modifications are underwriting-relevant and may affect premium or insurability", "https://www.budgetdirect.com.au/car-insurance/articles/modified-car-insurance.html",
+    "BUDGET_DIRECT_LOW_KM", "Low Kilometres Car Insurance", "Budget Direct", "Evidence that annual-kilometre information is collected and used in Australian motor insurance pricing", "https://www.budgetdirect.com.au/car-insurance/low-km-car-insurance.html",
+    "ALLIANZ_MOTOR_FAQ", "Car Insurance FAQs", "Allianz Australia", "Evidence that main-driver information, annual kilometres and policy start date are collected in quotation", "https://www.allianz.com.au/car-insurance/faqs.html",
+    "MONEY_AU_CAR_FINANCE_2026", "Car loan statistics and survey insights", "Money.com.au", "Australian survey calibration for vehicle finance / outright ownership mix", "https://www.money.com.au/car-loans/research-insights/car-loan-statistics",
+    "MONASH_COLOUR_CRASH", "An investigation into the relationship between vehicle colour and crash risk", "Monash University Accident Research Centre", "Evidence that vehicle colour has documented crash association; no direct causal relativity imposed in the baseline DGP", "https://www.monash.edu/muarc/archive/our-publications/reports/muarc263",
+    "GREEN_VEHICLE_GUIDE_SPEC", "Green Vehicle Guide vehicle specifications", "Australian Government", "Supporting vehicle-specification reference and classification cross-check", "https://www.greenvehicleguide.gov.au/pages/Help/HowToGuide",
+    "CAREXPERT_VEHICLE_SPECS", "CarExpert historical vehicle specifications", "CarExpert", "Representative make/model/year engine, power, torque, transmission and unladen-weight calibration", "https://www.carexpert.com.au/"
+  ) )
+# Multi-year source register additions ------------------------------------------
+source_register <- bind_rows( source_register, tribble( ~source_id, ~source_name, ~provider, ~purpose, ~source_url,
+    "ABS_MVC_2021", "Motor Vehicle Census, Australia, 31 January 2021", "Australian Bureau of Statistics", "2021 passenger-vehicle fleet calibration", "https://www.abs.gov.au/statistics/industry/tourism-and-transport/motor-vehicle-census-australia/31-jan-2021",
+    "BITRE_RVA_2022", "Road vehicles Australia, January 2022", "BITRE", "2022 passenger-vehicle fleet calibration", "https://data.gov.au/data/dataset/road-vehicles-australia-january-2022",
+    "BITRE_RVA_2023", "Road vehicles Australia, January 2023", "BITRE", "2023 passenger-vehicle fleet calibration", "https://data.gov.au/data/dataset/road-vehicles-australia-january-2023",
+    "BITRE_RVA_2024", "Road vehicles Australia, January 2024", "BITRE", "2024 passenger-vehicle fleet calibration", "https://data.gov.au/data/dataset/road-vehicles-australia-january-2024",
+    "ABS_CPI_MOTOR_REPAIR", "CPI: Maintenance and repair of motor vehicles", "Australian Bureau of Statistics", "On-level historical claim costs to the 2025 cost basis", "https://www.abs.gov.au/statistics/economy/price-indexes-and-inflation/consumer-price-index-australia",
+    "ABS_CPI_MOTOR_VEHICLES", "CPI: Motor vehicles", "Australian Bureau of Statistics", "Backcast RACQ 2025 vehicle-value anchors to each cohort-year nominal price level", "https://www.abs.gov.au/statistics/economy/price-indexes-and-inflation/consumer-price-index-australia"
+  ) )
+write_csv_safe(source_register, file.path(config$calibrated_dir, "source_register.csv"))
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 2. Module-specific helpers ----------------------------------------------------
+normalise_state <- function(x) {
+  x <- str_squish(str_to_upper(as.character(x)))
+  case_when( x %in% c("NSW", "NEW SOUTH WALES", "1") ~ "NSW", x %in% c("VIC", "VICTORIA", "2") ~ "VIC",
+    x %in% c("QLD", "QUEENSLAND", "3") ~ "QLD", x %in% c("SA", "SOUTH AUSTRALIA", "4") ~ "SA",
+    x %in% c("WA", "WESTERN AUSTRALIA", "5") ~ "WA", x %in% c("TAS", "TASMANIA", "6") ~ "TAS",
+    x %in% c("NT", "NORTHERN TERRITORY", "7") ~ "NT", x %in% c("ACT", "AUSTRALIAN CAPITAL TERRITORY", "8") ~ "ACT",
+    TRUE ~ NA_character_ )
+}
+normalise_remoteness <- function(x) {
+  x <- str_squish(as.character(x))
+  case_when( str_detect(x, regex("^Major Cities", ignore_case = TRUE)) ~ "Major Cities",
+    str_detect(x, regex("^Inner Regional", ignore_case = TRUE)) ~ "Inner Regional",
+    str_detect(x, regex("^Outer Regional", ignore_case = TRUE)) ~ "Outer Regional",
+    str_detect(x, regex("^Very Remote", ignore_case = TRUE)) ~ "Very Remote",
+    str_detect(x, regex("^Remote", ignore_case = TRUE)) ~ "Remote", TRUE ~ NA_character_ )
+}
+normalise_motive_power <- function(x) {
+  x <- str_squish(str_to_lower(as.character(x)))
+  case_when( is.na(x) | x == "" ~ NA_character_, str_detect(x, "hybrid") ~ "Hybrid Electric",
+    str_detect(x, "battery|fuel.?cell|bev|fcev|electric") ~ "Battery/Fuel-cell Electric",
+    str_detect(x, "diesel") ~ "Diesel", str_detect(x, "petrol|gasoline") ~ "Petrol",
+    str_detect(x, "dual|lpg|cng|natural gas|other|not stated|unknown") ~ "Other/Dual Fuel", TRUE ~ NA_character_ )
+}
+normalise_postcode <- function(x) {
+  digits <- str_extract(as.character(x), "[0-9]{1,4}")
+  if_else(is.na(digits), NA_character_, str_pad(digits, 4, side = "left", pad = "0"))
+}
+check_probability_sum <- function(data, probability_column = "probability", group_columns = NULL, tolerance = 1e-8) {
+  if (is.null(group_columns)) return(abs(sum(data[[probability_column]], na.rm = TRUE) - 1) <= tolerance)
+  sums <- data %>% group_by(across(all_of(group_columns))) %>% summarise(probability_sum = sum(.data[[probability_column]], na.rm = TRUE), .groups = "drop")
+  all(abs(sums$probability_sum - 1) <= tolerance)
+}
+write_calibration_csv <- function(data, filename) {
+  write_csv_safe(data, file.path(config$calibrated_dir, filename))
+}
+download_if_missing <- function(filename, url) {
+  existing <- resolve_existing_file(filename, search_directories)
+  if (!is.na(existing)) return(existing)
+  if (!isTRUE(config$download_missing_public_workbooks)) stop("Missing public-source file: ", filename)
+  destination <- file.path(config$raw_dir, filename)
+  unlink(destination, force = TRUE)
+  errors <- character()
+  for (method in c("auto", "libcurl")) {
+    ok <- tryCatch({
+      args <- list(url = url, destfile = destination, mode = "wb", quiet = FALSE)
+      if (method != "auto") args$method <- method
+      suppressWarnings(do.call(utils::download.file, args))
+      file.exists(destination) && file.info(destination)$size > 0
+    }, error = function(e) { errors <<- c(errors, paste(method, conditionMessage(e))); FALSE })
+    if (ok) return(normalizePath(destination, winslash = "/", mustWork = TRUE))
+    unlink(destination, force = TRUE)
+  }
+  curl <- Sys.which("curl")
+  if (nzchar(curl)) {
+    output <- tryCatch(system2(curl, c("-L", "--http1.1", "--fail", "--retry", "3", "--connect-timeout", "30", "--max-time", "180", "-o", destination, url), stdout = TRUE, stderr = TRUE), error = function(e) e)
+    if (inherits(output, "error")) {
+      status <- 1L
+    } else {
+      status <- attr(output, "status")
+      if (is.null(status)) status <- 0L
+    }
+    if (status == 0L && file.exists(destination) && file.info(destination)$size > 0) return(normalizePath(destination, winslash = "/", mustWork = TRUE))
+  }
+  stop("Could not download ", filename, ". Download manually from: ", url, " and place it at: ", destination,
+       if (length(errors)) paste0("\nAttempts: ", paste(errors, collapse = " | ")) else "")
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 3. RESOLVE / DOWNLOAD RAW FILES
+bitre_garaging_file <- resolve_existing_file( config$bitre_garaging_filename, search_directories = search_directories )
+bitre_year_file <- resolve_existing_file( config$bitre_year_filename, search_directories = search_directories )
+bitre_make_model_file <- resolve_existing_file( config$bitre_make_model_filename, search_directories = search_directories )
+motive_power_required_column_groups <- list( c( "vehicle_type", "veh_type" ), c( "year_of_manufacture", "manufacture_year", "year" ), c( "motive_power", "motive_power_type", "fuel_type", "fuel", "power_source" ), c( "make" ), c( "model" ), c( "no_vehicles", "number_of_vehicles", "vehicle_count", "vehicles", "count" ) )
+bitre_motive_power_make_model_file <- NA_character_
+if ( !is.na( bitre_make_model_file ) ) {
+existing_mm_header <- tryCatch( { readr::read_csv( bitre_make_model_file, n_max = 0, show_col_types = FALSE ) %>%
+clean_column_names() }, error = function(e) { NULL } )
+if ( !is.null( existing_mm_header ) ) {
+existing_mm_names <- names( existing_mm_header )
+existing_mm_matches <- purrr::map_lgl( motive_power_required_column_groups, function(group) { any( group %in% existing_mm_names ) } )
+if ( all( existing_mm_matches ) ) {
+bitre_motive_power_make_model_file <- bitre_make_model_file
+}
+}
+}
+if ( is.na( bitre_motive_power_make_model_file ) && !is.na( config$bitre_motive_power_make_model_filename ) ) {
+bitre_motive_power_make_model_file <- resolve_existing_file( config$bitre_motive_power_make_model_filename, search_directories = search_directories )
+}
+if ( is.na( bitre_motive_power_make_model_file ) ) {
+bitre_motive_power_make_model_file <- find_csv_with_required_columns( required_column_groups = motive_power_required_column_groups, search_directories = search_directories, exclude_paths = c( bitre_garaging_file, bitre_year_file ) )
+}
+if ( any( is.na( c( bitre_garaging_file, bitre_year_file, bitre_make_model_file ) ) ) ) {
+stop( paste0( "One or more BITRE Road Vehicles Australia raw CSVs are missing.\n", "Module 0 searches the project root, inputs/raw and inputs.\n", "Expected filenames:\n", "  ", config$bitre_garaging_filename, "\n  ", config$bitre_year_filename, "\n  ", config$bitre_make_model_filename, "\n", "These are the same raw files already used by the frozen Module 1." ) )
+}
+if ( is.na( bitre_motive_power_make_model_file ) ) {
+stop( paste0( "Module 0 could not find the detailed BITRE motive-power CSV required ", "to calibrate the new motive_power variable.\n\n", "Required BITRE extract:\n", "Registered road vehicles by vehicle type, year of manufacture, motive ", "power, make and model, 31 January 2025.\n\n", "Place that CSV in the project root, inputs/ or inputs/raw/. ", "The filename does not matter because Module 0 detects it by columns.\n", "Source dataset: https://data.gov.au/data/dataset/road-vehicles-australia-january-2025" ) )
+}
+bitre_road_yearbook_file <- download_if_missing( filename = config$bitre_road_yearbook_filename,
+url = "https://www.bitre.gov.au/sites/default/files/documents/bitre-yearbook-2025-04-road.xlsx" )
+abs_poa_allocation_file <- download_if_missing( filename = config$abs_poa_allocation_filename,
+url = "https://www.abs.gov.au/statistics/standards/australian-statistical-geography-standard-asgs/edition-3-july-2021-june-2026/access-and-downloads/allocation-files/POA_2021_AUST.xlsx" )
+abs_mesh_block_allocation_file <- download_if_missing( filename = config$abs_mesh_block_allocation_filename,
+url = "https://www.abs.gov.au/statistics/standards/australian-statistical-geography-standard-asgs/edition-3-july-2021-june-2026/access-and-downloads/allocation-files/MB_2021_AUST.xlsx" )
+abs_remoteness_allocation_file <- download_if_missing( filename = config$abs_remoteness_allocation_filename,
+url = "https://www.abs.gov.au/statistics/standards/australian-statistical-geography-standard-asgs/edition-3-july-2021-june-2026/access-and-downloads/allocation-files/RA_2021_AUST.xlsx" )
+abs_mesh_block_counts_file <- download_if_missing( filename = config$abs_mesh_block_counts_filename,
+url = "https://www.abs.gov.au/census/guide-census-data/mesh-block-counts/2021/Mesh%20Block%20Counts%2C%202021.xlsx" )
+vehicle_segment_lookup_file <- resolve_existing_file( config$vehicle_segment_lookup_filename, search_directories = c( config$input_dir, project_root, config$raw_dir ) )
+carexpert_vehicle_spec_lookup_file <- resolve_existing_file( config$carexpert_vehicle_spec_lookup_filename, search_directories = c( config$input_dir, project_root, config$raw_dir ) )
+racq_vehicle_value_file <- resolve_existing_file( config$racq_vehicle_value_filename, search_directories = c( config$input_dir, project_root, config$raw_dir ) )
+if ( is.na( vehicle_segment_lookup_file ) ) {
+stop( paste0( "Missing curated vehicle-segment lookup: ", config$vehicle_segment_lookup_filename, "." ) )
+}
+if ( is.na( carexpert_vehicle_spec_lookup_file ) ) {
+stop( paste0( "Missing CarExpert vehicle-specification lookup: ", config$carexpert_vehicle_spec_lookup_filename,
+  ". Place the 95% lookup in the project root, inputs/ or inputs/raw/." ) )
+}
+if ( is.na( racq_vehicle_value_file ) ) {
+stop( paste0( "Missing RACQ vehicle-value calibration file: ", config$racq_vehicle_value_filename, "." ) )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 4. BITRE PASSENGER-VEHICLE GARAGING DATA
+bitre_garaging_raw <- readr::read_csv( bitre_garaging_file, show_col_types = FALSE ) %>% clean_column_names()
+vehicle_type_column <- first_existing_column( bitre_garaging_raw, c( "vehicle_type", "veh_type", "vehicle" ), "BITRE vehicle-type column" )
+state_column <- first_existing_column( bitre_garaging_raw, c( "state_abb", "state_abbreviation", "state_territory", "state" ), "BITRE State column" )
+postcode_column <- first_existing_column( bitre_garaging_raw, c( "garaging_postcode", "registered_postcode", "postcode", "poa_code", "poa", "rpc" ), "BITRE postcode column" )
+vehicle_count_column <- first_existing_column( bitre_garaging_raw, c( "no_vehicles", "number_of_vehicles", "vehicle_count", "vehicles", "count" ), "BITRE vehicle-count column" )
+bitre_garaging <- bitre_garaging_raw %>% transmute( vehicle_type = as.character( .data[[ vehicle_type_column ]] ),
+state = normalise_state( .data[[ state_column ]] ), postcode = normalise_postcode( .data[[ postcode_column ]] ),
+no_vehicles = suppressWarnings( as.numeric( .data[[ vehicle_count_column ]] ) ) ) %>%
+filter( stringr::str_to_lower( vehicle_type ) == "passenger vehicles", !is.na( state ), is.finite( no_vehicles ), no_vehicles >= 0 )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 5. STATE DISTRIBUTION
+state_distribution <- bitre_garaging %>% group_by( state ) %>%
+summarise( passenger_vehicles = sum( no_vehicles ), .groups = "drop" ) %>%
+mutate( probability = passenger_vehicles / sum( passenger_vehicles ) ) %>%
+arrange( match( state, c( "NSW", "VIC", "QLD", "SA", "WA", "TAS", "NT", "ACT" ) ) )
+write_calibration_csv( state_distribution, "state_distribution.csv" )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 6. ABS POSTCODE -> REMOTENESS CROSSWALK
+# 6.1 Postal Area allocation: Mesh Block -> POA
+abs_poa <- readxl::read_excel( abs_poa_allocation_file, sheet = "POA_2021_AUST" ) %>% clean_column_names() %>%
+transmute( mb_code = as.character( mb_code_2021 ), postcode = normalise_postcode( poa_code_2021 ) ) %>%
+filter( !is.na( mb_code ), !is.na( postcode ) )
+# 6.2 Mesh Block allocation: Mesh Block -> SA1 + State
+abs_mb <- readxl::read_excel( abs_mesh_block_allocation_file, sheet = "MB_2021_AUST" ) %>% clean_column_names() %>%
+transmute( mb_code = as.character( mb_code_2021 ), mb_category = as.character( mb_category_2021 ),
+sa1_code = as.character( sa1_code_2021 ), state = normalise_state( state_name_2021 ) ) %>%
+filter( !is.na( mb_code ), !is.na( sa1_code ), !is.na( state ) )
+# 6.3 Remoteness allocation: SA1 -> Remoteness Area
+abs_ra <- readxl::read_excel( abs_remoteness_allocation_file, sheet = "SA1_RA_2021_AUST" ) %>%
+clean_column_names() %>% transmute( sa1_code = as.character( sa1_code_2021 ),
+remoteness_area = normalise_remoteness( ra_name_2021 ), ra_state = normalise_state( state_name_2021 ) ) %>%
+filter( !is.na( sa1_code ), !is.na( remoteness_area ), !is.na( ra_state ) )
+# 6.4 Census Mesh Block dwelling counts
+read_mesh_block_count_sheet <- function( sheet_name ) {
+sheet_data <- readxl::read_excel( abs_mesh_block_counts_file, sheet = sheet_name, skip = 6 ) %>%
+clean_column_names()
+mb_code_col <- first_existing_column( sheet_data, c( "mb_code_2021" ), paste0( "Mesh Block code in ", sheet_name ) )
+dwelling_col <- first_existing_column( sheet_data, c( "dwelling", "dwellings" ), paste0( "dwelling count in ", sheet_name ) )
+person_col <- first_existing_column( sheet_data, c( "person", "persons" ), paste0( "person count in ", sheet_name ) )
+sheet_data %>% transmute( mb_code = as.character( .data[[ mb_code_col ]] ),
+dwelling_count = suppressWarnings( as.numeric( .data[[ dwelling_col ]] ) ),
+person_count = suppressWarnings( as.numeric( .data[[ person_col ]] ) ) ) %>% filter( !is.na( mb_code ) )
+}
+mesh_count_sheets <- readxl::excel_sheets( abs_mesh_block_counts_file )
+mesh_count_sheets <- mesh_count_sheets[ stringr::str_detect( mesh_count_sheets, "^Table [1-9](\\.1)?$" ) ]
+abs_mesh_counts <- purrr::map_dfr( mesh_count_sheets, read_mesh_block_count_sheet ) %>%
+mutate( dwelling_count = replace_na( dwelling_count, 0 ), person_count = replace_na( person_count, 0 ),
+dwelling_count = pmax( dwelling_count, 0 ), person_count = pmax( person_count, 0 ) )
+# 6.5 Join the common Mesh Block geography
+mesh_block_geography <- abs_poa %>% inner_join( abs_mb, by = "mb_code" ) %>%
+inner_join( abs_ra, by = "sa1_code" ) %>% filter( state == ra_state ) %>%
+left_join( abs_mesh_counts, by = "mb_code" ) %>% mutate( dwelling_count = replace_na( dwelling_count, 0 ),
+person_count = replace_na( person_count, 0 ) )
+# 6.6 Dwelling-weight each POA's overlap with Remoteness Areas
+postcode_ra_components <- mesh_block_geography %>% group_by( state, postcode, remoteness_area ) %>%
+summarise( dwelling_count = sum( dwelling_count, na.rm = TRUE ), person_count = sum( person_count, na.rm = TRUE ),
+mesh_block_count = n_distinct( mb_code ), .groups = "drop" )
+postcode_ra_weights <- postcode_ra_components %>% group_by( state, postcode ) %>%
+mutate( postcode_dwelling_count = sum( dwelling_count ), postcode_person_count = sum( person_count ),
+postcode_mesh_block_count = sum( mesh_block_count ),
+weight_basis = case_when( postcode_dwelling_count > 0 ~ "2021 Census dwelling count",
+postcode_person_count > 0 ~ "2021 Census usual resident population fallback", TRUE ~ "Mesh Block count fallback" ),
+mapping_weight = case_when( postcode_dwelling_count > 0 ~ safe_divide( dwelling_count, postcode_dwelling_count ),
+postcode_person_count > 0 ~ safe_divide( person_count, postcode_person_count ),
+TRUE ~ safe_divide( mesh_block_count, postcode_mesh_block_count ) ) ) %>% ungroup() %>%
+dplyr::select( state, postcode, remoteness_area, dwelling_count, person_count, mesh_block_count, weight_basis, mapping_weight ) %>%
+arrange( state, postcode, remoteness_area )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 7. VEHICLE-WEIGHTED STATE x REMOTENESS DISTRIBUTION
+bitre_postcode_vehicles <- bitre_garaging %>% filter( !is.na( postcode ) ) %>% group_by( state, postcode ) %>%
+summarise( passenger_vehicles = sum( no_vehicles ), .groups = "drop" )
+bitre_postcode_mapping_audit <- bitre_postcode_vehicles %>% left_join( postcode_ra_weights %>%
+distinct( state, postcode ) %>% mutate( mapped_to_abs = TRUE ), by = c( "state", "postcode" ) ) %>%
+mutate( mapped_to_abs = replace_na( mapped_to_abs, FALSE ) )
+postcode_mapping_summary <- bitre_postcode_mapping_audit %>% group_by( state ) %>%
+summarise( total_passenger_vehicles = sum( passenger_vehicles, na.rm = TRUE ),
+mapped_passenger_vehicles = sum( if_else( mapped_to_abs, passenger_vehicles, 0 ), na.rm = TRUE ),
+.groups = "drop" ) %>% mutate( unmapped_passenger_vehicles = total_passenger_vehicles - mapped_passenger_vehicles,
+mapping_share = safe_divide( mapped_passenger_vehicles, total_passenger_vehicles ) ) %>%
+transmute( state, passenger_vehicles = total_passenger_vehicles, mapped_passenger_vehicles, unmapped_passenger_vehicles, mapping_share )
+overall_postcode_mapping_share <- safe_divide( sum( postcode_mapping_summary$mapped_passenger_vehicles ), sum( postcode_mapping_summary$passenger_vehicles ) )
+vehicle_remoteness_allocated <- bitre_postcode_vehicles %>%
+inner_join( postcode_ra_weights, by = c( "state", "postcode" ) ) %>%
+mutate( allocated_passenger_vehicles = passenger_vehicles * mapping_weight )
+remoteness_categories <- c( "Major Cities", "Inner Regional", "Outer Regional", "Remote", "Very Remote" )
+state_order <- c( "NSW", "VIC", "QLD", "SA", "WA", "TAS", "NT", "ACT" )
+state_remoteness_distribution <- vehicle_remoteness_allocated %>% group_by( state, remoteness_area ) %>%
+summarise( allocated_passenger_vehicles = sum( allocated_passenger_vehicles ), .groups = "drop" ) %>%
+tidyr::complete( state = state_order, remoteness_area = remoteness_categories,
+fill = list( allocated_passenger_vehicles = 0 ) ) %>% group_by( state ) %>%
+mutate( probability = allocated_passenger_vehicles / sum( allocated_passenger_vehicles ) ) %>% ungroup() %>%
+mutate( state = factor( state, levels = state_order ),
+remoteness_area = factor( remoteness_area, levels = remoteness_categories ) ) %>%
+arrange( state, remoteness_area ) %>% mutate( state = as.character( state ),
+remoteness_area = as.character( remoteness_area ) )
+write_calibration_csv( state_remoteness_distribution, "state_remoteness_distribution.csv" )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 8. COMPARE NEW CROSSWALK WITH THE FROZEN MODULE 1 REFERENCE
+frozen_module1_state_remoteness_reference <- tribble( ~state, ~remoteness_area, ~frozen_probability,
+"NSW", "Major Cities",     0.753838, "NSW", "Inner Regional",   0.200264, "NSW", "Outer Regional",   0.042765, "NSW", "Remote",           0.002532, "NSW", "Very Remote",      0.000601,
+"VIC", "Major Cities",     0.768192, "VIC", "Inner Regional",   0.191946, "VIC", "Outer Regional",   0.039343, "VIC", "Remote",           0.000519, "VIC", "Very Remote",      0.000000,
+"QLD", "Major Cities",     0.676003, "QLD", "Inner Regional",   0.190004, "QLD", "Outer Regional",   0.118103, "QLD", "Remote",           0.010487, "QLD", "Very Remote",      0.005403,
+"SA",  "Major Cities",     0.759016, "SA",  "Inner Regional",   0.104891, "SA",  "Outer Regional",   0.107220, "SA",  "Remote",           0.023126, "SA",  "Very Remote",      0.005747,
+"WA",  "Major Cities",     0.813867, "WA",  "Inner Regional",   0.087507, "WA",  "Outer Regional",   0.062231, "WA",  "Remote",           0.025147, "WA",  "Very Remote",      0.011249,
+"TAS", "Major Cities",     0.000000, "TAS", "Inner Regional",   0.621731, "TAS", "Outer Regional",   0.355046, "TAS", "Remote",           0.018785, "TAS", "Very Remote",      0.004438,
+"NT",  "Major Cities",     0.000000, "NT",  "Inner Regional",   0.000000, "NT",  "Outer Regional",   0.763287, "NT",  "Remote",           0.185878, "NT",  "Very Remote",      0.050835,
+"ACT", "Major Cities",     0.998598, "ACT", "Inner Regional",   0.001402, "ACT", "Outer Regional",   0.000000, "ACT", "Remote",           0.000000, "ACT", "Very Remote",      0.000000 )
+state_remoteness_vs_frozen <- state_remoteness_distribution %>%
+dplyr::select( state, remoteness_area, recalculated_probability = probability ) %>%
+left_join( frozen_module1_state_remoteness_reference, by = c( "state", "remoteness_area" ) ) %>%
+mutate( difference = recalculated_probability - frozen_probability, absolute_difference = abs( difference ) )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 9. DRIVER-AGE DISTRIBUTION FROM BITRE 2025 YEARBOOK
+licence_raw <- readxl::read_excel( bitre_road_yearbook_file, sheet = "Table 4.9a-i", col_names = FALSE )
+table_4_9i_row <- which( stringr::str_detect( as.character( licence_raw[[ 1 ]] ), stringr::fixed( "Table 4.9i" ) ) )
+if ( length( table_4_9i_row ) == 0L ) {
+stop( "Could not locate Table 4.9i in the BITRE 2025 Road Yearbook." )
+}
+table_4_9i_row <- table_4_9i_row[ 1 ]
+licence_section <- licence_raw[ table_4_9i_row:nrow( licence_raw ), 1:11 ]
+persons_row <- which( stringr::str_squish( as.character( licence_section[[ 1 ]] ) ) == "Persons" )
+if ( length( persons_row ) == 0L ) {
+stop( "Could not locate the Persons subsection in BITRE Table 4.9i." )
+}
+persons_row <- persons_row[ 1 ]
+latest_person_row_candidates <- which( stringr::str_squish( as.character( licence_section[[ 1 ]] ) ) == "30 June 2025" )
+latest_person_row_candidates <- latest_person_row_candidates[ latest_person_row_candidates > persons_row ]
+if ( length( latest_person_row_candidates ) == 0L ) {
+stop( "Could not locate the 30 June 2025 Persons row in BITRE Table 4.9i." )
+}
+latest_person_row <- latest_person_row_candidates[ 1 ]
+source_age_bands <- c( "15-19", "20-24", "25-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80+" )
+source_counts <- suppressWarnings( as.numeric( unlist( licence_section[ latest_person_row, 2:10 ] ) ) )
+source_total <- suppressWarnings( as.numeric( licence_section[ latest_person_row, 11 ][[ 1 ]] ) )
+if ( length( source_counts ) != length( source_age_bands ) || any( !is.finite( source_counts ) ) ) {
+stop( "BITRE licence-holder age counts were not extracted correctly." )
+}
+driver_age_source_extract <- tibble( source_age_group = source_age_bands,
+source_licence_holder_count = source_counts )
+driver_age_distribution <- driver_age_source_extract %>%
+mutate( age_group = if_else( source_age_group == "15-19", "18-19", source_age_group ),
+retained_share = if_else( source_age_group == "15-19", config$youngest_band_retained_share, 1 ),
+licence_holder_count = source_licence_holder_count * retained_share ) %>%
+dplyr::select( age_group, source_age_group, source_licence_holder_count, retained_share, licence_holder_count ) %>%
+mutate( probability = licence_holder_count / sum( licence_holder_count ) )
+write_calibration_csv( driver_age_distribution, "driver_age_distribution.csv" )
+driver_age_adjustment_audit <- tibble( source_table = "BITRE 2025 Road Yearbook Table 4.9i - Persons - 30 June 2025",
+source_youngest_band = "15-19", source_youngest_band_count = source_counts[ 1 ], target_simulation_band = "18-19",
+frozen_module1_retained_share = config$youngest_band_retained_share,
+frozen_module1_18_19_count = source_counts[ 1 ] * config$youngest_band_retained_share,
+uniform_within_band_retained_share = config$uniform_18_19_share_of_15_19,
+uniform_within_band_18_19_count = source_counts[ 1 ] * config$uniform_18_19_share_of_15_19,
+difference_in_count = source_counts[ 1 ] * ( config$youngest_band_retained_share - config$uniform_18_19_share_of_15_19 ),
+audit_note = paste( "Frozen Module 1 used 50% of the BITRE 15-19 source band.", "This is retained for baseline reproduction.", "A uniform single-age assumption would use 40%.", "Changing this requires deliberate rerunning of Modules 1-8." ) )
+write_calibration_csv( driver_age_adjustment_audit, "driver_age_adjustment_audit.csv" )
+if ( abs( config$youngest_band_retained_share - config$uniform_18_19_share_of_15_19 ) > 1e-12 ) {
+warning( paste0( "Driver-age audit: BITRE Table 4.9i uses a 15-19 youngest band. ", "Module 0 is retaining ", 100 * config$youngest_band_retained_share, "% for frozen Module 1 compatibility. ", "A uniform 18-19 share would be 40%. See driver_age_adjustment_audit.csv." ) )
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 10. VEHICLE YEAR-OF-MANUFACTURE DISTRIBUTION
+bitre_vehicle_year_raw <- readr::read_csv( bitre_year_file, show_col_types = FALSE ) %>% clean_column_names()
+year_vehicle_type_column <- first_existing_column( bitre_vehicle_year_raw, c( "vehicle_type", "veh_type" ), "vehicle-year vehicle-type column" )
+year_state_column <- first_existing_column( bitre_vehicle_year_raw, c( "state_abb", "state_abbreviation", "state_territory", "state" ), "vehicle-year State column" )
+year_column <- first_existing_column( bitre_vehicle_year_raw, c( "year_of_manufacture", "manufacture_year", "year" ), "year of manufacture column" )
+year_count_column <- first_existing_column( bitre_vehicle_year_raw, c( "no_vehicles", "number_of_vehicles", "vehicle_count", "vehicles", "count" ), "vehicle-year count column" )
+minimum_eligible_manufacture_year <- config$vehicle_reference_year - config$max_standard_vehicle_age
+bitre_vehicle_year <- bitre_vehicle_year_raw %>%
+transmute( vehicle_type = as.character( .data[[ year_vehicle_type_column ]] ),
+state = normalise_state( .data[[ year_state_column ]] ),
+year_of_manufacture = suppressWarnings( as.integer( .data[[ year_column ]] ) ),
+no_vehicles = suppressWarnings( as.numeric( .data[[ year_count_column ]] ) ) ) %>%
+filter( stringr::str_to_lower( vehicle_type ) == "passenger vehicles", !is.na( state ), !is.na( year_of_manufacture ), is.finite( no_vehicles ), no_vehicles > 0 ) %>%
+group_by( state, year_of_manufacture ) %>% summarise( no_vehicles = sum( no_vehicles ), .groups = "drop" )
+vehicle_year_eligibility_summary <- bitre_vehicle_year %>%
+mutate( eligible_standard_market = year_of_manufacture >= minimum_eligible_manufacture_year & year_of_manufacture <= config$vehicle_reference_year ) %>%
+group_by( state ) %>% summarise( registered_passenger_vehicles = sum( no_vehicles ),
+eligible_passenger_vehicles = sum( no_vehicles[ eligible_standard_market ] ),
+excluded_passenger_vehicles = registered_passenger_vehicles - eligible_passenger_vehicles,
+eligible_share = safe_divide( eligible_passenger_vehicles, registered_passenger_vehicles ),
+excluded_share = 1 - eligible_share, .groups = "drop" )
+vehicle_year_distribution_by_state <- bitre_vehicle_year %>%
+filter( year_of_manufacture >= minimum_eligible_manufacture_year, year_of_manufacture <= config$vehicle_reference_year ) %>%
+group_by( state ) %>% mutate( probability = no_vehicles / sum( no_vehicles ) ) %>% ungroup() %>%
+arrange( state, year_of_manufacture )
+write_calibration_csv( vehicle_year_eligibility_summary, "vehicle_year_eligibility_summary.csv" )
+write_calibration_csv( vehicle_year_distribution_by_state, "vehicle_year_distribution_by_state.csv" )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 11. VEHICLE SEGMENT CALIBRATION
+valid_vehicle_segments <- c( "Small Passenger", "Medium/Large Passenger", "Small/Medium SUV", "Large SUV/4WD", "Sports/Performance", "People Mover/Other Passenger" )
+vehicle_segment_lookup <- readr::read_csv( vehicle_segment_lookup_file, show_col_types = FALSE ) %>%
+clean_column_names()
+required_lookup_columns <- c( "year_of_manufacture", "make", "model", "vehicle_segment" )
+missing_lookup_columns <- setdiff( required_lookup_columns, names( vehicle_segment_lookup ) )
+if ( length( missing_lookup_columns ) > 0L ) {
+stop( paste0( "vehicle_segment_lookup.csv is missing: ", paste( missing_lookup_columns, collapse = ", " ) ) )
+}
+vehicle_segment_lookup <- vehicle_segment_lookup %>%
+transmute( year_of_manufacture = as.character( year_of_manufacture ),
+make = stringr::str_squish( stringr::str_to_upper( as.character( make ) ) ),
+model = stringr::str_squish( stringr::str_to_upper( as.character( model ) ) ),
+vehicle_segment = as.character( vehicle_segment ) )
+invalid_segment_labels <- setdiff( unique( na.omit( vehicle_segment_lookup$vehicle_segment ) ), valid_vehicle_segments )
+if ( length( invalid_segment_labels ) > 0L ) {
+stop( paste0( "Invalid vehicle segment label(s): ", paste( invalid_segment_labels, collapse = ", " ) ) )
+}
+bitre_make_model_raw <- readr::read_csv( bitre_make_model_file, show_col_types = FALSE ) %>% clean_column_names()
+mm_vehicle_type_column <- first_existing_column( bitre_make_model_raw, c( "vehicle_type", "veh_type" ), "make/model vehicle-type column" )
+mm_year_column <- first_existing_column( bitre_make_model_raw, c( "year_of_manufacture", "manufacture_year", "year" ), "make/model manufacture-year column" )
+mm_make_column <- first_existing_column( bitre_make_model_raw, c( "make" ), "make column" )
+mm_model_column <- first_existing_column( bitre_make_model_raw, c( "model" ), "model column" )
+mm_count_column <- first_existing_column( bitre_make_model_raw, c( "no_vehicles", "number_of_vehicles", "vehicle_count", "vehicles", "count" ), "make/model vehicle-count column" )
+bitre_make_model <- bitre_make_model_raw %>%
+transmute( vehicle_type = as.character( .data[[ mm_vehicle_type_column ]] ),
+year_of_manufacture = as.character( .data[[ mm_year_column ]] ),
+year_numeric = suppressWarnings( as.integer( .data[[ mm_year_column ]] ) ),
+make = stringr::str_squish( stringr::str_to_upper( as.character( .data[[ mm_make_column ]] ) ) ),
+model = stringr::str_squish( stringr::str_to_upper( as.character( .data[[ mm_model_column ]] ) ) ),
+no_vehicles = suppressWarnings( as.numeric( .data[[ mm_count_column ]] ) ) ) %>%
+filter( stringr::str_to_lower( vehicle_type ) == "passenger vehicles", !is.na( year_numeric ), year_numeric >= minimum_eligible_manufacture_year, year_numeric <= config$vehicle_reference_year, is.finite( no_vehicles ), no_vehicles > 0 ) %>%
+dplyr::select( -vehicle_type )
+classified_make_model <- bitre_make_model %>% left_join( vehicle_segment_lookup %>%
+distinct(), by = c( "year_of_manufacture", "make", "model" ) )
+unclassified_vehicle_weight <- safe_divide( sum( classified_make_model$no_vehicles[ is.na( classified_make_model$vehicle_segment ) ] ), sum( classified_make_model$no_vehicles ) )
+classified_make_model <- classified_make_model %>%
+mutate( vehicle_segment = replace_na( vehicle_segment, "People Mover/Other Passenger" ) )
+vehicle_segment_by_year <- classified_make_model %>%
+group_by( year_of_manufacture = year_numeric, vehicle_segment ) %>%
+summarise( no_vehicles = sum( no_vehicles ), .groups = "drop" ) %>% group_by( year_of_manufacture ) %>%
+mutate( probability = no_vehicles / sum( no_vehicles ) ) %>% ungroup() %>%
+arrange( year_of_manufacture, vehicle_segment )
+vehicle_segment_overall <- classified_make_model %>% group_by( vehicle_segment ) %>%
+summarise( no_vehicles = sum( no_vehicles ), .groups = "drop" ) %>%
+mutate( probability = no_vehicles / sum( no_vehicles ) ) %>% arrange( desc( probability ) )
+write_calibration_csv( vehicle_segment_by_year, "vehicle_segment_by_year.csv" )
+write_calibration_csv( vehicle_segment_overall, "vehicle_segment_overall.csv" )
+write_calibration_csv( tibble( weighted_unclassified_vehicle_share = unclassified_vehicle_weight ), "vehicle_segment_classification_audit.csv" )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 12. MOTIVE-POWER CALIBRATION
+bitre_motive_power_raw <- readr::read_csv( bitre_motive_power_make_model_file, show_col_types = FALSE ) %>%
+clean_column_names()
+mp_vehicle_type_column <- first_existing_column( bitre_motive_power_raw, c( "vehicle_type", "veh_type" ), "motive-power vehicle-type column" )
+mp_year_column <- first_existing_column( bitre_motive_power_raw, c( "year_of_manufacture", "manufacture_year", "year" ), "motive-power manufacture-year column" )
+mp_motive_column <- first_existing_column( bitre_motive_power_raw, c( "motive_power", "motive_power_type", "fuel_type", "fuel", "power_source" ), "motive-power / fuel-type column" )
+mp_make_column <- first_existing_column( bitre_motive_power_raw, c( "make" ), "motive-power make column" )
+mp_model_column <- first_existing_column( bitre_motive_power_raw, c( "model" ), "motive-power model column" )
+mp_count_column <- first_existing_column( bitre_motive_power_raw, c( "no_vehicles", "number_of_vehicles", "vehicle_count", "vehicles", "count" ), "motive-power vehicle-count column" )
+bitre_motive_power_all_years <- bitre_motive_power_raw %>%
+transmute( vehicle_type = as.character( .data[[ mp_vehicle_type_column ]] ),
+year_of_manufacture = as.character( .data[[ mp_year_column ]] ),
+year_numeric = suppressWarnings( as.integer( .data[[ mp_year_column ]] ) ),
+motive_power_raw = as.character( .data[[ mp_motive_column ]] ),
+motive_power = normalise_motive_power( .data[[ mp_motive_column ]] ),
+make = stringr::str_squish( stringr::str_to_upper( as.character( .data[[ mp_make_column ]] ) ) ),
+model = stringr::str_squish( stringr::str_to_upper( as.character( .data[[ mp_model_column ]] ) ) ),
+no_vehicles = suppressWarnings( as.numeric( .data[[ mp_count_column ]] ) ) ) %>%
+filter( stringr::str_to_lower( vehicle_type ) == "passenger vehicles", is.finite( no_vehicles ), no_vehicles > 0 )
+motive_power_unclassified_weight <- safe_divide( sum( bitre_motive_power_all_years$no_vehicles[ is.na( bitre_motive_power_all_years$motive_power ) ] ), sum( bitre_motive_power_all_years$no_vehicles ) )
+unrecognised_motive_power_labels <- bitre_motive_power_all_years %>% filter( is.na( motive_power ) ) %>%
+group_by( motive_power_raw ) %>% summarise( no_vehicles = sum( no_vehicles ), .groups = "drop" ) %>%
+arrange( desc( no_vehicles ) )
+bitre_motive_power_all_years <- bitre_motive_power_all_years %>%
+mutate( motive_power = replace_na( motive_power, "Other/Dual Fuel" ) )
+motive_power_distribution_all_years <- bitre_motive_power_all_years %>% group_by( motive_power ) %>%
+summarise( no_vehicles = sum( no_vehicles ), .groups = "drop" ) %>%
+mutate( probability = no_vehicles / sum( no_vehicles ) ) %>% arrange( desc( probability ) )
+bitre_motive_power_eligible <- bitre_motive_power_all_years %>%
+filter( !is.na( year_numeric ), year_numeric >= minimum_eligible_manufacture_year, year_numeric <= config$vehicle_reference_year )
+classified_motive_power <- bitre_motive_power_eligible %>% left_join( vehicle_segment_lookup %>%
+distinct(), by = c( "year_of_manufacture", "make", "model" ) )
+motive_power_segment_unclassified_weight <- safe_divide( sum( classified_motive_power$no_vehicles[ is.na( classified_motive_power$vehicle_segment ) ] ), sum( classified_motive_power$no_vehicles ) )
+classified_motive_power <- classified_motive_power %>%
+mutate( vehicle_segment = replace_na( vehicle_segment, "People Mover/Other Passenger" ) )
+vehicle_segment_motive_power_by_year <- classified_motive_power %>%
+group_by( year_of_manufacture = year_numeric, vehicle_segment, motive_power ) %>%
+summarise( no_vehicles = sum( no_vehicles ), .groups = "drop" ) %>% group_by( year_of_manufacture ) %>%
+mutate( probability = no_vehicles / sum( no_vehicles ) ) %>% ungroup() %>%
+arrange( year_of_manufacture, vehicle_segment, motive_power )
+vehicle_segment_motive_power_overall <- classified_motive_power %>% group_by( vehicle_segment, motive_power ) %>%
+summarise( no_vehicles = sum( no_vehicles ), .groups = "drop" ) %>%
+mutate( probability = no_vehicles / sum( no_vehicles ) ) %>% arrange( vehicle_segment, motive_power )
+motive_power_distribution <- classified_motive_power %>% group_by( motive_power ) %>%
+summarise( no_vehicles = sum( no_vehicles ), .groups = "drop" ) %>%
+mutate( probability = no_vehicles / sum( no_vehicles ) ) %>% arrange( desc( probability ) )
+write_calibration_csv( vehicle_segment_motive_power_by_year, "vehicle_segment_motive_power_by_year.csv" )
+write_calibration_csv( vehicle_segment_motive_power_overall, "vehicle_segment_motive_power_overall.csv" )
+write_calibration_csv( motive_power_distribution, "motive_power_distribution.csv" )
+write_calibration_csv( tibble( weighted_unclassified_motive_power_share = motive_power_unclassified_weight,
+weighted_unclassified_segment_share_in_motive_power_extract = motive_power_segment_unclassified_weight,
+detailed_source_file = bitre_motive_power_make_model_file ), "motive_power_classification_audit.csv" )
+# 12.1 CAREXPERT VEHICLE-SPECIFICATION CALIBRATION
+# The CarExpert lookup contains representative configurations for BITRE
+# make/model/year combinations. Coverage is measured using BITRE passenger-
+# vehicle counts, not the proportion of lookup rows. Where more than one
+# CarExpert configuration is available for a make/model/year, an exact
+# motive-power match is preferred. Otherwise a representative configuration for
+# the same make/model/year is retained and explicitly flagged.
+carexpert_vehicle_specs_raw <- readr::read_csv( carexpert_vehicle_spec_lookup_file, show_col_types = FALSE ) %>%
+  clean_column_names()
+required_vehicle_spec_columns <- c( "year_of_manufacture", "make", "model", "variant", "motive_power",
+  "engine_capacity_l", "cylinder_count", "power_kw", "power_rpm",
+  "torque_nm", "torque_rpm", "transmission_raw", "transmission_group",
+  "unladen_weight_kg", "source_url", "source_access_date" )
+missing_vehicle_spec_columns <- setdiff( required_vehicle_spec_columns, names(carexpert_vehicle_specs_raw) )
+if (length(missing_vehicle_spec_columns) > 0L) {
+  stop( "CarExpert vehicle specification lookup is missing: ", paste(missing_vehicle_spec_columns, collapse = ", ")
+  )
+}
+carexpert_vehicle_specs <- carexpert_vehicle_specs_raw %>% transmute(
+    year_of_manufacture = suppressWarnings(as.integer(year_of_manufacture)),
+    make = stringr::str_squish(stringr::str_to_upper(as.character(make))),
+    model = stringr::str_squish(stringr::str_to_upper(as.character(model))), variant = as.character(variant),
+    carexpert_motive_power_raw = as.character(motive_power),
+    carexpert_motive_power = normalise_motive_power(motive_power),
+    engine_capacity_l = suppressWarnings(as.numeric(engine_capacity_l)),
+    cylinder_count = suppressWarnings(as.numeric(cylinder_count)),
+    power_kw = suppressWarnings(as.numeric(power_kw)), power_rpm = suppressWarnings(as.numeric(power_rpm)),
+    torque_nm = suppressWarnings(as.numeric(torque_nm)), torque_rpm = suppressWarnings(as.numeric(torque_rpm)),
+    transmission_raw = as.character(transmission_raw), transmission_group = as.character(transmission_group),
+    unladen_weight_kg = suppressWarnings(as.numeric(unladen_weight_kg)), source_url = as.character(source_url),
+    source_access_date = as.character(source_access_date) ) %>% filter( !is.na(year_of_manufacture),
+    year_of_manufacture >= minimum_eligible_manufacture_year, year_of_manufacture <= config$vehicle_reference_year,
+    !is.na(make), make != "", !is.na(model), model != "" ) %>% mutate( spec_completeness = rowSums(cbind(
+      is.finite(power_kw), is.finite(torque_nm), is.finite(unladen_weight_kg),
+      !is.na(transmission_group) & transmission_group != "" )) )
+# One deterministic representative per make/model/year/motive-power combination.
+carexpert_spec_by_motive <- carexpert_vehicle_specs %>% arrange(
+    year_of_manufacture, make, model, carexpert_motive_power, desc(spec_completeness), variant ) %>%
+  group_by(year_of_manufacture, make, model, carexpert_motive_power) %>% slice(1L) %>% ungroup()
+# One deterministic default representative per make/model/year for cases where
+# BITRE motive power does not match the representative CarExpert configuration.
+carexpert_spec_default <- carexpert_vehicle_specs %>% arrange( year_of_manufacture, make, model,
+    desc(spec_completeness), variant ) %>% group_by(year_of_manufacture, make, model) %>% slice(1L) %>% ungroup()
+spec_columns <- c( "variant", "engine_capacity_l", "cylinder_count", "power_kw", "power_rpm",
+  "torque_nm", "torque_rpm", "transmission_raw", "transmission_group",
+  "unladen_weight_kg", "source_url", "source_access_date" )
+carexpert_exact <- carexpert_spec_by_motive %>% select( year_of_manufacture, make, model,
+    motive_power = carexpert_motive_power, all_of(spec_columns) ) %>%
+  rename_with(~paste0("exact_", .x), all_of(spec_columns))
+carexpert_default <- carexpert_spec_default %>% select(year_of_manufacture, make, model, all_of(spec_columns)) %>%
+  rename_with(~paste0("default_", .x), all_of(spec_columns))
+# Aggregate the detailed BITRE extract to the exact joint structure that Module 1
+# will sample: manufacture year x make x model x segment x motive power.
+vehicle_make_model_spec_by_year <- classified_motive_power %>% group_by( year_of_manufacture = year_numeric,
+    make, model, vehicle_segment, motive_power ) %>%
+  summarise(no_vehicles = sum(no_vehicles), .groups = "drop") %>% left_join( carexpert_exact,
+    by = c("year_of_manufacture", "make", "model", "motive_power") ) %>% left_join( carexpert_default,
+    by = c("year_of_manufacture", "make", "model") ) %>% mutate( vehicle_spec_match_status = case_when(
+      !is.na(exact_source_url) ~ "CarExpert motive-power match",
+      !is.na(default_source_url) ~ "CarExpert representative make-model-year",
+      TRUE ~ "Empirical donor fallback required" ), variant = coalesce(exact_variant, default_variant),
+    engine_capacity_l = coalesce(exact_engine_capacity_l, default_engine_capacity_l),
+    cylinder_count = coalesce(exact_cylinder_count, default_cylinder_count),
+    power_kw = coalesce(exact_power_kw, default_power_kw),
+    power_rpm = coalesce(exact_power_rpm, default_power_rpm),
+    torque_nm = coalesce(exact_torque_nm, default_torque_nm),
+    torque_rpm = coalesce(exact_torque_rpm, default_torque_rpm),
+    transmission_raw = coalesce(exact_transmission_raw, default_transmission_raw),
+    transmission_group = coalesce(exact_transmission_group, default_transmission_group),
+    unladen_weight_kg = coalesce(exact_unladen_weight_kg, default_unladen_weight_kg),
+    source_url = coalesce(exact_source_url, default_source_url),
+    source_access_date = coalesce(exact_source_access_date, default_source_access_date),
+    has_carexpert_spec = !is.na(source_url) ) %>% group_by(year_of_manufacture) %>%
+  mutate(probability = no_vehicles / sum(no_vehicles)) %>% ungroup() %>% select(
+    year_of_manufacture, make, model, vehicle_segment, motive_power,
+    no_vehicles, probability, vehicle_spec_match_status, has_carexpert_spec,
+    variant, engine_capacity_l, cylinder_count, power_kw, power_rpm,
+    torque_nm, torque_rpm, transmission_raw, transmission_group, unladen_weight_kg, source_url, source_access_date
+  ) %>% arrange(year_of_manufacture, desc(no_vehicles), make, model, motive_power)
+vehicle_spec_weighted_coverage <- safe_divide( sum(vehicle_make_model_spec_by_year$no_vehicles[
+    vehicle_make_model_spec_by_year$has_carexpert_spec ]), sum(vehicle_make_model_spec_by_year$no_vehicles) )
+vehicle_spec_motive_match_share <- safe_divide( sum(vehicle_make_model_spec_by_year$no_vehicles[
+    vehicle_make_model_spec_by_year$vehicle_spec_match_status == "CarExpert motive-power match" ]),
+  sum(vehicle_make_model_spec_by_year$no_vehicles) )
+# Donor pool used only for the residual unmatched fleet and for isolated missing
+# numerical fields. Module 1 uses a transparent hierarchical donor rule rather
+# than inventing specification values.
+vehicle_spec_donor_pool <- vehicle_make_model_spec_by_year %>% filter(has_carexpert_spec) %>%
+  mutate(donor_weight = no_vehicles) %>% select( year_of_manufacture, make, model, vehicle_segment, motive_power,
+    donor_weight, variant, engine_capacity_l, cylinder_count, power_kw, power_rpm, torque_nm, torque_rpm,
+    transmission_raw, transmission_group, unladen_weight_kg, source_url, source_access_date )
+vehicle_specification_audit <- tibble( metric = c( "BITRE-weighted CarExpert specification coverage",
+    "BITRE-weighted exact motive-power specification match share",
+    "BITRE-weighted residual requiring empirical donor fallback",
+    "Unique CarExpert make-model-year keys in eligible lookup" ), value = c( vehicle_spec_weighted_coverage,
+    vehicle_spec_motive_match_share, 1 - vehicle_spec_weighted_coverage, nrow(carexpert_spec_default) ) )
+write_calibration_csv( vehicle_make_model_spec_by_year, "vehicle_make_model_spec_by_year.csv" )
+write_calibration_csv( vehicle_spec_donor_pool, "vehicle_spec_donor_pool.csv" )
+write_calibration_csv( vehicle_specification_audit, "vehicle_specification_audit.csv" )
+# 12.2 Motive-power annual-kilometre calibration
+motive_power_km_calibration <- tribble( ~motive_power, ~source_mean_annual_km, ~km_relativity, ~evidence_classification,
+"Petrol", 10500, 10500 / 11100, "ABS empirical", "Diesel", 13900, 13900 / 11100, "ABS empirical",
+"Hybrid Electric", NA_real_, 1.00, "Neutral assumption pending separate empirical estimate",
+"Battery/Fuel-cell Electric", 11100, 11100 / 11100, "ABS battery-electric empirical; applied to combined BITRE BEV/FCEV category",
+"Other/Dual Fuel", NA_real_, 1.00, "Neutral assumption pending separate empirical estimate" ) %>%
+mutate( source = "ABS Electric passenger vehicle use, experimental estimates, 12 months ended 30 June 2020",
+source_url = "https://www.abs.gov.au/articles/electric-passenger-vehicle-use-experimental-estimates" )
+write_calibration_csv( motive_power_km_calibration, "motive_power_km_calibration.csv" )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 13. RACQ VEHICLE-VALUE CALIBRATION
+racq_vehicle_values <- readr::read_csv( racq_vehicle_value_file, show_col_types = FALSE ) %>% clean_column_names()
+required_racq_columns <- c( "make", "model", "vehicle_segment", "on_road_price", "residual_value_5yr" )
+missing_racq_columns <- setdiff( required_racq_columns, names( racq_vehicle_values ) )
+if ( length( missing_racq_columns ) > 0L ) {
+stop( paste0( "racq_2025_vehicle_values.csv is missing: ", paste( missing_racq_columns, collapse = ", " ) ) )
+}
+racq_vehicle_values_clean <- racq_vehicle_values %>% transmute( make = as.character( make ),
+model = as.character( model ), vehicle_segment = as.character( vehicle_segment ),
+on_road_price = suppressWarnings( as.numeric( on_road_price ) ),
+residual_value_5yr = suppressWarnings( as.numeric( residual_value_5yr ) ),
+residual_ratio_5yr = residual_value_5yr / on_road_price ) %>%
+filter( vehicle_segment %in% valid_vehicle_segments, is.finite( on_road_price ), is.finite( residual_value_5yr ), on_road_price > 0, residual_value_5yr > 0, residual_ratio_5yr > 0, residual_ratio_5yr < 1 )
+missing_racq_segments <- setdiff( valid_vehicle_segments, unique( racq_vehicle_values_clean$vehicle_segment ) )
+racq_segment_summary <- racq_vehicle_values_clean %>% group_by( vehicle_segment ) %>% summarise( n_models = n(),
+median_on_road_price = median( on_road_price ), median_residual_value_5yr = median( residual_value_5yr ),
+median_residual_ratio_5yr = median( residual_ratio_5yr ), min_on_road_price = min( on_road_price ),
+max_on_road_price = max( on_road_price ), .groups = "drop" )
+write_calibration_csv( racq_vehicle_values_clean, "racq_vehicle_values_clean.csv" )
+write_calibration_csv( racq_segment_summary, "racq_segment_summary.csv" )
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 14. ADDITIONAL QUOTE-STAGE VARIABLE CALIBRATIONS
+# These variables enrich the quote record without forcing unsupported claims
+# relativities into the baseline DGP. Empirical distributions are used where
+# available; otherwise the exact probabilities are explicit simulation choices.
+# Engine power, torque, transmission and unladen weight are now calibrated from
+# the CarExpert make/model/year specification lookup. They are exported as
+# observable vehicle covariates but retain neutral direct claims effects in the
+# baseline DGP because no empirical claims relativity is imposed here.
+parking_distribution_by_remoteness <- tribble( ~remoteness_area, ~overnight_parking, ~probability,
+  "Major Cities", "Garage", 0.38, "Major Cities", "Carport", 0.16,
+  "Major Cities", "Driveway / private property", 0.18, "Major Cities", "Secure car park / locked compound", 0.12,
+  "Major Cities", "Open car park", 0.06, "Major Cities", "Street / open land", 0.10,
+  "Inner Regional", "Garage", 0.43, "Inner Regional", "Carport", 0.20,
+  "Inner Regional", "Driveway / private property", 0.24,
+  "Inner Regional", "Secure car park / locked compound", 0.04, "Inner Regional", "Open car park", 0.03,
+  "Inner Regional", "Street / open land", 0.06, "Outer Regional", "Garage", 0.42,
+  "Outer Regional", "Carport", 0.22, "Outer Regional", "Driveway / private property", 0.27,
+  "Outer Regional", "Secure car park / locked compound", 0.03, "Outer Regional", "Open car park", 0.02,
+  "Outer Regional", "Street / open land", 0.04, "Remote", "Garage", 0.35, "Remote", "Carport", 0.22,
+  "Remote", "Driveway / private property", 0.32, "Remote", "Secure car park / locked compound", 0.03,
+  "Remote", "Open car park", 0.03, "Remote", "Street / open land", 0.05, "Very Remote", "Garage", 0.30,
+  "Very Remote", "Carport", 0.20, "Very Remote", "Driveway / private property", 0.38,
+  "Very Remote", "Secure car park / locked compound", 0.02, "Very Remote", "Open car park", 0.03,
+  "Very Remote", "Street / open land", 0.07 )
+finance_distribution <- tribble( ~finance_status, ~probability, "No finance", 0.67, "Loan / dealer finance", 0.29,
+  "Lease / novated lease", 0.04 )
+vehicle_colour_distribution <- tribble( ~vehicle_colour, ~probability, "White", 0.30, "Black", 0.16,
+  "Silver", 0.15, "Blue", 0.13, "Grey", 0.12, "Red", 0.10, "Other", 0.04 )
+modification_type_distribution <- tribble( ~modification_type, ~probability, "Cosmetic", 0.45,
+  "Wheels / suspension", 0.25, "Performance / engine", 0.20, "Other", 0.10 )
+pre_existing_damage_type_distribution <- tribble( ~damage_type, ~probability, "Existing accident damage", 0.55,
+  "Existing hail damage", 0.25, "Other minor damage", 0.20 )
+annual_km_band_definition <- tribble( ~annual_km_band, ~lower_km, ~upper_km, "0-5,000", 0, 5000,
+  "5,001-10,000", 5000, 10000, "10,001-15,000", 10000, 15000, "15,001-20,000", 15000, 20000,
+  "20,001-30,000", 20000, 30000, "30,000+", 30000, Inf )
+additional_quote_variable_calibrations <- list(
+  parking_distribution_by_remoteness = parking_distribution_by_remoteness,
+  finance_distribution = finance_distribution, vehicle_colour_distribution = vehicle_colour_distribution,
+  modification_type_distribution = modification_type_distribution,
+  pre_existing_damage_type_distribution = pre_existing_damage_type_distribution,
+  annual_km_band_definition = annual_km_band_definition, scalar_assumptions = list(
+    vehicle_modified_probability = 0.05, pre_existing_damage_probability = 0.03,
+    policyholder_is_regular_driver_probability = 0.90, policy_inception_start = as.Date("2021-01-01"),
+    policy_inception_end = as.Date("2025-12-31"), maximum_quote_lead_days = 30L ) )
+saveRDS( additional_quote_variable_calibrations,
+  file.path(config$calibrated_dir, "additional_quote_variable_calibrations.rds") )
+additional_quote_variable_assumption_register <- tribble(
+  ~variable, ~baseline_method_or_value, ~evidence_classification, ~direct_claims_effect_baseline, ~source_or_rationale,
+  "Overnight parking", "P(Parking | Remoteness) using documented scenario probabilities", "Industry-supported variable; exact exposure probabilities are simulation assumptions", "Neutral", "NRMA identifies where the vehicle is kept as a pricing factor; national parking exposure probabilities are not publicly available",
+  "Annual kilometres band", "Deterministic bands: 0-5k, 5-10k, 10-15k, 15-20k, 20-30k, 30k+", "Empirical exposure variable with quote-level coarsening", "Continuous annual kilometres already drives frequency", "Budget Direct and Allianz collect annual-kilometre information",
+  "Vehicle modifications", "5% modified; type probabilities 45/25/20/10", "Industry-supported underwriting variable; prevalence assumed", "Neutral", "Budget Direct and NRMA identify modifications as underwriting/pricing information",
+  "Pre-existing damage", "3% baseline; type probabilities 55/25/20", "Industry-supported underwriting/claims variable; prevalence assumed", "Neutral", "Existing damage is relevant to underwriting and claims settlement",
+  "Policyholder is regular driver", "90% Yes", "Industry-required driver information; prevalence assumed", "Neutral flag; driver_age remains the regular-driver age used by the DGP", "Budget Direct and Allianz require identification of the regular/main driver",
+  "Finance status", "67% no finance, 29% loan/dealer finance, 4% lease/novated lease", "Survey-calibrated distribution", "Neutral", "Australian 2026 vehicle-finance survey calibration",
+  "Transmission", "CarExpert representative make/model/year transmission; hierarchical empirical donor fallback only for unmatched residual fleet", "Externally calibrated representative vehicle specification", "Neutral", "CarExpert historical vehicle specifications; BITRE-weighted coverage validated in Module 0",
+  "Vehicle colour", "30% White, 16% Black, 15% Silver, 13% Blue, 12% Grey, 10% Red, 4% Other", "Survey-calibrated distribution", "Neutral", "Australian ownership survey; Monash research documents association but baseline does not impose causality",
+  "Policy inception date", "Discrete uniform across calendar year 2025", "Industry-realistic field; neutral simulation assumption", "Neutral", "Policy start date is collected in online quotation; no defensible public new-business seasonality distribution available",
+  "Quote date", "Inception date minus 0-30 uniformly sampled days", "Simulation assumption", "Neutral", "Transparent quote lead-time structure",
+  "Engine power / torque", "CarExpert representative make/model/year power and torque; residual missing values use documented empirical donor imputation", "Externally calibrated representative vehicle specification", "Neutral", "CarExpert historical specifications matched to BITRE make/model/year; no direct claims relativity imposed"
+)
+write_calibration_csv( additional_quote_variable_assumption_register,
+  "additional_quote_variable_assumption_register.csv" )
+# 14A. MULTI-YEAR NEW-BUSINESS CALIBRATION (2021-2025)
+# The detailed 2025 calibration above remains the common classification and
+# CarExpert specification layer. This section adds annual fleet weights and
+# calendar-year monetary cost levels for five independent new-business cohorts.
+# Raw annual fleet inputs
+# The 2021-2025 Road Vehicles Australia datasets are available from data.gov.au.
+# Rather than requiring ten manually prepared files, Module 0 retrieves the two
+# required CSV resources for each annual snapshot when they are not already
+# present in inputs/raw/multiyear:
+#   vehicle_state_year_YYYY.csv
+#     vehicle_type, state/state_abb, year_of_manufacture, no_vehicles
+#   vehicle_motive_yom_make_model_YYYY.csv
+#     vehicle_type, year_of_manufacture, motive_power, make, model, no_vehicles
+# This uses the official data.gov.au CKAN metadata API to locate the relevant
+# BITRE resource URLs by resource title. The local copies are retained so later
+# reruns remain reproducible even if the source portal changes.
+# Important 2021 note:
+# BITRE/data.gov.au now provides a retrospective Road Vehicles Australia
+# snapshot for 31 January 2021 derived from state/territory registry data.
+# Therefore the multi-year calibration can use one consistent BITRE/NEVDIS-style
+# source family for 2021-2025 rather than manually transforming ABS TableBuilder
+# output. The ABS 2021 Motor Vehicle Census remains useful as an external
+# reasonableness check but is no longer a required raw input.
+bitre_package_ids <- tibble::tribble( ~policy_year, ~package_id, 2021L, "292a071b-71f0-48c4-8617-c2ee0ca1ff2e",
+  2022L, "c34b68b7-b482-48c4-86ad-a426e22dd761", 2023L, "787053f6-97e1-4170-8e41-32a57277489a",
+  2024L, "767b84b8-6756-460a-96c9-9c073153485a", 2025L, "f6e0a290-7d47-4b88-ac3b-34824b0ab334" )
+normalise_resource_name <- function(x) {
+  x |> stringr::str_to_lower() |> stringr::str_replace_all("[^a-z0-9]+", " ") |> stringr::str_squish()
+}
+find_bitre_resource_url <- function(policy_year, resource_role) {
+  package_id <- bitre_package_ids$package_id[bitre_package_ids$policy_year == policy_year]
+  if (length(package_id) != 1L) stop("No BITRE package id registered for policy year ", policy_year, ".")
+  api_url <- paste0( "https://data.gov.au/data/api/3/action/package_show?id=", package_id )
+  meta <- tryCatch( jsonlite::fromJSON(api_url, simplifyDataFrame = TRUE), error = function(e) stop(
+      "Could not read data.gov.au metadata for ", policy_year, ". ",
+      "Check your internet connection or place the annual CSVs manually in ",
+      config$multiyear_raw_dir, ". Original error: ", conditionMessage(e) ) )
+  if (!isTRUE(meta$success)) stop("data.gov.au metadata request failed for ", policy_year, ".")
+  resources <- meta$result$resources
+  if (!is.data.frame(resources) || nrow(resources) == 0L) {
+    stop("No resources returned for BITRE Road Vehicles Australia ", policy_year, ".")
+  }
+  resource_names <- normalise_resource_name(resources$name)
+  has_all_terms <- function(x, terms) {
+    Reduce( `&`, lapply(terms, function(term) stringr::str_detect(x, stringr::fixed(term))) )
+  }
+  if (resource_role == "state_x_manufacture_year") {
+    # Match by required concepts rather than title word order.
+    # Explicitly exclude postcode, motive-power and make/model resources.
+    keep <- has_all_terms( resource_names, c("vehicle type", "state", "year of manufacture") ) &
+      !stringr::str_detect(resource_names, "postcode|motive power|make|model")
+  } else if (resource_role == "motive_power_x_yom_x_make_x_model") {
+    # BITRE title ordering differs between annual releases. For example,
+    # 2025 uses "... year of manufacture, motive power, make and model ...".
+    # Require all concepts, irrespective of their order.
+    keep <- has_all_terms( resource_names,
+      c("vehicle type", "year of manufacture", "motive power", "make", "model") ) &
+      !stringr::str_detect(resource_names, "state|postcode")
+  } else {
+    stop("Unknown BITRE resource role: ", resource_role)
+  }
+  candidates <- resources[keep, , drop = FALSE]
+  if (nrow(candidates) != 1L) {
+    stop( "Could not uniquely identify the ", resource_role,
+      " BITRE CSV for ", policy_year, ". Candidates found: ",
+      if (nrow(candidates) == 0L) "none" else paste(candidates$name, collapse = " | ") )
+  }
+  candidates$url[[1]]
+}
+download_bitre_annual_resource <- function(policy_year, source_role, destination) {
+  if (file.exists(destination) && file.info(destination)$size > 100L) {
+    return(invisible(destination))
+  }
+  url <- find_bitre_resource_url(policy_year, source_role)
+  dir.create(dirname(destination), recursive = TRUE, showWarnings = FALSE)
+  message("Downloading BITRE ", policy_year, " ", source_role, "...")
+  status <- tryCatch( utils::download.file(url, destination, mode = "wb", quiet = FALSE), error = function(e) e )
+  if (inherits(status, "error") || !file.exists(destination) || file.info(destination)$size <= 100L) {
+    if (file.exists(destination)) unlink(destination)
+    stop( "Automatic download failed for BITRE ", policy_year, " ", source_role, ". ",
+      "You can download the corresponding Road Vehicles Australia CSV manually ",
+      "from data.gov.au and save it as ", basename(destination), "." )
+  }
+  invisible(destination)
+}
+multiyear_source_requirements <- tidyr::crossing( policy_year = config$cohort_years,
+  source_role = c("state_x_manufacture_year", "motive_power_x_yom_x_make_x_model") ) |> mutate(
+    expected_filename = if_else( source_role == "state_x_manufacture_year",
+      paste0("vehicle_state_year_", policy_year, ".csv"),
+      paste0("vehicle_motive_yom_make_model_", policy_year, ".csv") ),
+    provider = "BITRE Road Vehicles Australia / data.gov.au", status = "required; auto-download if absent" )
+purrr::pwalk( multiyear_source_requirements |> transmute( policy_year, source_role,
+      destination = file.path(config$multiyear_raw_dir, expected_filename) ), download_bitre_annual_resource )
+write_calibration_csv(multiyear_source_requirements, "multiyear_source_requirements.csv")
+# Cost-level input
+# annual_cost_indices_2021_2025.csv remains a separate empirical input because
+# it is a constructed pair of annual CPI-derived indices rather than a BITRE
+# vehicle-registration resource.
+cost_index_template_file <- file.path( config$multiyear_raw_dir, "annual_cost_indices_2021_2025_TEMPLATE.csv" )
+cost_index_file <- file.path( config$multiyear_raw_dir, "annual_cost_indices_2021_2025.csv" )
+if (!file.exists(cost_index_file) && !file.exists(cost_index_template_file)) {
+  readr::write_csv( tibble( policy_year = config$cohort_years,
+      claims_cost_level = c(NA_real_, NA_real_, NA_real_, NA_real_, 1),
+      motor_vehicle_price_level = c(NA_real_, NA_real_, NA_real_, NA_real_, 1),
+      claims_cost_source = "ABS Maintenance and repair of motor vehicles CPI; YEAR / 2025",
+      vehicle_price_source = "ABS Motor vehicles CPI; YEAR / 2025" ), cost_index_template_file )
+}
+if (!file.exists(cost_index_file)) {
+  stop( "Missing inputs/raw/multiyear/annual_cost_indices_2021_2025.csv. ",
+    "A template has been written to: ", cost_index_template_file, ". ",
+    "Populate the four historical YEAR/2025 index ratios from the ABS CPI time series and rerun." )
+}
+annual_cost_level_indices <- readr::read_csv(cost_index_file, show_col_types = FALSE) |> transmute(
+    policy_year = as.integer(policy_year), claims_cost_level = as.numeric(claims_cost_level),
+    motor_vehicle_price_level = as.numeric(motor_vehicle_price_level) ) |> arrange(policy_year)
+if (!setequal(annual_cost_level_indices$policy_year, config$cohort_years) ||
+    any(!is.finite(annual_cost_level_indices$claims_cost_level)) ||
+    any(!is.finite(annual_cost_level_indices$motor_vehicle_price_level)) ||
+    any(annual_cost_level_indices$claims_cost_level <= 0) ||
+    any(annual_cost_level_indices$motor_vehicle_price_level <= 0) ||
+    abs(annual_cost_level_indices$claims_cost_level[annual_cost_level_indices$policy_year == 2025] - 1) > 1e-10 ||
+    abs(annual_cost_level_indices$motor_vehicle_price_level[annual_cost_level_indices$policy_year == 2025] - 1) > 1e-10) {
+  stop("annual_cost_indices_2021_2025.csv is invalid. It must cover 2021-2025 with positive finite indices and 2025 = 1.")
+}
+write_calibration_csv(annual_cost_level_indices, "annual_cost_level_indices.csv")
+read_annual_state_year <- function(policy_year) {
+  f <- file.path(config$multiyear_raw_dir, paste0("vehicle_state_year_", policy_year, ".csv"))
+  x <- readr::read_csv(f, show_col_types = FALSE)
+  names(x) <- names(x) |> stringr::str_to_lower() |> stringr::str_replace_all("[^a-z0-9]+", "_") |> stringr::str_replace_all("^_|_$", "")
+  if (!"state" %in% names(x) && "state_abb" %in% names(x)) {
+    x <- x |> dplyr::rename(state = state_abb)
+  }
+  needed <- c("vehicle_type", "state", "year_of_manufacture", "no_vehicles")
+  miss <- setdiff(needed, names(x))
+  if (length(miss) > 0L) stop(basename(f), " missing columns: ", paste(miss, collapse = ", "))
+  x |> transmute( policy_year = as.integer(policy_year), vehicle_type = as.character(vehicle_type),
+      state = normalise_state(state), year_of_manufacture = suppressWarnings(as.integer(year_of_manufacture)),
+      no_vehicles = suppressWarnings(as.numeric(no_vehicles)) ) |> filter(
+      stringr::str_to_lower(vehicle_type) == "passenger vehicles",
+      state %in% sort(unique(state_distribution$state)), is.finite(no_vehicles), no_vehicles > 0,
+      !is.na(year_of_manufacture), year_of_manufacture <= policy_year,
+      year_of_manufacture >= policy_year - config$max_standard_vehicle_age )
+}
+read_annual_make_model <- function(policy_year) {
+  f <- file.path(config$multiyear_raw_dir, paste0("vehicle_motive_yom_make_model_", policy_year, ".csv"))
+  x <- readr::read_csv(f, show_col_types = FALSE)
+  names(x) <- names(x) |> stringr::str_to_lower() |> stringr::str_replace_all("[^a-z0-9]+", "_") |> stringr::str_replace_all("^_|_$", "")
+  needed <- c("vehicle_type", "year_of_manufacture", "motive_power", "make", "model", "no_vehicles")
+  miss <- setdiff(needed, names(x))
+  if (length(miss) > 0L) stop(basename(f), " missing columns: ", paste(miss, collapse = ", "))
+  x |> transmute( policy_year = as.integer(policy_year), vehicle_type = as.character(vehicle_type),
+      year_of_manufacture = suppressWarnings(as.integer(year_of_manufacture)),
+      motive_power = normalise_motive_power(motive_power),
+      make = stringr::str_squish(stringr::str_to_upper(as.character(make))),
+      model = stringr::str_squish(stringr::str_to_upper(as.character(model))),
+      no_vehicles = suppressWarnings(as.numeric(no_vehicles)) ) |> filter(
+      stringr::str_to_lower(vehicle_type) == "passenger vehicles",
+      !is.na(year_of_manufacture), year_of_manufacture <= policy_year,
+      year_of_manufacture >= policy_year - config$max_standard_vehicle_age,
+      !is.na(motive_power), make != "", model != "", is.finite(no_vehicles), no_vehicles > 0 )
+}
+annual_state_year_raw <- purrr::map_dfr(config$cohort_years, read_annual_state_year)
+annual_make_model_raw <- purrr::map_dfr(config$cohort_years, read_annual_make_model)
+state_distribution_by_policy_year <- annual_state_year_raw |> group_by(policy_year, state) |>
+  summarise(no_vehicles = sum(no_vehicles), .groups = "drop") |> group_by(policy_year) |>
+  mutate(probability = no_vehicles / sum(no_vehicles)) |> ungroup() |> arrange(policy_year, state)
+# Broad remoteness composition is held at the empirically derived 2025
+# P(Remoteness | State), while annual State weights vary empirically.
+state_remoteness_distribution_by_policy_year <- tidyr::crossing( policy_year = config$cohort_years,
+  state_remoteness_distribution ) |> arrange(policy_year, state, remoteness_area)
+vehicle_year_distribution_by_policy_year_state <- annual_state_year_raw |>
+  group_by(policy_year, state, year_of_manufacture) |>
+  summarise(no_vehicles = sum(no_vehicles), .groups = "drop") |> group_by(policy_year, state) |>
+  mutate(probability = no_vehicles / sum(no_vehicles)) |> ungroup() |>
+  arrange(policy_year, state, year_of_manufacture)
+# Apply the same curated FCAI/GVG segment classification to each annual fleet.
+annual_make_model_classified <- annual_make_model_raw |> left_join( vehicle_segment_lookup |> transmute(
+        year_of_manufacture = as.integer(year_of_manufacture),
+        make = stringr::str_squish(stringr::str_to_upper(make)),
+        model = stringr::str_squish(stringr::str_to_upper(model)), vehicle_segment ),
+    by = c("year_of_manufacture", "make", "model") ) |>
+  mutate(vehicle_segment = replace_na(vehicle_segment, "People Mover/Other Passenger"))
+vehicle_make_model_distribution_by_policy_year <- annual_make_model_classified |>
+  group_by(policy_year, year_of_manufacture, make, model, motive_power, vehicle_segment) |>
+  summarise(no_vehicles = sum(no_vehicles), .groups = "drop") |> group_by(policy_year, year_of_manufacture) |>
+  mutate(probability = no_vehicles / sum(no_vehicles)) |> ungroup() |>
+  arrange(policy_year, year_of_manufacture, desc(probability))
+vehicle_segment_motive_power_by_policy_year_yom <- annual_make_model_classified |>
+  group_by(policy_year, year_of_manufacture, vehicle_segment, motive_power) |>
+  summarise(no_vehicles = sum(no_vehicles), .groups = "drop") |> group_by(policy_year, year_of_manufacture) |>
+  mutate(probability = no_vehicles / sum(no_vehicles)) |> ungroup() |>
+  arrange(policy_year, year_of_manufacture, vehicle_segment, motive_power)
+write_calibration_csv(state_distribution_by_policy_year, "state_distribution_by_policy_year.csv")
+write_calibration_csv(state_remoteness_distribution_by_policy_year, "state_remoteness_distribution_by_policy_year.csv")
+write_calibration_csv(vehicle_year_distribution_by_policy_year_state, "vehicle_year_distribution_by_policy_year_state.csv")
+write_calibration_csv(vehicle_make_model_distribution_by_policy_year, "vehicle_make_model_distribution_by_policy_year.csv")
+write_calibration_csv(vehicle_segment_motive_power_by_policy_year_yom, "vehicle_segment_motive_power_by_policy_year_yom.csv")
+multiyear_calibration_validation_checks <- bind_rows( state_distribution_by_policy_year |> group_by(policy_year) |>
+    summarise(check_name = "State probabilities sum to one", observed_value = sum(probability), pass = abs(observed_value - 1) < 1e-8, .groups = "drop"),
+  vehicle_year_distribution_by_policy_year_state |> group_by(policy_year, state) |>
+    summarise(check_name = "Vehicle-year probabilities sum to one within year x state", observed_value = sum(probability), pass = abs(observed_value - 1) < 1e-8, .groups = "drop"),
+  vehicle_make_model_distribution_by_policy_year |> group_by(policy_year, year_of_manufacture) |>
+    summarise(check_name = "Make-model probabilities sum to one within cohort x manufacture year", observed_value = sum(probability), pass = abs(observed_value - 1) < 1e-8, .groups = "drop")
+) |> mutate(required_for_progress = TRUE)
+cost_index_checks <- tibble( policy_year = config$cohort_years,
+  check_name = "Annual monetary cost indices positive; 2025 normalised to one",
+  observed_value = annual_cost_level_indices$claims_cost_level,
+  pass = annual_cost_level_indices$claims_cost_level > 0 & annual_cost_level_indices$motor_vehicle_price_level > 0,
+  required_for_progress = TRUE )
+multiyear_calibration_validation_checks <- bind_rows(multiyear_calibration_validation_checks, cost_index_checks)
+write_calibration_csv(multiyear_calibration_validation_checks, "multiyear_calibration_validation_checks.csv")
+if (!all(multiyear_calibration_validation_checks$pass)) {
+  print(multiyear_calibration_validation_checks, n = Inf)
+  stop("At least one required multi-year Module 0 calibration check failed.")
+}
+```
+
+
+```{r, message=FALSE, warning=TRUE}
+# 15. VALIDATION AND AUDIT CHECKS
+max_state_remoteness_baseline_difference <- max( state_remoteness_vs_frozen$absolute_difference, na.rm = TRUE )
+source_age_total_matches <- abs( sum( source_counts ) - source_total ) <= max( 1, 1e-8 * source_total )
+calibration_validation_checks <- tribble( ~check_name, ~observed_value, ~target_or_rule, ~pass, ~required_for_progress,
+"State probabilities sum to one", sum( state_distribution$probability ), "1", check_probability_sum( state_distribution ), TRUE,
+"State x Remoteness probabilities sum to one within each state", NA_real_, "1 within each state", check_probability_sum( state_remoteness_distribution, group_columns = "state" ), TRUE,
+"BITRE postcode vehicle mapping coverage", overall_postcode_mapping_share, paste0( ">=", config$minimum_postcode_vehicle_mapping_share ), is.finite( overall_postcode_mapping_share ) && overall_postcode_mapping_share >= config$minimum_postcode_vehicle_mapping_share, TRUE,
+"BITRE licence-holder source total reconstructed", sum( source_counts ), as.character( source_total ), source_age_total_matches, TRUE,
+"Driver-age probabilities sum to one", sum( driver_age_distribution$probability ), "1", check_probability_sum( driver_age_distribution ), TRUE,
+"Frozen youngest-band share equals uniform 18-19 share of source 15-19 band", config$youngest_band_retained_share, as.character( config$uniform_18_19_share_of_15_19 ), abs( config$youngest_band_retained_share - config$uniform_18_19_share_of_15_19 ) < 1e-12, FALSE,
+"Vehicle-year probabilities sum to one within state", NA_real_, "1 within each state", check_probability_sum( vehicle_year_distribution_by_state, group_columns = "state" ), TRUE,
+"Weighted unclassified vehicle share", unclassified_vehicle_weight, paste0( "<=", config$max_unclassified_vehicle_weight ), is.finite( unclassified_vehicle_weight ) && unclassified_vehicle_weight <= config$max_unclassified_vehicle_weight, TRUE,
+"Motive-power probabilities sum to one", sum( motive_power_distribution$probability ), "1", check_probability_sum( motive_power_distribution ), TRUE,
+"Joint vehicle-segment x motive-power probabilities sum to one within manufacture year", NA_real_, "1 within each manufacture year", check_probability_sum( vehicle_segment_motive_power_by_year, group_columns = "year_of_manufacture" ), TRUE,
+"Weighted unclassified motive-power share", motive_power_unclassified_weight, paste0( "<=", config$max_unclassified_motive_power_weight ), is.finite( motive_power_unclassified_weight ) && motive_power_unclassified_weight <= config$max_unclassified_motive_power_weight, TRUE,
+"Motive-power kilometre calibration covers all five modelling categories", length( setdiff( c( "Petrol", "Diesel", "Hybrid Electric", "Battery/Fuel-cell Electric", "Other/Dual Fuel" ), motive_power_km_calibration$motive_power ) ), "0 missing categories", length( setdiff( c( "Petrol", "Diesel", "Hybrid Electric", "Battery/Fuel-cell Electric", "Other/Dual Fuel" ), motive_power_km_calibration$motive_power ) ) == 0L, TRUE,
+"CarExpert vehicle-specification weighted coverage", vehicle_spec_weighted_coverage, paste0( ">=", config$minimum_vehicle_spec_coverage ), is.finite( vehicle_spec_weighted_coverage ) && vehicle_spec_weighted_coverage >= config$minimum_vehicle_spec_coverage, TRUE,
+"Joint make-model-spec probabilities sum to one within manufacture year", NA_real_, "1 within each manufacture year", check_probability_sum( vehicle_make_model_spec_by_year, group_columns = "year_of_manufacture" ), TRUE,
+"RACQ calibration contains all six simulation segments", length( setdiff( valid_vehicle_segments, unique( racq_vehicle_values_clean$vehicle_segment ) ) ), "0 missing segments", length( missing_racq_segments ) == 0L, TRUE,
+"Additional parking probabilities sum to one within Remoteness Area", NA_real_, "1 within each Remoteness Area", check_probability_sum(parking_distribution_by_remoteness, group_columns = "remoteness_area"), TRUE,
+"Additional finance probabilities sum to one", sum(finance_distribution$probability), "1", check_probability_sum(finance_distribution), TRUE,
+"Additional vehicle-colour probabilities sum to one", sum(vehicle_colour_distribution$probability), "1", check_probability_sum(vehicle_colour_distribution), TRUE,
+"Modification-type probabilities sum to one", sum(modification_type_distribution$probability), "1", check_probability_sum(modification_type_distribution), TRUE,
+"Pre-existing-damage type probabilities sum to one", sum(pre_existing_damage_type_distribution$probability), "1", check_probability_sum(pre_existing_damage_type_distribution), TRUE,
+"Additional scalar quote assumptions are valid probabilities", NA_real_, "All probability assumptions in [0,1]", all(c(additional_quote_variable_calibrations$scalar_assumptions$vehicle_modified_probability, additional_quote_variable_calibrations$scalar_assumptions$pre_existing_damage_probability, additional_quote_variable_calibrations$scalar_assumptions$policyholder_is_regular_driver_probability) >= 0 & c(additional_quote_variable_calibrations$scalar_assumptions$vehicle_modified_probability, additional_quote_variable_calibrations$scalar_assumptions$pre_existing_damage_probability, additional_quote_variable_calibrations$scalar_assumptions$policyholder_is_regular_driver_probability) <= 1), TRUE,
+"Recalculated State x Remoteness differs from frozen Module 1 reference", max_state_remoteness_baseline_difference, "Diagnostic only: review before replacing frozen Module 1 table", is.finite( max_state_remoteness_baseline_difference ), FALSE )
+write_calibration_csv( calibration_validation_checks, "calibration_validation_checks.csv" )
+required_checks <- calibration_validation_checks %>% filter( required_for_progress )
+if ( !all( required_checks$pass ) ) {
+print( calibration_validation_checks, n = Inf )
+stop( paste( "At least one required Module 0 calibration validation check failed.", "Review inputs/calibrated/calibration_validation_checks.csv." ) )
+}
+# 15.1 Frozen-module manifest ---------------------------------------------------
+# This is documentation only; it does not enter any calibration calculation.
+module0_freeze_manifest <- tibble( module = "Module 0", module_version = module_version,
+  freeze_date = ifelse(is.na(module_freeze_date), NA_character_, as.character(module_freeze_date)),
+  carexpert_lookup = config$carexpert_vehicle_spec_lookup_filename,
+  minimum_vehicle_spec_coverage = config$minimum_vehicle_spec_coverage,
+  vehicle_reference_year = config$vehicle_reference_year,
+  maximum_standard_vehicle_age = config$max_standard_vehicle_age, output_contract_file = module0_output_contract )
+write_calibration_csv(module0_freeze_manifest, "module0_freeze_manifest.csv")
+# 16. SUPERVISOR-FACING CALIBRATION SUMMARY
+calibration_summary <- tribble( ~calibration_component, ~method, ~output_file, ~evidence_classification,
+"State", "Passenger-vehicle counts by State converted to categorical probabilities", "state_distribution.csv", "Empirical",
+"Remoteness conditional on State", paste( "BITRE passenger vehicles by postcode are mapped through ABS POA,", "Mesh Block and SA1 geography to ASGS Edition 3 Remoteness Areas;", "postcode overlaps are weighted using 2021 Census dwelling counts" ), "state_remoteness_distribution.csv", "Empirical with transparent geographic crosswalk approximation",
+"Driver age", paste( "BITRE 2025 Table 4.9i national licence-holder counts converted to", "categorical probabilities; youngest source band adjustment audited separately" ), "driver_age_distribution.csv", "Empirical with youngest-band approximation",
+"Vehicle manufacture year", paste( "BITRE passenger-vehicle counts by State and manufacture year;", "ordinary comprehensive market eligibility applied before renormalising" ), "vehicle_year_distribution_by_state.csv", "Empirical plus portfolio-scope restriction",
+"Vehicle segment", paste( "BITRE make/model/year vehicle counts joined to curated GVG/FCAI", "segment classifications and vehicle-weighted" ), "vehicle_segment_by_year.csv", "Empirical vehicle weights plus curated classification",
+"Motive power", paste( "BITRE passenger-vehicle counts by manufacture year, motive power,", "make and model are joined to the existing vehicle-segment lookup;", "segment and motive power are retained as a joint distribution conditional", "on manufacture year" ), "vehicle_segment_motive_power_by_year.csv", "Empirical BITRE classification and probabilities",
+"Vehicle specifications", paste( "BITRE manufacture-year x make x model x motive-power counts are joined", "to a representative CarExpert historical specification lookup; exact motive-power", "matches are preferred and the residual fleet is handled by a documented", "empirical donor hierarchy in Module 1" ), "vehicle_make_model_spec_by_year.csv", "Empirical BITRE weights plus externally calibrated representative CarExpert specifications",
+"Motive-power annual kilometres", paste( "ABS 2019-20 national passenger-vehicle mean kilometres for petrol,", "diesel and battery electric are converted to relative usage factors;", "hybrid and Other/Dual Fuel remain neutral" ), "motive_power_km_calibration.csv", "Empirical where available; neutral assumption for unsupported categories",
+"Vehicle-value calibration", paste( "RACQ on-road prices and five-year residual values cleaned and", "summarised by the six simulation vehicle segments" ), "racq_vehicle_values_clean.csv", "Empirical calibration sample",
+"Additional quote-stage variables", paste("Parking, finance, colour, modification, existing-damage,", "regular-driver, annual-kilometre-band and policy-date assumptions are stored", "in one compact calibration object; variables without public prevalence data", "are explicitly labelled simulation assumptions and carry neutral baseline claims effects"), "additional_quote_variable_calibrations.rds", "Mixed: empirical/survey calibration plus transparent industry-supported assumptions" )
+write_calibration_csv( calibration_summary, "calibration_summary.csv" )
+# Final audit summary -----------------------------------------------------------
+cat("\nModule 0 complete. Required validation checks:\n")
+print(calibration_validation_checks %>% filter(required_for_progress), n = Inf)
+cat("\nCore + multi-year calibrated inputs written to: ", config$calibrated_dir, "\n", sep = "")
+```

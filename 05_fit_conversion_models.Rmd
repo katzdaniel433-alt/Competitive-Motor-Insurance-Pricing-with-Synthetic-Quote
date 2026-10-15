@@ -1,0 +1,1127 @@
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# Fit the six prespecified GLM/GAM conversion specifications.
+# Use validation log loss for model selection and hold out test outcomes.
+# Monte Carlo-safe model selection contract: M5-GLMGAM-OOT-2026-09-18-MC-SAFE
+
+required_packages <- c( "tidyverse", "broom", "mgcv" )
+missing_packages <- required_packages[ !required_packages %in% rownames( installed.packages() ) ]
+if ( length( missing_packages ) > 0L
+) {
+  stop( paste0( "Install the following packages before running Module 5: ", paste( missing_packages,
+        collapse = ", " ) ) )
+}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(broom)
+  library(mgcv)
+})
+options( dplyr.summarise.inform = FALSE, scipen = 999 )
+config <- list( seed = 20260817L,
+  input_dir = file.path("outputs", "conversion_generation"),
+  output_dir = file.path("outputs", "conversion_models"),
+  modelling_file = "conversion_data.csv", upstream_validation_file = "conversion_generation_validation_checks.csv",
+  upstream_vehicle_specification_audit_file = "conversion_vehicle_specification_audit.csv",
+  truth_file = "conversion_truth.rds", 
+  market_scenario_id = "baseline",
+   demand_scenario_id = "baseline",
+  expected_policy_year = 2025L, expected_profiles = 10000L, expected_conversion_train_rows = 6000L,
+  expected_conversion_validation_rows = 2000L, expected_conversion_test_rows = 2000L, probability_clip = 1e-6,
+  calibration_bins = 10L, minimum_training_events = 300L, minimum_validation_events = 75L,
+  minimum_test_events = 75L,
+  # The nonlinear GAM is selected only if its validation improvement over the
+  # interpretable Market-position GLM is material and calibration is acceptable.
+  minimum_relative_logloss_improvement_for_gam = 0.005, gam_calibration_slope_lower = 0.70,
+  gam_calibration_slope_upper = 1.30,
+  # Broad held-out validation gates.
+  final_test_oe_lower = 0.75, final_test_oe_upper = 1.25, final_test_calibration_slope_lower = 0.60,
+  final_test_calibration_slope_upper = 1.40,
+  # Feature-engineering threshold aligned to the baseline DGP's main
+  # relative-price tolerance region. It remains an observable engineered feature;
+  # the fitted model does not receive the true DGP threshold parameter.
+  market_gap_threshold = 0.08, write_plots = TRUE )
+set.seed(
+  config$seed )
+dir.create(
+  config$output_dir, recursive = TRUE, showWarnings = FALSE )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 1. UTILITY FUNCTIONS
+safe_divide <- function( numerator, denominator
+) {
+  result <- numerator / denominator
+  invalid <- !is.finite( result )
+  result[ invalid ] <- NA_real_
+  result
+}
+clip_probability <- function( probability, epsilon = config$probability_clip
+) {
+  pmin( pmax( as.numeric( probability ), epsilon ), 1 - epsilon )
+}
+assert_columns <- function( data, required_columns, data_name
+) {
+  missing_columns <- setdiff( required_columns, names( data ) )
+  if ( length( missing_columns ) > 0L
+  ) {
+    stop( paste0( data_name, " is missing required columns: ", paste( missing_columns, collapse = ", " ) ) )
+  }
+}
+set_reference_level <- function( x, reference_level, variable_name
+) {
+  x_factor <- factor( as.character( x ), ordered = FALSE )
+  if ( !reference_level %in% levels( x_factor )
+  ) {
+    stop( paste0( "Reference level '", reference_level, "' is not present for ", variable_name,
+        ". Available levels: ", paste( levels( x_factor ), collapse = ", " ) ) )
+  }
+  stats::relevel( x_factor, ref = reference_level )
+}
+auc_rank <- function( outcome, probability
+) {
+  outcome <- as.integer( outcome )
+  probability <- as.numeric( probability )
+  keep <- is.finite( outcome ) & is.finite( probability )
+  outcome <- outcome[ keep ]
+  probability <- probability[ keep ]
+  positive_count <- sum( outcome == 1L )
+  negative_count <- sum( outcome == 0L )
+  if ( positive_count == 0L || negative_count == 0L
+  ) {
+    return( NA_real_ )
+  }
+  probability_rank <- rank( probability, ties.method = "average" )
+  positive_rank_sum <- sum( probability_rank[ outcome == 1L ] )
+  ( positive_rank_sum - positive_count * ( positive_count + 1 ) / 2 ) / ( positive_count * negative_count )
+}
+calibration_statistics <- function( outcome, probability
+) {
+  probability <- clip_probability( probability )
+  linear_predictor <- stats::qlogis( probability )
+  intercept_fit <- tryCatch( suppressWarnings( stats::glm( outcome ~ 1, offset = linear_predictor, family =
+            stats::binomial() ) ),
+      error = function(e) {
+        NULL
+      } )
+  slope_fit <- tryCatch( suppressWarnings( stats::glm( outcome ~ linear_predictor, family = stats::binomial() ) ),
+      error = function(e) {
+        NULL
+      } )
+  calibration_intercept <- if ( !is.null( intercept_fit )
+    ) {
+      unname( stats::coef( intercept_fit )[ 1 ] )
+    } else {
+      NA_real_
+    }
+  calibration_slope <- if ( !is.null( slope_fit ) && length( stats::coef( slope_fit ) ) >= 2L
+    ) {
+      unname( stats::coef( slope_fit )[ 2 ] )
+    } else {
+      NA_real_
+    }
+  c( calibration_intercept = calibration_intercept, calibration_slope = calibration_slope )
+}
+expected_calibration_error <- function( outcome, probability, bins = config$calibration_bins
+) {
+  calibration_data <- tibble( outcome = as.integer( outcome ), probability = clip_probability( probability ) ) %>%
+    mutate( calibration_bin = ntile( probability, bins ) ) %>% group_by( calibration_bin ) %>% summarise(
+      observations = n(), observed_rate = mean( outcome ), predicted_rate = mean( probability ), .groups = "drop" )
+  weighted.mean( abs( calibration_data$observed_rate - calibration_data$predicted_rate ), w =
+      calibration_data$observations )
+}
+binary_model_metrics <- function( outcome, probability
+) {
+  outcome <- as.integer( outcome )
+  probability <- clip_probability( probability )
+  if ( length( outcome ) != length( probability )
+  ) {
+    stop( "Outcome and prediction vectors must have equal length." )
+  }
+  calibration <- calibration_statistics( outcome, probability )
+  observed_rate <- mean( outcome )
+  predicted_rate <- mean( probability )
+  top_decile_cutoff <- quantile( probability, probs = 0.90, na.rm = TRUE, names = FALSE )
+  top_decile_event_rate <- mean( outcome[ probability >= top_decile_cutoff ] )
+  tibble( observations = length( outcome ), events = sum( outcome ), observed_conversion_rate = observed_rate,
+    predicted_conversion_rate = predicted_rate, observed_to_expected = safe_divide( observed_rate, predicted_rate
+      ), log_loss = -mean( outcome * log( probability ) + ( 1 - outcome ) * log( 1 - probability ) ), brier_score =
+      mean( ( outcome - probability )^2 ), auc = auc_rank( outcome, probability ), calibration_intercept = unname(
+        calibration[ "calibration_intercept" ] ), calibration_slope = unname( calibration[ "calibration_slope" ] ),
+    expected_calibration_error = expected_calibration_error( outcome, probability ), top_decile_event_rate =
+      top_decile_event_rate, top_decile_lift = safe_divide( top_decile_event_rate, observed_rate ) )
+}
+fit_model_safely <- function( formula, data, model_type, model_name
+) {
+  tryCatch(
+    {
+      fitted_model <- if ( model_type == "glm"
+        ) {
+          stats::glm( formula = formula, data = data, family = stats::binomial( link = "logit" ), control =
+              stats::glm.control( maxit = 100 ) )
+        } else if ( model_type == "gam"
+        ) {
+          mgcv::gam( formula = formula, data = data, family = stats::binomial( link = "logit" ), method = "REML",
+            select = TRUE )
+        } else {
+          stop( paste0( "Unknown model type: ", model_type ) )
+        }
+      if ( inherits( fitted_model, "glm" ) && !inherits( fitted_model, "gam" ) && !isTRUE( fitted_model$converged )
+      ) {
+        stop( paste0( model_name, " did not converge." ) )
+      }
+      fitted_model
+    },
+    error = function(e) {
+      warning( paste0( model_name, " failed to fit: ", conditionMessage( e ) ) )
+      NULL
+    } )
+}
+predict_probability_safely <- function( model, new_data, model_name
+) {
+  if ( is.null( model )
+  ) {
+    return( rep( NA_real_, nrow( new_data ) ) )
+  }
+  predictions <- tryCatch(
+      {
+        stats::predict( model, newdata = new_data, type = "response" )
+      },
+      error = function(e) {
+        stop( paste0( "Prediction failed for ", model_name, ": ", conditionMessage( e ) ) )
+      } )
+  if ( length( predictions ) != nrow( new_data )
+  ) {
+    stop( paste0( "Prediction length mismatch for ", model_name, "." ) )
+  }
+  if ( any( !is.finite( predictions ) )
+  ) {
+    stop( paste0( "Non-finite predictions generated by ", model_name, "." ) )
+  }
+  clip_probability( predictions )
+}
+make_calibration_table <- function( data, probability_column, group_column
+) {
+  probability_symbol <- rlang::ensym( probability_column )
+  group_symbol <- rlang::ensym( group_column )
+  data %>% group_by( !!group_symbol ) %>% summarise( profiles = n(), conversions = sum( focal_conversion ),
+      observed_conversion_rate = mean( focal_conversion ), predicted_conversion_rate = mean( !!probability_symbol
+        ), observed_to_expected = safe_divide( observed_conversion_rate, predicted_conversion_rate ), .groups =
+        "drop" )
+}
+add_wald_intervals <- function( tidy_table
+) {
+  required_columns <- c( "estimate", "std.error" )
+  if ( !all( required_columns %in% names( tidy_table ) )
+  ) {
+    stop( paste0( "Wald intervals require columns: ", paste( required_columns, collapse = ", " ) ) )
+  }
+  tidy_table %>% mutate( conf.low = estimate - qnorm( 0.975 ) * std.error, conf.high = estimate + qnorm( 0.975 ) *
+          std.error, odds_ratio = exp( estimate ), odds_ratio_low = exp( conf.low ), odds_ratio_high = exp(
+          conf.high ) )
+}
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 2. READ AND VALIDATE MODULE 4 INPUT
+modelling_path <- file.path( config$input_dir, config$modelling_file )
+upstream_validation_path <- file.path( config$input_dir, config$upstream_validation_file )
+upstream_vehicle_specification_audit_path <- file.path( config$input_dir,
+  config$upstream_vehicle_specification_audit_file )
+truth_path <- file.path( config$input_dir, config$truth_file )
+required_upstream_files <- c( modelling_path, upstream_validation_path, upstream_vehicle_specification_audit_path,
+  truth_path )
+missing_upstream_files <- required_upstream_files[ !file.exists( required_upstream_files ) ]
+if ( length( missing_upstream_files ) > 0L
+) {
+  stop( paste0( "Required revised Module 4 input(s) not found: ", paste( missing_upstream_files, collapse = ", " ),
+      ". Run the frozen 2025 Module 4 first." ) )
+}
+upstream_validation <- readr::read_csv( upstream_validation_path, show_col_types = FALSE )
+assert_columns( upstream_validation, c( "scenario_id", "demand_scenario_id", "check_name", "pass" ),
+  "conversion_generation_validation_checks.csv" )
+upstream_validation <- upstream_validation %>% mutate( pass = as.logical( pass ) )
+selected_upstream_validation <- upstream_validation %>% filter( scenario_id == config$market_scenario_id,
+    demand_scenario_id == config$demand_scenario_id )
+if ( nrow( selected_upstream_validation ) == 0L
+) {
+  stop( paste0( "No Module 4 validation rows were found for market_scenario_id='", config$market_scenario_id,
+      "' and demand_scenario_id='", config$demand_scenario_id, "'." ) )
+}
+if ( any( is.na( selected_upstream_validation$pass ) | !selected_upstream_validation$pass )
+) {
+  failed_upstream_checks <- selected_upstream_validation %>% filter( is.na( pass ) | !pass ) %>% pull( check_name )
+  stop( paste0( "Module 4 validation failed for the selected scenario: ", paste( failed_upstream_checks,
+        collapse = "; " ) ) )
+}
+upstream_vehicle_specification_audit <- readr::read_csv( upstream_vehicle_specification_audit_path,
+  show_col_types = FALSE )
+assert_columns( upstream_vehicle_specification_audit, c( "market_scenario_id", "policy_year", "profiles",
+    "conversion_train_profiles", "conversion_validation_profiles", "conversion_test_profiles",
+    "valid_engine_capacity_share", "valid_cylinder_count_share", "positive_power_share", "positive_torque_share",
+    "positive_unladen_weight_share", "nonblank_transmission_share" ), "conversion_vehicle_specification_audit.csv"
+)
+selected_upstream_vehicle_specification_audit <- upstream_vehicle_specification_audit %>% filter(
+    market_scenario_id == config$market_scenario_id )
+if ( nrow( selected_upstream_vehicle_specification_audit ) != 1L
+) {
+  stop( "Expected exactly one Module 4 vehicle-specification audit row for the selected market scenario." )
+}
+if ( selected_upstream_vehicle_specification_audit$policy_year[[1]] != config$expected_policy_year ||
+    selected_upstream_vehicle_specification_audit$profiles[[1]] != config$expected_profiles ||
+    selected_upstream_vehicle_specification_audit$conversion_train_profiles[[1]] !=
+      config$expected_conversion_train_rows ||
+    selected_upstream_vehicle_specification_audit$conversion_validation_profiles[[1]] !=
+      config$expected_conversion_validation_rows ||
+    selected_upstream_vehicle_specification_audit$conversion_test_profiles[[1]] !=
+      config$expected_conversion_test_rows
+) {
+  stop( "Module 4 audit does not match the frozen 2025 / 6000-2000-2000 interface." )
+}
+required_vehicle_spec_audit_shares <- c( selected_upstream_vehicle_specification_audit$valid_engine_capacity_share,
+  selected_upstream_vehicle_specification_audit$valid_cylinder_count_share,
+  selected_upstream_vehicle_specification_audit$positive_power_share,
+  selected_upstream_vehicle_specification_audit$positive_torque_share,
+  selected_upstream_vehicle_specification_audit$positive_unladen_weight_share,
+  selected_upstream_vehicle_specification_audit$nonblank_transmission_share )
+if ( any( !is.finite( required_vehicle_spec_audit_shares ) ) || any( required_vehicle_spec_audit_shares < 1 )
+) {
+  stop( "Module 4 vehicle-specification audit is incomplete for the selected scenario." )
+}
+conversion_raw <- readr::read_csv( modelling_path, show_col_types = FALSE )
+required_columns <- c( "scenario_id", "demand_scenario_id", "policy_id", "quote_profile_id", "policy_year",
+  "technical_data_split", "conversion_data_split", "data_split", "state", "remoteness_area", "driver_age",
+  "licence_years", "vehicle_age", "vehicle_segment", "motive_power", "engine_capacity_l", "cylinder_count",
+  "power_kw", "torque_nm", "unladen_weight_kg", "transmission", "vehicle_value", "annual_km", "voluntary_excess",
+  "prior_claims_5yr", "claim_free_years", "estimated_expected_claim_cost", "technical_premium",
+  "focal_price_multiplier", "focal_quote", "focal_benchmark_quote", "n_competitor_quotes", "focal_rank",
+  "focal_rank_percentile", "relative_price_to_cheapest_competitor", "percentage_gap_to_cheapest_competitor",
+  "relative_price_to_market_median", "within_profile_competitor_spread_ratio", "focal_conversion" )
+assert_columns( conversion_raw, required_columns, "conversion_data.csv" )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 3. LEAKAGE CHECK
+explicit_forbidden_columns <- c( "claim_count", "pricing_claim_count", "incurred_claim_cost",
+  "reconstructed_incurred_claim_cost", "gross_claim_cost", "average_paid_claim_cost",
+  "pricing_average_paid_claim_cost", "largest_paid_claim", "total_loss_claim_count", "any_total_loss",
+  "reconstructed_reported_claim_count", "incurred_claim_cost_nominal", "gross_claim_cost_nominal",
+  "average_paid_claim_cost_nominal", "largest_paid_claim_nominal", "driver_sex_audit" )
+truth_or_latent_patterns <- c( "^true_", "^latent_", "price_sensitivity_z", "taste_shock", "utility",
+  "purchase_uniform", "choice_uniform", "participation_intercept", "calibrated_focal_brand_utility",
+  "focal_selected_if_purchase", "^market_purchase$" )
+pattern_forbidden_columns <- names( conversion_raw )[ str_detect( names( conversion_raw ), regex( paste(
+        truth_or_latent_patterns, collapse = "|" ), ignore_case = TRUE ) ) ]
+leaked_columns <- union( intersect( explicit_forbidden_columns, names( conversion_raw ) ),
+  pattern_forbidden_columns )
+if ( length( leaked_columns ) > 0L
+) {
+  stop( paste0( "Module 4 modelling data contain forbidden current-outcome or truth/latent fields: ", paste(
+        leaked_columns, collapse = ", " ) ) )
+}
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 4. SELECT MARKET AND DEMAND SCENARIO
+conversion_data <- conversion_raw %>% filter( scenario_id == config$market_scenario_id, demand_scenario_id ==
+      config$demand_scenario_id ) %>% mutate( policy_year = as.integer( policy_year ), technical_data_split =
+      tolower( trimws( as.character( technical_data_split ) ) ), conversion_data_split = tolower( trimws(
+          as.character( conversion_data_split ) ) ), data_split = tolower( trimws( as.character( data_split ) ) ) )
+if ( nrow( conversion_data ) != config$expected_profiles
+) {
+  stop( paste0( "Module 5 requires exactly ", config$expected_profiles,
+      " rows for the selected 2025 scenario; observed ", nrow( conversion_data ), "." ) )
+}
+if ( anyDuplicated( conversion_data$policy_id ) > 0L || anyDuplicated( conversion_data$quote_profile_id ) > 0L
+) {
+  stop( "Conversion modelling data must contain unique policy_id and quote_profile_id values." )
+}
+if ( !all( conversion_data$policy_year == config$expected_policy_year )
+) {
+  stop( "Module 5 must receive the 2025 quote cohort only." )
+}
+if ( !all( conversion_data$technical_data_split == "test" )
+) {
+  stop( "technical_data_split must remain 'test' for every conversion-modelling row." )
+}
+if ( !all( conversion_data$data_split == conversion_data$conversion_data_split )
+) {
+  stop( "data_split must remain an exact alias of conversion_data_split." )
+}
+expected_conversion_splits <- c( "train", "validation", "test" )
+if ( !setequal( unique( conversion_data$conversion_data_split ), expected_conversion_splits )
+) {
+  stop( "conversion_data_split must contain train, validation and test only." )
+}
+observed_split_counts <- conversion_data %>% count( conversion_data_split, name = "profiles" )
+split_count <- function( split_name
+) {
+  value <- observed_split_counts %>% filter( conversion_data_split == split_name ) %>% pull( profiles )
+  if ( length( value ) != 1L
+  ) {
+    stop( paste0( "Unable to recover exactly one row count for conversion split ", split_name, "." ) )
+  }
+  as.integer( value )
+}
+if ( split_count( "train" ) != config$expected_conversion_train_rows || split_count( "validation" ) !=
+      config$expected_conversion_validation_rows || split_count( "test" ) != config$expected_conversion_test_rows
+) {
+  stop( paste0( "Conversion split does not match the frozen 6000/2000/2000 design. ",
+      "Observed train/validation/test = ", split_count( "train" ), "/", split_count( "validation" ), "/",
+      split_count( "test" ), "." ) )
+}
+if ( !all( conversion_data$focal_conversion %in% c( 0L, 1L ) )
+) {
+  stop( "focal_conversion must be binary." )
+}
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 5. PREPARE OBSERVABLE PREDICTORS
+positive_required_columns <- c( "vehicle_value", "power_kw", "torque_nm", "unladen_weight_kg", "annual_km",
+  "estimated_expected_claim_cost", "technical_premium", "focal_quote", "relative_price_to_cheapest_competitor",
+  "relative_price_to_market_median", "within_profile_competitor_spread_ratio" )
+for ( column_name in positive_required_columns
+) {
+  column_values <- conversion_data[[ column_name ]]
+  if ( any( !is.finite( column_values ) ) || any( column_values <= 0 )
+  ) {
+    stop( paste0( column_name, " must be finite and strictly positive." ) )
+  }
+}
+nonnegative_vehicle_spec_columns <- c( "engine_capacity_l", "cylinder_count" )
+for ( column_name in nonnegative_vehicle_spec_columns
+) {
+  column_values <- conversion_data[[ column_name ]]
+  if ( any( !is.finite( column_values ) ) || any( column_values < 0 )
+  ) {
+    stop( paste0( column_name, " must be finite and non-negative." ) )
+  }
+}
+if ( anyNA( conversion_data$transmission ) || any( trimws( as.character( conversion_data$transmission ) ) == "" )
+) {
+  stop( "transmission must be populated for every conversion-modelling row." )
+}
+n_competitor_quotes_training_mean <- mean( conversion_data$n_competitor_quotes[
+      conversion_data$conversion_data_split == "train" ] )
+if ( !is.finite( n_competitor_quotes_training_mean )
+) {
+  stop( "Unable to calculate TRAIN-only competitor-count centering constant." )
+}
+conversion_data <- conversion_data %>% mutate( conversion_data_split = as.character( conversion_data_split ),
+    data_split = conversion_data_split, focal_conversion = as.integer( focal_conversion ), prior_claims_band =
+      case_when( prior_claims_5yr <= 0 ~ "0", prior_claims_5yr == 1 ~ "1", prior_claims_5yr == 2 ~ "2", TRUE ~ "3+"
+      ), prior_claims_band = factor( prior_claims_band, levels = c( "0", "1", "2", "3+" ) ), state =
+      set_reference_level( state, "NSW", "state" ), remoteness_area = set_reference_level( remoteness_area,
+        "Major Cities", "remoteness_area" ), vehicle_segment = set_reference_level( vehicle_segment,
+        "Small Passenger", "vehicle_segment" ), motive_power = set_reference_level( motive_power, "Petrol",
+        "motive_power" ), transmission = as.character( transmission ), voluntary_excess_factor =
+      set_reference_level( voluntary_excess, "800", "voluntary_excess" ), log_vehicle_value = log( vehicle_value ),
+    log_annual_km = log( annual_km ), log_estimated_loss_cost = log( estimated_expected_claim_cost ),
+    log_technical_premium = log( technical_premium ),
+    # Identifiable own-price movement around the actuarial benchmark.
+    log_focal_to_technical = log( focal_quote / technical_premium ), log_relative_price_to_cheapest = log(
+        relative_price_to_cheapest_competitor ), log_relative_price_to_market_median = log(
+        relative_price_to_market_median ), log_competitor_spread = log( within_profile_competitor_spread_ratio ),
+    gap_above_market_threshold = pmax( percentage_gap_to_cheapest_competitor - config$market_gap_threshold, 0 ),
+    n_competitor_quotes_centered = n_competitor_quotes - n_competitor_quotes_training_mean, age_band = cut(
+        driver_age, breaks = c( 18, 24, 29, 39, 49, 59, 69, 79, Inf ), include.lowest = TRUE, right = TRUE ) )
+if ( !all( conversion_data$conversion_data_split %in% c( "train", "validation", "test" ) ) || !all(
+      conversion_data$data_split == conversion_data$conversion_data_split )
+) {
+  stop( "conversion_data_split/data_split must preserve train, validation and test exactly." )
+}
+prepared_observable_columns <- c( "driver_age", "licence_years", "prior_claims_band", "claim_free_years", "state",
+  "remoteness_area", "vehicle_segment", "motive_power", "engine_capacity_l", "cylinder_count", "power_kw",
+  "torque_nm", "unladen_weight_kg", "transmission", "vehicle_age", "log_vehicle_value", "log_annual_km",
+  "voluntary_excess_factor", "log_technical_premium", "log_focal_to_technical", "log_relative_price_to_cheapest",
+  "focal_rank_percentile", "gap_above_market_threshold", "log_relative_price_to_market_median",
+  "log_competitor_spread", "n_competitor_quotes_centered" )
+if ( anyNA( conversion_data[ prepared_observable_columns ] )
+) {
+  stop( "Prepared conversion predictors contain missing values." )
+}
+finite_numeric_predictors <- c( "driver_age", "licence_years", "claim_free_years", "engine_capacity_l",
+  "cylinder_count", "power_kw", "torque_nm", "unladen_weight_kg", "vehicle_age", "log_vehicle_value",
+  "log_annual_km", "log_technical_premium", "log_focal_to_technical", "log_relative_price_to_cheapest",
+  "focal_rank_percentile", "gap_above_market_threshold", "log_relative_price_to_market_median",
+  "log_competitor_spread", "n_competitor_quotes_centered" )
+if ( any( !is.finite( as.matrix( conversion_data[ finite_numeric_predictors ] ) ) )
+) {
+  stop( "Prepared numeric conversion predictors contain non-finite values." )
+}
+conversion_model_vehicle_specification_audit <- tibble( market_scenario_id = config$market_scenario_id,
+  demand_scenario_id = config$demand_scenario_id, profiles = nrow( conversion_data ), policy_year =
+    config$expected_policy_year, technical_data_split = "test", conversion_train_profiles = split_count( "train" ),
+  conversion_validation_profiles = split_count( "validation" ), conversion_test_profiles = split_count( "test" ),
+  valid_engine_capacity_share = mean( is.finite( conversion_data$engine_capacity_l ) &
+        conversion_data$engine_capacity_l >= 0 ), valid_cylinder_count_share = mean( is.finite(
+        conversion_data$cylinder_count ) & conversion_data$cylinder_count >= 0 ), positive_power_share = mean(
+      is.finite( conversion_data$power_kw ) & conversion_data$power_kw > 0 ), positive_torque_share = mean(
+      is.finite( conversion_data$torque_nm ) & conversion_data$torque_nm > 0 ), positive_unladen_weight_share =
+    mean( is.finite( conversion_data$unladen_weight_kg ) & conversion_data$unladen_weight_kg > 0 ),
+  nonblank_transmission_share = mean( !is.na( conversion_data$transmission ) & trimws( as.character(
+            conversion_data$transmission ) ) != "" ), included_as_direct_conversion_predictors = FALSE, rationale =
+    paste( "Vehicle specifications are retained and audited as observable covariates",
+      "but are not forced into the baseline conversion equations because the",
+      "Module 4 demand DGP assigns no direct effects to these fields.",
+      "The primary Module 5 estimand is the incremental value of own price and", "competitive market position." ) )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 6. TRAIN / VALIDATION / TEST SPLITS
+training_data <- conversion_data %>% filter( conversion_data_split == "train" )
+validation_data <- conversion_data %>% filter( conversion_data_split == "validation" )
+test_data <- conversion_data %>% filter( conversion_data_split == "test" )
+development_data <- conversion_data %>% filter( conversion_data_split %in% c( "train", "validation" ) )
+final_training_data <- development_data
+if ( nrow( training_data ) != config$expected_conversion_train_rows || nrow( validation_data ) !=
+      config$expected_conversion_validation_rows || nrow( test_data ) != config$expected_conversion_test_rows ||
+    nrow( development_data ) != config$expected_conversion_train_rows + config$expected_conversion_validation_rows
+) {
+  stop( "Module 5 partitions do not match the frozen 6000/2000/2000 design." )
+}
+development_test_overlap <- intersect( development_data$quote_profile_id, test_data$quote_profile_id )
+if ( length( development_test_overlap ) > 0L
+) {
+  stop( "Conversion TEST observations have leaked into development data." )
+}
+split_event_counts <- conversion_data %>% group_by( conversion_data_split ) %>% summarise( profiles = n(),
+    conversions = sum( focal_conversion ), nonconversions = sum( focal_conversion == 0L ), conversion_rate = mean(
+        focal_conversion ), .groups = "drop" ) %>% mutate( data_split = conversion_data_split, .after =
+      conversion_data_split )
+training_events <- split_event_counts$conversions[ split_event_counts$conversion_data_split == "train" ]
+validation_events <- split_event_counts$conversions[ split_event_counts$conversion_data_split == "validation" ]
+test_events <- split_event_counts$conversions[ split_event_counts$conversion_data_split == "test" ]
+if ( length( training_events ) != 1L || training_events < config$minimum_training_events
+) {
+  stop( "The training sample has too few focal conversions for stable modelling." )
+}
+if ( length( validation_events ) != 1L || validation_events < config$minimum_validation_events
+) {
+  stop( "The validation sample has too few focal conversions." )
+}
+if ( length( test_events ) != 1L || test_events < config$minimum_test_events
+) {
+  stop( "The test sample has too few focal conversions." )
+}
+if ( any( split_event_counts$conversions <= 0L ) || any( split_event_counts$nonconversions <= 0L )
+) {
+  stop( "Every conversion partition must contain both outcome classes." )
+}
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 7. FACTOR-LEVEL SUPPORT CHECK
+factor_predictors <- c( "prior_claims_band", "state", "remoteness_area", "vehicle_segment", "motive_power",
+  "voluntary_excess_factor" )
+training_level_check <- purrr::map_dfr( factor_predictors, function( variable_name
+    ) {
+      full_levels <- levels( conversion_data[[ variable_name ]] )
+      training_levels <- unique( as.character( training_data[[ variable_name ]] ) )
+      missing_training_levels <- setdiff( full_levels, training_levels )
+      tibble( variable = variable_name, full_levels = paste( full_levels, collapse = " | " ),
+        missing_from_training = paste( missing_training_levels, collapse = " | " ), pass = length(
+            missing_training_levels ) == 0L )
+    } )
+if ( !all( training_level_check$pass )
+) {
+  stop( paste( "Some factor levels are absent from training data.",
+      "Review training_factor_level_check.csv before fitting." ) )
+}
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 8. MODEL FORMULAS
+# Technical/customer information only.
+# The frozen CarExpert vehicle-specification fields are retained and audited in
+# this module but are not forced into the conversion equations. Module 4 assigns
+# no direct demand effects to those fields; the primary research comparison is
+# therefore kept focused on own price and competitive market position.
+# log_technical_premium is included as a compact actuarial risk-level summary.
+# The remaining observable characteristics allow conversion to vary by customer
+# profile even before commercial price and market position are introduced.
+technical_formula <- focal_conversion ~ splines::ns( driver_age, df = 4 ) + splines::ns( licence_years, df = 3 ) +
+    prior_claims_band + splines::ns( claim_free_years, df = 3 ) + state + remoteness_area + vehicle_segment +
+    motive_power + splines::ns( vehicle_age, df = 3 ) + log_vehicle_value + log_annual_km +
+    voluntary_excess_factor + log_technical_premium
+# Adds the focal insurer's commercial price movement around technical premium.
+own_price_formula <- focal_conversion ~ splines::ns( driver_age, df = 4 ) + splines::ns( licence_years, df = 3 ) +
+    prior_claims_band + splines::ns( claim_free_years, df = 3 ) + state + remoteness_area + vehicle_segment +
+    motive_power + splines::ns( vehicle_age, df = 3 ) + log_vehicle_value + log_annual_km +
+    voluntary_excess_factor + log_technical_premium + log_focal_to_technical
+# Adds focal price relative to the cheapest returned competitor.
+relative_price_formula <- focal_conversion ~ splines::ns( driver_age, df = 4 ) + splines::ns( licence_years, df = 3
+    ) + prior_claims_band + splines::ns( claim_free_years, df = 3 ) + state + remoteness_area + vehicle_segment +
+    motive_power + splines::ns( vehicle_age, df = 3 ) + log_vehicle_value + log_annual_km +
+    voluntary_excess_factor + log_technical_premium + log_focal_to_technical + log_relative_price_to_cheapest
+# Adds rank alone as the market-position variable.
+rank_formula <- focal_conversion ~ splines::ns( driver_age, df = 4 ) + splines::ns( licence_years, df = 3 ) +
+    prior_claims_band + splines::ns( claim_free_years, df = 3 ) + state + remoteness_area + vehicle_segment +
+    motive_power + splines::ns( vehicle_age, df = 3 ) + log_vehicle_value + log_annual_km +
+    voluntary_excess_factor + log_technical_premium + log_focal_to_technical + focal_rank_percentile
+# Combined interpretable market-position GLM.
+full_market_glm_formula <- focal_conversion ~ splines::ns( driver_age, df = 4 ) + splines::ns( licence_years,
+      df = 3 ) + prior_claims_band + splines::ns( claim_free_years, df = 3 ) + state + remoteness_area +
+    vehicle_segment + motive_power + splines::ns( vehicle_age, df = 3 ) + log_vehicle_value + log_annual_km +
+    voluntary_excess_factor + log_technical_premium + log_focal_to_technical + log_relative_price_to_cheapest +
+    focal_rank_percentile + gap_above_market_threshold + log_relative_price_to_market_median +
+    log_competitor_spread + n_competitor_quotes_centered
+# Flexible nonlinear market-position comparator.
+# The GAM remains deliberately lower-dimensional than the true Module 4
+# random-utility law and receives no latent taste or heterogeneous sensitivity
+# variables.
+full_market_gam_formula <- focal_conversion ~ s( driver_age, k = 5, bs = "cr" ) + s( licence_years, k = 4,
+      bs = "cr" ) + prior_claims_band + s( claim_free_years, k = 4, bs = "cr" ) + state + remoteness_area +
+    vehicle_segment + motive_power + s( vehicle_age, k = 4, bs = "cr" ) + s( log_vehicle_value, k = 5, bs = "cr"
+    ) + s( log_annual_km, k = 5, bs = "cr" ) + voluntary_excess_factor + s( log_technical_premium, k = 5, bs = "cr"
+    ) + s( log_focal_to_technical, k = 5, bs = "cr" ) + s( log_relative_price_to_cheapest, k = 6, bs = "cr" ) + s(
+      focal_rank_percentile, k = 5, bs = "cr" ) + gap_above_market_threshold + s(
+      log_relative_price_to_market_median, k = 5, bs = "cr" ) + s( log_competitor_spread, k = 4, bs = "cr" ) +
+    n_competitor_quotes_centered
+model_definitions <- list( "Technical-only GLM" = list( formula = technical_formula, type = "glm",
+      benchmark_stage = "Technical/customer characteristics only" ), "Own-price GLM" = list( formula =
+        own_price_formula, type = "glm", benchmark_stage =
+        "Adds focal commercial price relative to technical premium" ), "Relative-price GLM" = list( formula =
+        relative_price_formula, type = "glm", benchmark_stage = "Adds focal price relative to cheapest competitor"
+    ), "Rank GLM" = list( formula = rank_formula, type = "glm", benchmark_stage =
+        "Adds focal quote rank percentile" ), "Market-position GLM" = list( formula = full_market_glm_formula,
+      type = "glm", benchmark_stage = "Adds combined market-position information" ), "Market-position GAM" = list(
+      formula = full_market_gam_formula, type = "gam", benchmark_stage =
+        "Flexible smooth nonlinear market-position model" ) )
+model_formula_register <- purrr::imap_dfr( model_definitions, function( definition, model_name
+    ) {
+      tibble( model = model_name, model_type = definition$type, benchmark_stage = definition$benchmark_stage,
+        formula = paste( deparse( definition$formula, width.cutoff = 500 ), collapse = " " ) )
+    } )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 9. FIT DEVELOPMENT MODELS ON TRAIN ONLY
+development_models <- purrr::imap( model_definitions, function( definition, model_name
+    ) {
+      fit_model_safely( formula = definition$formula, data = training_data, model_type = definition$type,
+        model_name = model_name )
+    } )
+development_models <- development_models[ !purrr::map_lgl( development_models, is.null ) ]
+required_glm_gam_models <- c( "Technical-only GLM", "Own-price GLM", "Relative-price GLM", "Rank GLM",
+  "Market-position GLM", "Market-position GAM" )
+missing_required_models <- setdiff( required_glm_gam_models, names( development_models ) )
+if ( length( missing_required_models ) > 0L
+) {
+  stop( paste0( "Required GLM/GAM models failed to fit: ", paste( missing_required_models, collapse = ", " ) ) )
+}
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 10. DEVELOPMENT PREDICTIONS AND MODEL METRICS
+# TEST is deliberately excluded before model-family selection.
+development_prediction_long <- purrr::imap_dfr( development_models, function( model_object, model_name
+    ) {
+      predicted_probability <- predict_probability_safely( model = model_object, new_data = development_data,
+          model_name = model_name )
+      development_data %>% transmute( scenario_id, demand_scenario_id, policy_id, quote_profile_id, policy_year,
+          technical_data_split, conversion_data_split, data_split, focal_conversion, focal_rank,
+          focal_rank_percentile, relative_price_to_cheapest_competitor, age_band, vehicle_segment, model =
+            model_name, predicted_probability = predicted_probability )
+    } )
+if ( any( development_prediction_long$conversion_data_split == "test" )
+) {
+  stop( "TEST predictions were generated before model selection." )
+}
+development_model_metrics <- development_prediction_long %>% group_by( model, conversion_data_split ) %>%
+  nest() %>% mutate( metrics = purrr::map( data, function( group_data
+        ) {
+          binary_model_metrics( group_data$focal_conversion, group_data$predicted_probability )
+        } ) ) %>% dplyr::select( -data ) %>% unnest( metrics ) %>% ungroup() %>% mutate( data_split =
+      conversion_data_split, .after = conversion_data_split )
+training_aic <- purrr::imap_dfr( development_models, function( model_object, model_name
+    ) {
+      model_aic <- tryCatch( stats::AIC( model_object ),
+          error = function(e) {
+            NA_real_
+          } )
+      tibble( model = model_name, training_aic = model_aic )
+    } )
+development_model_metrics <- development_model_metrics %>% left_join( training_aic, by = "model" ) %>% left_join(
+    model_formula_register %>% dplyr::select( model, model_type, benchmark_stage ), by = "model" )
+validation_model_metrics <- development_model_metrics %>% filter( conversion_data_split == "validation" ) %>%
+  arrange( log_loss )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 11. SELECT FULL MARKET MODEL USING VALIDATION ONLY
+# The Market-position GLM is the parsimonious default. The Market-position GAM is
+# selected only if:
+#   1. validation log loss improves by at least 0.5% relative to the GLM; and
+#   2. the GAM validation calibration slope remains within the pre-specified band.
+# TEST performance is not considered in this decision.
+full_candidate_names <- c( "Market-position GLM", "Market-position GAM" )
+full_validation_metrics <- validation_model_metrics %>% filter( model %in% full_candidate_names )
+if ( nrow( full_validation_metrics ) != 2L
+) {
+  stop( "Both Market-position GLM and Market-position GAM validation metrics are required." )
+}
+glm_validation_row <- full_validation_metrics %>% filter( model == "Market-position GLM" )
+gam_validation_row <- full_validation_metrics %>% filter( model == "Market-position GAM" )
+glm_validation_log_loss <- glm_validation_row$log_loss[ 1 ]
+gam_relative_logloss_improvement_vs_glm <- safe_divide( glm_validation_log_loss - gam_validation_row$log_loss[ 1 ],
+    glm_validation_log_loss )
+gam_validation_calibration_acceptable <- is.finite( gam_validation_row$calibration_slope[ 1 ] ) &&
+  gam_validation_row$calibration_slope[ 1 ] >= config$gam_calibration_slope_lower &&
+  gam_validation_row$calibration_slope[ 1 ] <= config$gam_calibration_slope_upper
+gam_complexity_threshold_met <- is.finite( gam_relative_logloss_improvement_vs_glm ) &&
+  gam_relative_logloss_improvement_vs_glm >= config$minimum_relative_logloss_improvement_for_gam
+full_selection_table <- full_validation_metrics %>% mutate( relative_logloss_improvement_vs_glm = safe_divide(
+        glm_validation_log_loss - log_loss, glm_validation_log_loss ), minimum_required_improvement = if_else(
+        model == "Market-position GAM", config$minimum_relative_logloss_improvement_for_gam, 0 ),
+    calibration_slope_lower = if_else( model == "Market-position GAM", config$gam_calibration_slope_lower, -Inf ),
+    calibration_slope_upper = if_else( model == "Market-position GAM", config$gam_calibration_slope_upper, Inf ),
+    calibration_acceptable = if_else( model == "Market-position GAM", is.finite( calibration_slope ) &
+          calibration_slope >= calibration_slope_lower & calibration_slope <= calibration_slope_upper, TRUE ),
+    complexity_threshold_met = if_else( model == "Market-position GAM", is.finite(
+          relative_logloss_improvement_vs_glm ) & relative_logloss_improvement_vs_glm >=
+            minimum_required_improvement, TRUE ), eligible_for_selection = calibration_acceptable &
+        complexity_threshold_met )
+selected_development_model_name <- "Market-position GLM"
+selection_reason <- paste( "The Market-position GLM was retained because the GAM did not satisfy both",
+    "the pre-specified 0.5% validation log-loss improvement threshold and the",
+    "validation calibration requirement." )
+if ( gam_complexity_threshold_met && gam_validation_calibration_acceptable
+) {
+  selected_development_model_name <- "Market-position GAM"
+  selection_reason <- paste0( "Market-position GAM reduced validation log loss by ", round( 100 *
+          gam_relative_logloss_improvement_vs_glm, 2 ),
+      "% relative to the Market-position GLM and retained acceptable ", "validation calibration." )
+}
+selected_definition <- model_definitions[[ selected_development_model_name ]]
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 12. REFIT ALL PRE-SPECIFIED MODELS ON TRAIN + VALIDATION
+# Refit all six GLM/GAM candidates after the validation-only selection decision.
+# This permits fair held-out TEST reporting without using TEST for selection.
+final_models <- purrr::imap( model_definitions, function( definition, model_name
+    ) {
+      fit_model_safely( formula = definition$formula, data = final_training_data, model_type = definition$type,
+        model_name = paste0( "Final ", model_name ) )
+    } )
+final_models <- final_models[ !purrr::map_lgl( final_models, is.null ) ]
+missing_final_required_models <- setdiff( required_glm_gam_models, names( final_models ) )
+if ( length( missing_final_required_models ) > 0L
+) {
+  stop( paste0( "Required final GLM/GAM models failed to fit: ", paste( missing_final_required_models,
+        collapse = ", " ) ) )
+}
+if ( !selected_development_model_name %in% names( final_models )
+) {
+  stop( "The selected model failed during final train-plus-validation refitting." )
+}
+final_selected_model <- final_models[[ selected_development_model_name ]]
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 13. FINAL TEST PREDICTIONS FOR ALL PRE-SPECIFIED MODELS
+final_prediction_long <- purrr::imap_dfr( final_models, function( model_object, model_name
+    ) {
+      predicted_probability <- predict_probability_safely( model = model_object, new_data = conversion_data,
+          model_name = paste0( "Final ", model_name ) )
+      conversion_data %>% transmute( scenario_id, demand_scenario_id, policy_id, quote_profile_id, policy_year,
+          technical_data_split, conversion_data_split, data_split, focal_conversion, focal_rank,
+          focal_rank_percentile, relative_price_to_cheapest_competitor, age_band, vehicle_segment, model =
+            model_name, predicted_probability = predicted_probability )
+    } )
+test_model_metrics <- final_prediction_long %>% filter( conversion_data_split == "test" ) %>% group_by( model ) %>%
+  nest() %>% mutate( metrics = purrr::map( data, function( group_data
+        ) {
+          binary_model_metrics( group_data$focal_conversion, group_data$predicted_probability )
+        } ) ) %>% dplyr::select( -data ) %>% unnest( metrics ) %>% ungroup() %>% left_join(
+    model_formula_register %>% dplyr::select( model, model_type, benchmark_stage ), by = "model" ) %>% arrange(
+    log_loss )
+selected_model_probability <- final_prediction_long %>% filter( model == selected_development_model_name ) %>%
+  arrange( match( quote_profile_id, conversion_data$quote_profile_id ) ) %>% pull( predicted_probability )
+if ( length( selected_model_probability ) != nrow( conversion_data )
+) {
+  stop( "Selected final-model probability vector does not align with conversion_data." )
+}
+conversion_data$selected_model_probability <- selected_model_probability
+final_selected_test_metrics <- test_model_metrics %>% filter( model == selected_development_model_name ) %>%
+  mutate( fitting_sample = "train + validation", evaluation_sample = "test", selection_reason = selection_reason )
+final_selected_test_predictions <- final_prediction_long %>% filter( model == selected_development_model_name,
+    conversion_data_split == "test" ) %>% arrange( quote_profile_id )
+if ( nrow( final_selected_test_predictions ) != config$expected_conversion_test_rows
+) {
+  stop( "Selected final-model TEST prediction table must contain exactly 2,000 rows." )
+}
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 14. INCREMENTAL VALUE OF MARKET POSITION
+build_incremental_value <- function( metrics_table, evaluation_split
+) {
+  own_price_row <- metrics_table %>% filter( model == "Own-price GLM" )
+  technical_row <- metrics_table %>% filter( model == "Technical-only GLM" )
+  if ( nrow( own_price_row ) != 1L || nrow( technical_row ) != 1L
+  ) {
+    stop( paste0( "Benchmark rows are missing when constructing incremental value for ", evaluation_split, "." ) )
+  }
+  metrics_table %>% mutate( evaluation_split = evaluation_split, technical_log_loss = technical_row$log_loss[ 1 ],
+      own_price_log_loss = own_price_row$log_loss[ 1 ], technical_auc = technical_row$auc[ 1 ], own_price_auc =
+        own_price_row$auc[ 1 ], log_loss_improvement_vs_technical = technical_log_loss - log_loss,
+      relative_log_loss_improvement_vs_technical = safe_divide( technical_log_loss - log_loss, technical_log_loss
+        ), auc_improvement_vs_technical = auc - technical_auc, log_loss_improvement_vs_own_price =
+        own_price_log_loss - log_loss, relative_log_loss_improvement_vs_own_price = safe_divide(
+          own_price_log_loss - log_loss, own_price_log_loss ), auc_improvement_vs_own_price = auc - own_price_auc
+    ) %>% dplyr::select( evaluation_split, model, log_loss, brier_score, auc, expected_calibration_error,
+      log_loss_improvement_vs_technical, relative_log_loss_improvement_vs_technical, auc_improvement_vs_technical,
+      log_loss_improvement_vs_own_price, relative_log_loss_improvement_vs_own_price, auc_improvement_vs_own_price )
+}
+validation_incremental_value <- build_incremental_value( validation_model_metrics, "validation" )
+test_incremental_value <- build_incremental_value( test_model_metrics, "test" )
+incremental_model_value <- bind_rows( validation_incremental_value, test_incremental_value )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 15. KNOWN-TRUTH PROBABILITY RECOVERY
+# IMPORTANT:
+# No truth file is read before this section. All fitting, selection, final
+# refitting and held-out prediction have already been completed.
+truth_probability_recovery <- tibble()
+truth_data <- readRDS( truth_path )
+  assert_columns( truth_data, c( "scenario_id", "demand_scenario_id", "policy_id", "quote_profile_id",
+      "policy_year", "technical_data_split", "conversion_data_split", "data_split",
+      "true_focal_conversion_probability" ), "conversion_truth.rds" )
+  truth_for_validation <- truth_data %>% filter( scenario_id == config$market_scenario_id, demand_scenario_id ==
+        config$demand_scenario_id, policy_year == config$expected_policy_year, technical_data_split == "test",
+      conversion_data_split == "test", data_split == conversion_data_split ) %>% dplyr::select( scenario_id,
+      demand_scenario_id, policy_id, quote_profile_id, true_focal_conversion_probability )
+  final_test_predictions <- final_prediction_long %>% filter( conversion_data_split == "test" ) %>% left_join(
+      truth_for_validation, by = c( "scenario_id", "demand_scenario_id", "policy_id", "quote_profile_id" ) )
+  if ( anyNA( final_test_predictions$true_focal_conversion_probability )
+  ) {
+    stop( "Truth-probability join failed for one or more held-out test profiles." )
+  }
+  truth_probability_recovery <- final_test_predictions %>% group_by( model ) %>% summarise( test_profiles = n(),
+      mean_true_probability = mean( true_focal_conversion_probability ), mean_predicted_probability = mean(
+          predicted_probability ), predicted_to_true_mean_ratio = safe_divide( mean_predicted_probability,
+          mean_true_probability ), probability_mae = mean( abs( predicted_probability -
+              true_focal_conversion_probability ) ), probability_rmse = sqrt( mean( ( predicted_probability -
+                true_focal_conversion_probability )^2 ) ), probability_spearman_correlation = cor(
+          predicted_probability, true_focal_conversion_probability, method = "spearman" ), .groups = "drop" )
+# Truth is evaluation-only and has not been used for fitting or model selection.
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 16. SELECTED-MODEL HELD-OUT CALIBRATION
+selected_test_predictions <- conversion_data %>% filter( data_split == "test" ) %>% mutate( relative_price_decile =
+      ntile( relative_price_to_cheapest_competitor, 10 ), predicted_probability_decile = ntile(
+        selected_model_probability, 10 ) )
+selected_calibration_by_rank <- make_calibration_table( selected_test_predictions, selected_model_probability,
+    focal_rank )
+selected_calibration_by_price_decile <- make_calibration_table( selected_test_predictions,
+    selected_model_probability, relative_price_decile ) %>% left_join( selected_test_predictions %>% group_by(
+        relative_price_decile ) %>% summarise( mean_relative_price_to_cheapest = mean(
+            relative_price_to_cheapest_competitor ), mean_focal_rank = mean( focal_rank ), .groups = "drop" ), by =
+      "relative_price_decile" )
+selected_calibration_by_probability_decile <- make_calibration_table( selected_test_predictions,
+    selected_model_probability, predicted_probability_decile )
+selected_calibration_by_age <- make_calibration_table( selected_test_predictions, selected_model_probability,
+    age_band )
+selected_calibration_by_vehicle_segment <- make_calibration_table( selected_test_predictions,
+    selected_model_probability, vehicle_segment )
+selected_calibration_by_motive_power <- make_calibration_table( selected_test_predictions,
+    selected_model_probability, motive_power )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 17. LOGISTIC COEFFICIENT OUTPUTS
+glm_coefficient_tables <- purrr::imap_dfr( final_models, function( model_object, model_name
+    ) {
+      registered_type <- model_definitions[[ model_name ]]$type
+      if ( !identical( registered_type, "glm" )
+      ) {
+        return( tibble() )
+      }
+      broom::tidy( model_object, conf.int = FALSE ) %>% add_wald_intervals() %>% mutate( model = model_name,
+          .before = 1 )
+    } )
+selected_model_summary <- capture.output( summary( final_selected_model ) )
+selected_model_summary <- c( paste0(
+      "Module 5 architecture: 2025 quote cohort; technical_data_split=test; conversion TRAIN/VALIDATION/TEST = ",
+      config$expected_conversion_train_rows, "/", config$expected_conversion_validation_rows, "/",
+      config$expected_conversion_test_rows ), paste0(
+      "Model-family selection uses VALIDATION only; final refit uses ", config$expected_conversion_train_rows +
+        config$expected_conversion_validation_rows, " TRAIN+VALIDATION rows; predictive evaluation uses TEST only."
+    ), paste0( "TRAIN-only n_competitor_quotes centering mean: ", round( n_competitor_quotes_training_mean, 6 ) ),
+    selected_model_summary )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 18. VALIDATION CHECKS
+selected_validation_metrics <- validation_model_metrics %>% filter( model == selected_development_model_name )
+own_price_validation_metrics <- validation_model_metrics %>% filter( model == "Own-price GLM" )
+market_glm_validation_metrics <- validation_model_metrics %>% filter( model == "Market-position GLM" )
+market_position_incremental_logloss <- own_price_validation_metrics$log_loss[ 1 ] -
+  selected_validation_metrics$log_loss[ 1 ]
+market_position_incremental_auc <- selected_validation_metrics$auc[ 1 ] - own_price_validation_metrics$auc[ 1 ]
+model_validation_checks <- tribble( ~check_name, ~observed_value, ~threshold_description, ~pass,
+  ~required_for_progress, "Rows retained for selected scenario", nrow( conversion_data ), paste0( "= ",
+    config$expected_profiles ), nrow( conversion_data ) == config$expected_profiles, TRUE,
+  "Policy year is 2025 only", as.numeric( all( conversion_data$policy_year == config$expected_policy_year ) ), "1",
+  all( conversion_data$policy_year == config$expected_policy_year ), TRUE,
+  "Technical-pricing provenance is TEST only", as.numeric( all( conversion_data$technical_data_split == "test" ) ),
+  "1", all( conversion_data$technical_data_split == "test" ), TRUE, "data_split matches conversion_data_split",
+  as.numeric( all( conversion_data$data_split == conversion_data$conversion_data_split ) ), "1", all(
+    conversion_data$data_split == conversion_data$conversion_data_split ), TRUE, "Conversion TRAIN rows", nrow(
+    training_data ), paste0( "= ", config$expected_conversion_train_rows ), nrow( training_data ) ==
+    config$expected_conversion_train_rows, TRUE, "Conversion VALIDATION rows", nrow( validation_data ), paste0(
+    "= ", config$expected_conversion_validation_rows ), nrow( validation_data ) ==
+    config$expected_conversion_validation_rows, TRUE, "Conversion TEST rows", nrow( test_data ), paste0( "= ",
+    config$expected_conversion_test_rows ), nrow( test_data ) == config$expected_conversion_test_rows, TRUE,
+  "No development-test quote-profile overlap", length( development_test_overlap ), "0", length(
+    development_test_overlap ) == 0L, TRUE, "No TEST predictions before model selection", sum(
+    development_prediction_long$conversion_data_split == "test" ), "0", !any(
+    development_prediction_long$conversion_data_split == "test" ), TRUE,
+  "TRAIN-only competitor-count centering constant finite", n_competitor_quotes_training_mean, "Finite", is.finite(
+    n_competitor_quotes_training_mean ), TRUE, "Forbidden current-outcome or truth fields absent", length(
+    leaked_columns ), "0", length( leaked_columns ) == 0L, TRUE, "Unique policy IDs", n_distinct(
+    conversion_data$policy_id ), "Equal to row count", n_distinct( conversion_data$policy_id ) == nrow(
+      conversion_data ), TRUE, "Vehicle specification columns retained from Module 4", as.numeric( all( c(
+        "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm", "unladen_weight_kg", "transmission" ) %in%
+        names( conversion_data ) ) ), "1", all( c( "engine_capacity_l", "cylinder_count", "power_kw", "torque_nm",
+      "unladen_weight_kg", "transmission" ) %in% names( conversion_data ) ), TRUE,
+  "Vehicle specification audit complete in Module 5", min( c(
+      conversion_model_vehicle_specification_audit$valid_engine_capacity_share,
+      conversion_model_vehicle_specification_audit$valid_cylinder_count_share,
+      conversion_model_vehicle_specification_audit$positive_power_share,
+      conversion_model_vehicle_specification_audit$positive_torque_share,
+      conversion_model_vehicle_specification_audit$positive_unladen_weight_share,
+      conversion_model_vehicle_specification_audit$nonblank_transmission_share ) ), "1", all( c(
+      conversion_model_vehicle_specification_audit$valid_engine_capacity_share,
+      conversion_model_vehicle_specification_audit$valid_cylinder_count_share,
+      conversion_model_vehicle_specification_audit$positive_power_share,
+      conversion_model_vehicle_specification_audit$positive_torque_share,
+      conversion_model_vehicle_specification_audit$positive_unladen_weight_share,
+      conversion_model_vehicle_specification_audit$nonblank_transmission_share ) == 1 ), TRUE,
+  "Selected final TEST predictions", nrow( final_selected_test_predictions ), paste0( "= ",
+    config$expected_conversion_test_rows ), nrow( final_selected_test_predictions ) ==
+    config$expected_conversion_test_rows, TRUE, "Truth probability recovery produced for all fitted final models",
+  nrow( truth_probability_recovery ), "Equal to number of final models", nrow( truth_probability_recovery ) ==
+    length( final_models ), TRUE, "Training focal conversions", training_events, paste0( ">= ",
+    config$minimum_training_events ), training_events >= config$minimum_training_events, TRUE,
+  "Validation focal conversions", validation_events, paste0( ">= ", config$minimum_validation_events ),
+  validation_events >= config$minimum_validation_events, TRUE, "Test focal conversions", test_events, paste0(
+    ">= ", config$minimum_test_events ), test_events >= config$minimum_test_events, TRUE,
+  "All required GLM/GAM development models fitted", length( missing_required_models ), "0 missing", length(
+    missing_required_models ) == 0L, TRUE, "All required GLM/GAM final models fitted", length(
+    missing_final_required_models ), "0 missing", length( missing_final_required_models ) == 0L, TRUE,
+  "All development predictions finite and inside (0,1)", sum( !is.finite(
+      development_prediction_long$predicted_probability ) | development_prediction_long$predicted_probability <=
+        0 | development_prediction_long$predicted_probability >= 1 ), "0 invalid predictions", all( is.finite(
+      development_prediction_long$predicted_probability ) & development_prediction_long$predicted_probability > 0 &
+      development_prediction_long$predicted_probability < 1 ), TRUE,
+  "All final predictions finite and inside (0,1)", sum( !is.finite( final_prediction_long$predicted_probability ) |
+      final_prediction_long$predicted_probability <= 0 | final_prediction_long$predicted_probability >= 1 ),
+  "0 invalid predictions", all( is.finite( final_prediction_long$predicted_probability ) &
+      final_prediction_long$predicted_probability > 0 & final_prediction_long$predicted_probability < 1 ), TRUE,
+  "Selected final-model test O/E", final_selected_test_metrics$observed_to_expected[ 1 ], paste0(
+    config$final_test_oe_lower, " to ", config$final_test_oe_upper ),
+  final_selected_test_metrics$observed_to_expected[ 1 ] >= config$final_test_oe_lower &&
+  final_selected_test_metrics$observed_to_expected[ 1 ] <= config$final_test_oe_upper,
+  FALSE,"Selected final-model test calibration slope", final_selected_test_metrics$calibration_slope[ 1 ], paste0(
+    config$final_test_calibration_slope_lower, " to ", config$final_test_calibration_slope_upper ), is.finite(
+    final_selected_test_metrics$calibration_slope[ 1 ] ) && final_selected_test_metrics$calibration_slope[ 1 ] >=
+    config$final_test_calibration_slope_lower && final_selected_test_metrics$calibration_slope[ 1 ] <=
+    config$final_test_calibration_slope_upper, FALSE,"GAM validation calibration acceptable for selection",
+  gam_validation_row$calibration_slope[ 1 ], paste0( config$gam_calibration_slope_lower, " to ",
+    config$gam_calibration_slope_upper ), gam_validation_calibration_acceptable, FALSE,
+  "GAM validation log-loss improvement meets complexity threshold", gam_relative_logloss_improvement_vs_glm,
+  paste0( ">=", config$minimum_relative_logloss_improvement_for_gam ), gam_complexity_threshold_met, FALSE,
+  "Selected validation model improves log loss over own-price benchmark", market_position_incremental_logloss,
+  "> 0 is evidence of incremental market-position value", market_position_incremental_logloss > 0, FALSE,
+  "Selected validation model improves AUC over own-price benchmark", market_position_incremental_auc,
+  "> 0 is evidence of incremental ranking value", market_position_incremental_auc > 0, FALSE )
+required_check_failure <- model_validation_checks %>% filter( required_for_progress, !pass )
+if ( nrow( required_check_failure ) > 0L
+) {
+  stop( paste0( "Required Module 5 validation check(s) failed: ", paste( required_check_failure$check_name,
+        collapse = "; " ) ) )
+}
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 19. WRITE OUTPUTS
+# Downstream interface:
+# Retain the selected model, own-price benchmark, full GLM/GAM candidate set, prepared
+# data and metadata objects because Module 6 / Module 7 / Monte Carlo workflows
+# may require model-specific repricing or model-selection diagnostics.
+readr::write_csv( split_event_counts, file.path( config$output_dir, "split_event_counts.csv" ) )
+readr::write_csv( training_level_check, file.path( config$output_dir, "training_factor_level_check.csv" ) )
+readr::write_csv( model_formula_register, file.path( config$output_dir, "model_formula_register.csv" ) )
+readr::write_csv( development_model_metrics, file.path( config$output_dir, "conversion_model_comparison.csv" ) )
+readr::write_csv( validation_model_metrics, file.path( config$output_dir, "validation_model_metrics.csv" ) )
+readr::write_csv( full_selection_table, file.path( config$output_dir, "full_model_selection_table.csv" ) )
+readr::write_csv( test_model_metrics, file.path( config$output_dir, "test_model_metrics.csv" ) )
+readr::write_csv( final_selected_test_metrics, file.path( config$output_dir, "final_selected_test_metrics.csv" ) )
+readr::write_csv( final_selected_test_predictions, file.path( config$output_dir,
+    "final_selected_test_predictions.csv" ) )
+readr::write_csv( incremental_model_value, file.path( config$output_dir, "incremental_model_value.csv" ) )
+readr::write_csv( truth_probability_recovery, file.path( config$output_dir, "truth_probability_recovery.csv" ) )
+readr::write_csv( selected_calibration_by_rank, file.path( config$output_dir, "selected_calibration_by_rank.csv" )
+)
+readr::write_csv( selected_calibration_by_price_decile, file.path( config$output_dir,
+    "selected_calibration_by_relative_price_decile.csv" ) )
+readr::write_csv( selected_calibration_by_probability_decile, file.path( config$output_dir,
+    "selected_calibration_by_probability_decile.csv" ) )
+readr::write_csv( selected_calibration_by_age, file.path( config$output_dir, "selected_calibration_by_age.csv" ) )
+readr::write_csv( selected_calibration_by_vehicle_segment, file.path( config$output_dir,
+    "selected_calibration_by_vehicle_segment.csv" ) )
+readr::write_csv( selected_calibration_by_motive_power, file.path( config$output_dir,
+    "selected_calibration_by_motive_power.csv" ) )
+readr::write_csv( glm_coefficient_tables, file.path( config$output_dir, "logistic_model_coefficients.csv" ) )
+readr::write_csv( model_validation_checks, file.path( config$output_dir, "model_validation_checks.csv" ) )
+readr::write_csv( conversion_model_vehicle_specification_audit, file.path( config$output_dir,
+    "conversion_model_vehicle_specification_audit.csv" ) )
+readr::write_csv( final_prediction_long, file.path( config$output_dir, "final_model_predictions.csv" ) )
+writeLines( selected_model_summary, file.path( config$output_dir, "selected_model_summary.txt" ) )
+saveRDS( development_models, file.path( config$output_dir, "development_conversion_models.rds" ) )
+saveRDS( final_models, file.path( config$output_dir, "final_conversion_models.rds" ) )
+saveRDS( final_selected_model, file.path( config$output_dir, "final_selected_conversion_model.rds" ) )
+saveRDS( final_models[[ "Own-price GLM" ]], file.path( config$output_dir, "final_own_price_conversion_model.rds" )
+)
+saveRDS( conversion_data, file.path( config$output_dir, "prepared_conversion_data.rds" ) )
+saveRDS( development_prediction_long, file.path( config$output_dir, "development_model_predictions.rds" ) )
+saveRDS( final_prediction_long, file.path( config$output_dir, "final_model_predictions.rds" ) )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 20. SELECTED-MODEL METADATA FOR MODULE 6
+selected_model_metadata <- list( model_family_scope = c( "glm", "gam" ), candidate_models = names(
+      model_definitions ), selected_model_name = selected_development_model_name, selected_model_type =
+    selected_definition$type, selection_reason = selection_reason, market_scenario_id = config$market_scenario_id,
+  demand_scenario_id = config$demand_scenario_id, module_version = "M5-GLMGAM-OOT-2026-09-18",
+  quote_market_policy_year = config$expected_policy_year, quote_market_profiles = config$expected_profiles,
+  technical_data_split = "test", conversion_split_counts = c( train = config$expected_conversion_train_rows,
+      validation = config$expected_conversion_validation_rows, test = config$expected_conversion_test_rows ),
+  development_test_overlap = length( development_test_overlap ), development_test_predictions_generated = any(
+      development_prediction_long$conversion_data_split == "test" ), formula = selected_definition$formula,
+  gam_selection_rule = list( minimum_relative_logloss_improvement =
+        config$minimum_relative_logloss_improvement_for_gam, calibration_slope_lower =
+        config$gam_calibration_slope_lower, calibration_slope_upper = config$gam_calibration_slope_upper,
+      validation_relative_logloss_improvement_vs_glm = gam_relative_logloss_improvement_vs_glm,
+      validation_calibration_acceptable = gam_validation_calibration_acceptable, selected = identical(
+          selected_development_model_name, "Market-position GAM" ) ), probability_clip = config$probability_clip,
+  fitting_sample = "conversion TRAIN + VALIDATION (6,000 + 2,000)", model_selection_sample =
+    "conversion VALIDATION only (2,000)", primary_evaluation_sample = "conversion TEST only (2,000)",
+  n_competitor_quotes_centering_sample = "conversion TRAIN only", n_competitor_quotes_training_mean =
+    n_competitor_quotes_training_mean, market_gap_threshold = config$market_gap_threshold, feature_engineering =
+    list( log_focal_to_technical = "log(focal_quote / technical_premium)", log_relative_price_to_cheapest =
+        "log(relative_price_to_cheapest_competitor)", focal_rank_percentile =
+        "(focal_rank - 1) / n_competitor_quotes", gap_above_market_threshold = paste0(
+          "pmax(percentage_gap_to_cheapest_competitor - ", config$market_gap_threshold, ", 0)" ),
+      log_relative_price_to_market_median = "log(relative_price_to_market_median)", log_competitor_spread =
+        "log(within_profile_competitor_spread_ratio)", n_competitor_quotes_centered = paste0(
+          "n_competitor_quotes - ", n_competitor_quotes_training_mean, " (TRAIN-only mean)" ) ),
+  factor_reference_levels = list( prior_claims_band = "0", state = "NSW", remoteness_area = "Major Cities",
+      vehicle_segment = "Small Passenger", motive_power = "Petrol", voluntary_excess_factor = "800" ),
+  truth_used_for_fitting = FALSE )
+saveRDS( selected_model_metadata, file.path( config$output_dir, "selected_model_metadata.rds" ) )
+selected_model_bundle <- list( model = final_selected_model, metadata = selected_model_metadata )
+saveRDS( selected_model_bundle, file.path( config$output_dir, "final_selected_conversion_model_bundle.rds" ) )
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 21. DIAGNOSTIC PLOTS
+if ( isTRUE( config$write_plots )
+) {
+  model_order <- validation_model_metrics %>% arrange( log_loss ) %>% pull( model )
+  p_validation_logloss <- validation_model_metrics %>% mutate( model = factor( model, levels = rev( model_order ) )
+    ) %>% ggplot( aes( x = model, y = log_loss ) ) + geom_col() + coord_flip() + labs( x = NULL,
+      y = "Validation log loss", title = "Conversion-model validation comparison" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "01_validation_log_loss.png" ), p_validation_logloss, width = 8,
+    height = 5, dpi = 300 )
+  p_validation_auc <- validation_model_metrics %>% mutate( model = factor( model, levels = rev( model_order ) )
+    ) %>% ggplot( aes( x = model, y = auc ) ) + geom_col() + coord_flip() + labs( x = NULL, y = "Validation AUC",
+      title = "Conversion-model discrimination" ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "02_validation_auc.png" ), p_validation_auc, width = 8, height = 5,
+    dpi = 300 )
+  p_calibration <- selected_calibration_by_probability_decile %>% ggplot( aes( x = predicted_conversion_rate, y =
+          observed_conversion_rate ) ) + geom_point() + geom_abline( slope = 1, intercept = 0, linetype = 2 ) +
+    labs( x = "Mean predicted conversion", y = "Observed conversion", title = "Held-out selected-model calibration"
+    ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "03_selected_model_calibration.png" ), p_calibration, width = 6,
+    height = 6, dpi = 300 )
+  p_rank_calibration <- selected_calibration_by_rank %>% dplyr::select( focal_rank, observed_conversion_rate,
+      predicted_conversion_rate ) %>% pivot_longer( cols = c( observed_conversion_rate, predicted_conversion_rate
+      ), names_to = "series", values_to = "conversion_rate" ) %>% mutate( series = recode( series,
+          observed_conversion_rate = "Observed", predicted_conversion_rate = "Predicted" ) ) %>% ggplot( aes( x =
+          focal_rank, y = conversion_rate, linetype = series ) ) + geom_line() + geom_point() + labs(
+      x = "Focal quote rank", y = "Conversion rate", linetype = NULL, title = "Held-out conversion by market rank"
+    ) + theme_minimal()
+  ggsave( file.path( config$output_dir, "04_selected_model_conversion_by_rank.png" ), p_rank_calibration,
+    width = 8, height = 5, dpi = 300 )
+  truth_plot_data <- final_prediction_long %>% filter( data_split == "test", model %in% c( "Own-price GLM",
+            selected_development_model_name ) ) %>% left_join( truth_data %>% filter( scenario_id ==
+              config$market_scenario_id, demand_scenario_id == config$demand_scenario_id, data_split == "test"
+          ) %>% dplyr::select( policy_id, quote_profile_id, true_focal_conversion_probability ), by = c(
+          "policy_id", "quote_profile_id" ) )
+  p_truth_recovery <- ggplot( truth_plot_data, aes( x = true_focal_conversion_probability, y =
+            predicted_probability ) ) + geom_point( alpha = 0.15 ) + facet_wrap( vars( model ) ) + geom_abline(
+        slope = 1, intercept = 0, linetype = 2 ) + labs( x = "Known true conversion probability",
+        y = "Fitted conversion probability", title = "Held-out recovery of synthetic conversion truth" ) +
+      theme_minimal()
+  ggsave( file.path( config$output_dir, "05_truth_probability_recovery.png" ), p_truth_recovery, width = 10,
+    height = 5, dpi = 300 )
+}
+```
+
+
+```{r module-5-conversion-models, message=FALSE, warning=TRUE}
+# 22. PRINT KEY RESULTS
+cat( "\nModule 5 sample architecture:\n" )
+cat( "Policy year: ", config$expected_policy_year, "\nProfiles: ", nrow( conversion_data ),
+  "\nTechnical-pricing provenance: TEST only", "\nConversion split TRAIN/VALIDATION/TEST: ", nrow( training_data ),
+  "/", nrow( validation_data ), "/", nrow( test_data ), "\nDevelopment TEST predictions before selection: ", sum(
+    development_prediction_long$conversion_data_split == "test" ), "\n", sep = "" )
+cat( "\n", "============================================================\n", "MODULE 5 COMPLETE\n",
+  "============================================================\n", sep = "" )
+cat( "\nMarket scenario: ", config$market_scenario_id, "\n", sep = "" )
+cat( "Demand scenario: ", config$demand_scenario_id, "\n", sep = "" )
+cat( "\nSplit event counts:\n" )
+print( split_event_counts, n = Inf )
+cat( "\nValidation model comparison:\n" )
+print( validation_model_metrics, n = Inf )
+cat( "\nFull-model validation selection table:\n" )
+print( full_selection_table, n = Inf )
+cat( "\nSelected full model: ", selected_development_model_name, "\n", sep = "" )
+cat( "Selection reason: ", selection_reason, "\n", sep = "" )
+cat( "\nHeld-out final selected-model metrics:\n" )
+print( final_selected_test_metrics, n = Inf )
+cat( "\nIncremental model value:\n" )
+print( incremental_model_value, n = Inf )
+cat( "\nKnown-truth probability recovery:\n" )
+print( truth_probability_recovery, n = Inf )
+cat( "\nValidation checks:\n" )
+print( model_validation_checks, n = Inf )
+cat( "\nCanonical Module 6 model:\n", file.path( config$output_dir, "final_selected_conversion_model.rds" ), "\n",
+  sep = "" )
+```
