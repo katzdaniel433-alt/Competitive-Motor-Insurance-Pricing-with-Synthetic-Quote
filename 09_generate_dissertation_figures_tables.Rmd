@@ -1,495 +1,143 @@
 ```{r setup, include=FALSE}
-# ==============================================================================
-# 09. DISSERTATION FIGURES AND TABLES
-# ==============================================================================
-# Purpose:
-#   Create publication-ready dissertation exhibits from the FROZEN outputs of
-#   Modules 1-8 and Module 6B. This file is READ-ONLY with respect to the
-#   modelling pipeline: it must not refit models, reselect strategies, or alter
-#   any upstream output.
-#
-# Recommended use:
-#   1. Run/freeze Modules 0-8 and 6B first.
-#   2. Knit this file once.
-#   3. Insert the generated PDF figures and LaTeX tables into the dissertation.
-#
-# Output:
-#   outputs/dissertation_exhibits/
-#     figures/
-#     tables/
-#     figure_manifest.csv
-#     table_manifest.csv
-#
-# Presentation: Figures contain no internal titles or subtitles. Use the
-# dissertation's LaTeX figure captions for titles and figure descriptions.
-# Axis labels, facet labels, legends and explanatory footnotes are retained.
-#
-# Audit corrections (2026-10-14): all reader-facing outputs use "reference
-# insurer", "paid claim", "contribution retention", "expected claims ratio",
-# and lower-case training/validation/test sample names. The existing internal
-# input column names (e.g., focal_rank, true_margin_retention) are retained
-# because they belong to the frozen upstream data contract.
-#
-# NOTE: The dissertation's own Rmd/LaTeX must separately correct the omitted
-# equation left-hand sides, the vehicle-value formula, citation and prose
-# typos, and manually authored table pagination. This module cannot edit those.
-
-# ==============================================================================
-
-required_packages <- c(
-  "dplyr", "readr", "tidyr", "stringr", "purrr",
-  "tibble", "ggplot2", "scales", "knitr"
-)
-
-missing_packages <- required_packages[
-  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
-]
-
-if (length(missing_packages) > 0L) {
-  stop(
-    "Install the following packages before running this file: ",
-    paste(missing_packages, collapse = ", ")
-  )
-}
-
+required_packages <- c("dplyr", "readr", "tidyr", "stringr", "purrr", "tibble", "ggplot2", "scales", "knitr")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly=TRUE)]
+if (length(missing_packages)) stop("Missing packages: ", paste(missing_packages, collapse=", "))
 suppressPackageStartupMessages({
-  library(dplyr)
-  library(readr)
-  library(tidyr)
-  library(stringr)
-  library(purrr)
-  library(tibble)
-  library(ggplot2)
-  library(scales)
-  library(knitr)
+  library(dplyr); library(readr); library(tidyr); library(stringr)
+  library(purrr); library(tibble); library(ggplot2); library(scales); library(knitr)
 })
+options(dplyr.summarise.inform=FALSE, scipen=999)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.align="center")
 
-options(
-  dplyr.summarise.inform = FALSE,
-  scipen = 999
-)
+thesis_root <- normalizePath(getwd(), winslash="/", mustWork=TRUE)
+model_output_dir <- file.path(thesis_root, "Methodology", "outputs")
+exhibit_dir <- file.path(thesis_root, "outputs", "dissertation_exhibits")
+figure_dir <- file.path(exhibit_dir, "figures")
+table_dir <- file.path(exhibit_dir, "tables")
+if (!dir.exists(model_output_dir)) stop("Model outputs not found at ", model_output_dir,
+  ". Knit from the Thesis Draft working directory.")
+dir.create(figure_dir, recursive=TRUE, showWarnings=FALSE)
+dir.create(table_dir, recursive=TRUE, showWarnings=FALSE)
 
-# ------------------------------------------------------------------------------
-# Project/output locations
-# ------------------------------------------------------------------------------
-
-find_project_root <- function(start = getwd()) {
-  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
-
-  repeat {
-    if (
-      dir.exists(file.path(current, "outputs")) ||
-      file.exists(file.path(current, "01_generate_synthetic_motor_portfolio.Rmd")) ||
-      file.exists(file.path(current, "01_generate_synthetic_motor_portfolio_2021_2025_FIXED.Rmd"))
-    ) {
-      return(current)
-    }
-
-    parent <- dirname(current)
-
-    if (identical(parent, current)) {
-      return(normalizePath(start, winslash = "/", mustWork = TRUE))
-    }
-
-    current <- parent
-  }
+resolve_file <- function(primary, required=TRUE) {
+  relative <- sub("^outputs/", "", primary)
+  path <- file.path(model_output_dir, relative)
+  if (file.exists(path)) return(normalizePath(path, winslash="/", mustWork=TRUE))
+  if (!required) return(NA_character_)
+  stop("Missing frozen input: ", path, call.=FALSE)
 }
-
-project_root <- find_project_root()
-
-exhibit_dir <- file.path(project_root, "outputs", "dissertation_exhibits")
-figure_dir  <- file.path(exhibit_dir, "figures")
-table_dir   <- file.path(exhibit_dir, "tables")
-
-dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
-
-# ------------------------------------------------------------------------------
-# File-resolution helpers
-# ------------------------------------------------------------------------------
-
-all_project_files <- function(pattern) {
-  list.files(
-    project_root,
-    pattern = pattern,
-    recursive = TRUE,
-    full.names = TRUE,
-    ignore.case = TRUE
-  )
-}
-
-resolve_file <- function(primary, pattern = NULL, required = TRUE) {
-  primary_path <- file.path(project_root, primary)
-
-  if (file.exists(primary_path)) {
-    return(primary_path)
-  }
-
-  if (!is.null(pattern)) {
-    candidates <- all_project_files(pattern)
-
-    if (length(candidates) > 0L) {
-      # Prefer files inside the standard outputs tree, then newest modification.
-      info <- file.info(candidates)
-
-      candidate_tbl <- tibble(
-        path = candidates,
-        in_outputs = str_detect(candidates, fixed(file.path(project_root, "outputs"))),
-        modified = info$mtime
-      ) %>%
-        arrange(desc(in_outputs), desc(modified))
-
-      return(candidate_tbl$path[[1]])
-    }
-  }
-
-  if (required) {
-    stop(
-      "Could not locate required file: ", primary,
-      if (!is.null(pattern)) paste0(" (pattern: ", pattern, ")") else ""
-    )
-  }
-
-  NA_character_
-}
-
 read_csv_safe <- function(path) {
-  if (is.na(path) || !file.exists(path)) {
-    return(NULL)
-  }
-
-  readr::read_csv(path, show_col_types = FALSE)
+  if (length(path)==0 || is.na(path) || !file.exists(path)) return(NULL)
+  readr::read_csv(path, show_col_types=FALSE)
+}
+validate_cols <- function(x, required, label) {
+  missing <- setdiff(required, names(x))
+  if(length(missing)) stop(label, " missing columns: ", paste(missing, collapse=", "), call.=FALSE)
+}
+fmt_pct <- function(x, accuracy=0.01) scales::percent(x, accuracy=accuracy, scale=100)
+fmt_pp <- function(x) paste0(formatC(100*x, format="f", digits=2), " pp")
+fmt_num <- function(x, digits=3) formatC(x, format="f", digits=digits, big.mark=",")
+fmt_currency <- function(x, digits=0) scales::dollar(x, accuracy=10^(-digits), big.mark=",")
+fmt_yes_no <- function(x) ifelse(is.na(x), "NA", ifelse(x, "Yes", "No"))
+metric_value <- function(df, key, numeric=TRUE) {
+  ix <- which(df$metric==key)
+  if (!length(ix)) return(if(numeric) NA_real_ else NA_character_)
+  value <- df$value[[ix[[1]]]]
+  if(numeric) suppressWarnings(as.numeric(value)) else as.character(value)
 }
 
-# A sensitivity result is only accepted if all ten cases completed and the
-# central decision metrics are present. This deliberately avoids stale/broken
-# aggregate files from earlier development runs.
-resolve_complete_sensitivity <- function() {
-  canonical <- file.path(
-    project_root,
-    "outputs", "sensitivity_analysis_v8", "sensitivity_summary.csv"
-  )
-
-  candidates <- unique(c(
-    if (file.exists(canonical)) canonical else character(0),
-    all_project_files("^sensitivity_summary.*\\.csv$")
-  ))
-
-  if (length(candidates) == 0L) {
-    stop("No sensitivity_summary CSV was found.")
-  }
-
-  scored <- map_dfr(candidates, function(path) {
-    dat <- tryCatch(read_csv(path, show_col_types = FALSE), error = function(e) NULL)
-
-    if (is.null(dat)) {
-      return(tibble(
-        path = path,
-        completed = 0L,
-        non_missing_decisions = 0L,
-        valid = FALSE,
-        modified = file.info(path)$mtime
-      ))
-    }
-
-    completed <- if ("collection_success" %in% names(dat)) {
-      sum(dat$collection_success %in% TRUE, na.rm = TRUE)
-    } else {
-      nrow(dat)
-    }
-
-    decision_cols <- intersect(
-      c(
-        "targeted_true_relative_conversion_uplift",
-        "targeted_true_margin_retention"
-      ),
-      names(dat)
+figure_colours <- c(
+  navy="#17465F", teal="#16827C", orange="#CE7940",
+  grey="#677985", charcoal="#202D36", light="#D9E1E6"
+)
+theme_dissertation <- function(base_size=11.5) {
+  ggplot2::theme_bw(base_size=base_size, base_family="serif") +
+    ggplot2::theme(
+      plot.title=element_blank(), plot.subtitle=element_blank(),
+      plot.caption=element_blank(),
+      plot.background=element_rect(fill="white", colour=NA),
+      panel.background=element_rect(fill="white", colour=NA),
+      panel.border=element_rect(fill=NA, colour="#A8B4BC", linewidth=.3),
+      panel.grid.major.x=element_blank(),
+      panel.grid.major.y=element_line(colour="#E5EBEF", linewidth=.28),
+      panel.grid.minor=element_blank(),
+      axis.title=element_text(face="bold", colour=figure_colours[["charcoal"]], size=base_size),
+      axis.text=element_text(colour=figure_colours[["charcoal"]], size=base_size-1),
+      axis.ticks=element_line(colour="#5D6971", linewidth=.3),
+      strip.background=element_rect(fill="white", colour="#C6CDD2", linewidth=.35),
+      strip.text=element_text(face="bold", colour=figure_colours[["charcoal"]], size=base_size-1),
+      legend.position="bottom", legend.title=element_blank(),
+      legend.text=element_text(size=base_size-1),
+      legend.key=element_blank(),
+      plot.margin=margin(8,12,8,10)
     )
-
-    non_missing_decisions <- if (length(decision_cols) == 2L) {
-      sum(stats::complete.cases(dat[, decision_cols]))
-    } else {
-      0L
-    }
-
-    tibble(
-      path = path,
-      completed = completed,
-      non_missing_decisions = non_missing_decisions,
-      valid = nrow(dat) >= 10L && completed >= 10L && non_missing_decisions >= 10L,
-      modified = file.info(path)$mtime
-    )
-  }) %>%
-    arrange(
-      desc(valid),
-      desc(completed),
-      desc(non_missing_decisions),
-      desc(modified)
-    )
-
-  if (!scored$valid[[1]]) {
-    stop(
-      "Sensitivity files were found, but no file contained ten complete cases ",
-      "with non-missing pricing results."
-    )
-  }
-
-  scored$path[[1]]
-}
-
-resolve_complete_monte_carlo <- function() {
-  canonical <- file.path(
-    project_root,
-    "outputs", "monte_carlo_stability_v5",
-    "monte_carlo_replication_summary.csv"
-  )
-
-  candidates <- unique(c(
-    if (file.exists(canonical)) canonical else character(0),
-    all_project_files("^monte_carlo_replication_summary.*\\.csv$")
-  ))
-
-  if (length(candidates) == 0L) {
-    stop("No Monte Carlo replication summary CSV was found.")
-  }
-
-  scored <- map_dfr(candidates, function(path) {
-    dat <- tryCatch(read_csv(path, show_col_types = FALSE), error = function(e) NULL)
-
-    if (is.null(dat)) {
-      return(tibble(
-        path = path,
-        completed = 0L,
-        decision_rows = 0L,
-        valid = FALSE,
-        modified = file.info(path)$mtime
-      ))
-    }
-
-    completed <- if ("collection_success" %in% names(dat)) {
-      sum(dat$collection_success %in% TRUE, na.rm = TRUE)
-    } else {
-      nrow(dat)
-    }
-
-    decision_rows <- if (
-      all(c(
-        "targeted_true_relative_conversion_uplift",
-        "targeted_true_margin_retention"
-      ) %in% names(dat))
-    ) {
-      sum(
-        stats::complete.cases(
-          dat[, c(
-            "targeted_true_relative_conversion_uplift",
-            "targeted_true_margin_retention"
-          )]
-        )
-      )
-    } else {
-      0L
-    }
-
-    tibble(
-      path = path,
-      completed = completed,
-      decision_rows = decision_rows,
-      valid = nrow(dat) >= 10L && completed >= 10L && decision_rows >= 10L,
-      modified = file.info(path)$mtime
-    )
-  }) %>%
-    arrange(desc(valid), desc(completed), desc(decision_rows), desc(modified))
-
-  if (!scored$valid[[1]]) {
-    stop("No complete ten-replication Monte Carlo summary was found.")
-  }
-
-  scored$path[[1]]
-}
-
-# ------------------------------------------------------------------------------
-# Formatting helpers
-# ------------------------------------------------------------------------------
-
-fmt_pct <- function(x, accuracy = 0.01) {
-  scales::percent(x, accuracy = accuracy, scale = 100)
-}
-
-fmt_pp <- function(x, accuracy = 0.01) {
-  paste0(formatC(100 * x, format = "f", digits = 2), " pp")
-}
-
-fmt_num <- function(x, digits = 3) {
-  formatC(x, format = "f", digits = digits, big.mark = ",")
-}
-
-fmt_currency <- function(x, digits = 0) {
-  scales::dollar(x, accuracy = 10^(-digits), big.mark = ",")
-}
-
-fmt_yes_no <- function(x) {
-  ifelse(is.na(x), "NA", ifelse(x, "Yes", "No"))
-}
-
-metric_value <- function(summary_df, metric_name, numeric = TRUE) {
-  idx <- which(summary_df$metric == metric_name)
-
-  if (length(idx) == 0L) {
-    return(if (numeric) NA_real_ else NA_character_)
-  }
-
-  out <- summary_df$value[[idx[[1]]]]
-
-  if (numeric) {
-    suppressWarnings(as.numeric(out))
-  } else {
-    as.character(out)
-  }
 }
 
 save_figure <- function(plot, filename, width, height) {
   pdf_path <- file.path(figure_dir, paste0(filename, ".pdf"))
   png_path <- file.path(figure_dir, paste0(filename, ".png"))
-
-  ggsave(
-    pdf_path,
-    plot = plot,
-    width = width,
-    height = height,
-    units = "in",
-    device = cairo_pdf
-  )
-
-  ggsave(
-    png_path,
-    plot = plot,
-    width = width,
-    height = height,
-    units = "in",
-    dpi = 320
-  )
-
-  invisible(c(pdf = pdf_path, png = png_path))
+  ggplot2::ggsave(pdf_path, plot=plot, width=width, height=height, units="in",
+      device=if (capabilities("cairo")) grDevices::cairo_pdf else "pdf", bg="white")
+  ggplot2::ggsave(png_path, plot=plot, width=width, height=height, units="in", dpi=400, bg="white")
+  invisible(c(pdf=pdf_path,png=png_path))
 }
-
-save_table <- function(data, filename, caption, longtable = FALSE) {
+save_table <- function(dat, filename, caption, longtable=FALSE) {
   csv_path <- file.path(table_dir, paste0(filename, ".csv"))
   tex_path <- file.path(table_dir, paste0(filename, ".tex"))
-
-  write_csv(data, csv_path)
-
-  latex <- knitr::kable(
-    data,
-    format = "latex",
-    booktabs = TRUE,
-    longtable = longtable,
-    caption = caption,
-    escape = TRUE,
-    linesep = ""
-  )
-
-  writeLines(as.character(latex), tex_path)
-
-  invisible(c(csv = csv_path, tex = tex_path))
+  readr::write_csv(dat, csv_path)
+  tex <- knitr::kable(dat, format="latex", booktabs=TRUE,
+                       longtable=longtable, caption=caption, escape=TRUE, linesep="")
+  writeLines(as.character(tex), tex_path)
+  invisible(c(csv=csv_path, tex=tex_path))
 }
 
-theme_dissertation <- function(base_size = 10.5) {
-  theme_minimal(base_size = base_size, base_family = "serif") +
-    theme(
-      plot.title = element_blank(),
-      plot.subtitle = element_blank(),
-      plot.caption = element_text(size = base_size - 1.5, hjust = 0),
-      axis.title = element_text(face = "bold"),
-      panel.grid.minor = element_blank(),
-      legend.position = "bottom",
-      legend.title = element_blank(),
-      strip.text = element_text(face = "bold"),
-      plot.margin = margin(8, 10, 8, 8)
-    )
+resolve_complete <- function(input, numeric_cols, label) {
+  dat <- read_csv_safe(resolve_file(input))
+  validate_cols(dat, numeric_cols, label)
+  successes <- if("collection_success" %in% names(dat))
+    sum(dat$collection_success %in% TRUE) else nrow(dat)
+  if(nrow(dat)<10 || successes<10 || sum(complete.cases(dat[,numeric_cols,drop=FALSE]))<10)
+    stop(label, " does not contain ten completed observations.")
+  dat
 }
 
-# ------------------------------------------------------------------------------
-# Resolve frozen outputs
-# ------------------------------------------------------------------------------
+select_frozen_folder <- function(candidates, required_files, label) {
+  valid <- vapply(candidates, function(folder) {
+    all(file.exists(file.path(model_output_dir, folder, required_files)))
+  }, logical(1))
+  if (!any(valid)) stop("No complete ", label, " snapshot found in: ",
+                        paste(candidates, collapse=", "), call.=FALSE)
+  chosen <- candidates[which(valid)[1]]
+  message(label, " input folder: ", chosen)
+  chosen
+}
+pricing_folder <- select_frozen_folder(
+ c("pricing_simulation_v3","pricing_simulation"),
+ c("targeted_segmentation_comparison.csv","selected_segment_multipliers.csv",
+   "test_strategy_comparison.csv"), "Pricing")
+sensitivity_folder <- select_frozen_folder(
+ c("sensitivity_analysis_v8","sensitivity_analysis"),
+ "sensitivity_summary.csv", "Sensitivity")
+monte_carlo_folder <- select_frozen_folder(
+ c("monte_carlo_stability_v5","monte_carlo_stability"),
+ "monte_carlo_replication_summary.csv", "Monte Carlo")
 
 paths <- list(
-  truth_rds = resolve_file(
-    "outputs/synthetic_generator_multiyear/synthetic_motor_full_truth.rds",
-    "synthetic_motor_full_truth\\.rds$",
-    required = FALSE
-  ),
-
-  technical_profiles = resolve_file(
-    "outputs/technical_pricing/technical_pricing_profiles.csv",
-    "^technical_pricing_profiles.*\\.csv$"
-  ),
-
-  technical_summary = resolve_file(
-    "outputs/technical_pricing/technical_pricing_summary.csv",
-    "^technical_pricing_summary.*\\.csv$"
-  ),
-
-  technical_truth_summary = resolve_file(
-    "outputs/technical_pricing/technical_pricing_truth_recovery.csv",
-    "^technical_pricing_truth_recovery.*\\.csv$"
-  ),
-
-  quote_summary = resolve_file(
-    "outputs/quote_market/quote_market_summary.csv",
-    "^quote_market_summary.*\\.csv$"
-  ),
-
-  conversion_summary = resolve_file(
-    "outputs/conversion_generation/conversion_generation_summary.csv",
-    "^conversion_generation_summary.*\\.csv$"
-  ),
-
-  conversion_by_rank = resolve_file(
-    "outputs/conversion_generation/conversion_by_rank.csv",
-    "^conversion_by_rank.*\\.csv$"
-  ),
-
-  validation_metrics = resolve_file(
-    "outputs/conversion_models/validation_model_metrics.csv",
-    "^validation_model_metrics.*\\.csv$"
-  ),
-
-  truth_recovery = resolve_file(
-    "outputs/conversion_models/truth_probability_recovery.csv",
-    "^truth_probability_recovery.*\\.csv$"
-  ),
-
-  target_comparison = resolve_file(
-    "outputs/pricing_simulation_v3/targeted_segmentation_comparison.csv",
-    "^targeted_segmentation_comparison.*\\.csv$"
-  ),
-
-  selected_multipliers = resolve_file(
-    "outputs/pricing_simulation_v3/selected_segment_multipliers.csv",
-    "^selected_segment_multipliers.*\\.csv$"
-  ),
-
-  test_strategy = resolve_file(
-    "outputs/pricing_simulation_v3/test_strategy_comparison.csv",
-    "^test_strategy_comparison.*\\.csv$"
-  ),
-
-  sensitivity = resolve_complete_sensitivity(),
-
-  monte_carlo = resolve_complete_monte_carlo(),
-
-  bootstrap_summary = resolve_file(
-    "outputs/pricing_bootstrap_uncertainty/paired_bootstrap_summary.csv",
-    "^paired_bootstrap_summary.*\\.csv$"
-  ),
-
-  bootstrap_replications = resolve_file(
-    "outputs/pricing_bootstrap_uncertainty/paired_bootstrap_replications.csv",
-    "^paired_bootstrap_replications.*\\.csv$",
-    required = FALSE
-  )
+  truth_rds=resolve_file("outputs/synthetic_generator_multiyear/synthetic_motor_full_truth.rds", FALSE),
+  technical_profiles=resolve_file("outputs/technical_pricing/technical_pricing_profiles.csv"),
+  technical_summary=resolve_file("outputs/technical_pricing/technical_pricing_summary.csv"),
+  technical_truth_summary=resolve_file("outputs/technical_pricing/technical_pricing_truth_recovery.csv"),
+  quote_summary=resolve_file("outputs/quote_market/quote_market_summary.csv"),
+  conversion_summary=resolve_file("outputs/conversion_generation/conversion_generation_summary.csv"),
+  conversion_by_rank=resolve_file("outputs/conversion_generation/conversion_by_rank.csv"),
+  validation_metrics=resolve_file("outputs/conversion_models/validation_model_metrics.csv"),
+  truth_recovery=resolve_file("outputs/conversion_models/truth_probability_recovery.csv"),
+  target_comparison=resolve_file(file.path("outputs",pricing_folder,"targeted_segmentation_comparison.csv")),
+  selected_multipliers=resolve_file(file.path("outputs",pricing_folder,"selected_segment_multipliers.csv")),
+  test_strategy=resolve_file(file.path("outputs",pricing_folder,"test_strategy_comparison.csv")),
+  bootstrap_summary=resolve_file("outputs/pricing_bootstrap_uncertainty/paired_bootstrap_summary.csv", FALSE),
+  bootstrap_replications=resolve_file("outputs/pricing_bootstrap_uncertainty/paired_bootstrap_replications.csv", FALSE)
 )
-
 technical_profiles <- read_csv_safe(paths$technical_profiles)
 technical_summary <- read_csv_safe(paths$technical_summary)
 technical_truth_summary <- read_csv_safe(paths$technical_truth_summary)
@@ -501,1202 +149,998 @@ truth_recovery <- read_csv_safe(paths$truth_recovery)
 target_comparison <- read_csv_safe(paths$target_comparison)
 selected_multipliers <- read_csv_safe(paths$selected_multipliers)
 test_strategy <- read_csv_safe(paths$test_strategy)
-sensitivity <- read_csv_safe(paths$sensitivity)
-monte_carlo <- read_csv_safe(paths$monte_carlo)
 bootstrap_summary <- read_csv_safe(paths$bootstrap_summary)
 bootstrap_replications <- read_csv_safe(paths$bootstrap_replications)
+# Include bootstrap exhibits only after confirming the 10,000-profile rerun.
+# Explicitly reject a stale 2,000-profile bootstrap, even if filenames are the same.
+bootstrap_checks <- read_csv_safe(resolve_file(
+  "outputs/pricing_bootstrap_uncertainty/paired_bootstrap_validation_checks.csv", FALSE))
+run_bootstrap_exhibits <- !is.null(bootstrap_summary) &&
+  !is.null(bootstrap_replications) && !is.null(bootstrap_checks)
+if (!run_bootstrap_exhibits) {
+  stop("New Module 06B bootstrap files are required: point estimates, ",
+       "summary, replications and validation checks in ",
+       "Methodology/outputs/pricing_bootstrap_uncertainty. Do not reuse 2,000-profile results.")
+}
+stopifnot(
+  nrow(bootstrap_replications) == 5000L,
+  all(c("check_name", "observed_value", "pass") %in% names(bootstrap_checks)),
+  all(bootstrap_checks$pass %in% TRUE),
+  any(bootstrap_checks$check_name == "Paired TEST profiles" &
+      as.numeric(bootstrap_checks$observed_value) == 10000),
+  any(bootstrap_checks$check_name == "Bootstrap replications" &
+      as.numeric(bootstrap_checks$observed_value) == 5000),
+  all(c("absolute_true_conversion_uplift", "relative_true_conversion_uplift",
+        "true_margin_retention") %in% bootstrap_summary$metric)
+)
+sensitivity <- resolve_complete(file.path("outputs",sensitivity_folder,"sensitivity_summary.csv"),
+ c("targeted_true_relative_conversion_uplift","targeted_true_margin_retention"), "Sensitivity")
+monte_carlo <- resolve_complete(file.path("outputs",monte_carlo_folder,"monte_carlo_replication_summary.csv"),
+ c("targeted_true_relative_conversion_uplift","targeted_true_margin_retention"), "Monte Carlo")
 ```
 
-# Main-text tables
+# Dissertation tables (existing filenames preserved)
 
-## Table 1 - Empirical calibration sources
-
+## Table 1 — Calibration inputs
 ```{r table-calibration-sources}
 table_01_calibration_sources <- tribble(
-  ~Component, ~Principal_source, ~Role_in_simulation, ~Evidence_classification,
-  "Vehicle registrations and fleet mix",
-  "BITRE - Road Vehicles Australia / transport statistics",
-  "State, manufacture year, make/model and fleet structure",
-  "Empirical calibration",
-  "Driver population",
-  "BITRE licence-holder statistics",
-  "Driver-age calibration",
-  "Empirical calibration",
-  "Geography and remoteness",
-  "ABS geographic allocations, ASGS and Census",
-  "State x Remoteness allocation and locality structure",
-  "Empirical calibration",
-  "Vehicle segment and motive power",
-  "Australian Government Green Vehicle Guide and FCAI",
-  "Vehicle classification and technology structure",
-  "Empirical classification/calibration",
-  "Vehicle specifications",
-  "CarExpert historical specification records",
-  "Engine capacity, cylinders, power, torque, transmission and weight",
-  "Empirical lookup with compatible donor matching",
-  "Vehicle values",
-  "RACQ vehicle-running-cost/value information",
-  "New-value and depreciation anchors",
-  "Empirical calibration plus modelling assumptions",
-  "Claims and vehicle cost on-levelling",
-  "ABS price indices",
-  "Common 2025 monetary basis",
-  "Empirical indexation",
-  "Demand and competitor mechanisms",
-  "Study assumptions informed by pricing/conversion literature",
-  "Participation, price sensitivity, competitor stance and behavioural response",
-  "Explicit simulation assumptions"
+ ~Component,~Principal_source,~Role_in_simulation,~Evidence_classification,
+ "Vehicle registrations and fleet mix","BITRE - Road Vehicles Australia / transport statistics","State, manufacture year, make/model and fleet structure","Empirical calibration",
+ "Driver population","BITRE licence-holder statistics","Driver-age calibration","Empirical calibration",
+ "Geography and remoteness","ABS geographic allocations, ASGS and Census","State x Remoteness allocation and locality structure","Empirical calibration",
+ "Vehicle segment and motive power","Australian Government Green Vehicle Guide and FCAI","Vehicle classification and technology structure","Empirical classification/calibration",
+ "Vehicle specifications","CarExpert historical specification records","Engine capacity, cylinders, power, torque, transmission and weight","Empirical lookup with compatible donor matching",
+ "Vehicle values","RACQ vehicle-running-cost/value information","New-value and depreciation anchors","Empirical calibration plus modelling assumptions",
+ "Claims and vehicle cost on-levelling","ABS price indices","Common 2025 monetary basis","Empirical indexation",
+ "Demand and competitor mechanisms","Study assumptions informed by pricing/conversion literature","Participation, price sensitivity, competitor stance and behavioural response","Explicit simulation assumptions"
 )
-
-save_table(
-  table_01_calibration_sources,
-  "table_01_empirical_calibration_sources",
-  "Principal empirical calibration sources and their role in the synthetic portfolio.",
-  longtable = TRUE
-)
-
+save_table(table_01_calibration_sources,"table_01_empirical_calibration_sources",
+ "Principal empirical calibration sources and their role in the synthetic portfolio.",TRUE)
 knitr::kable(table_01_calibration_sources)
 ```
 
-> **Reference note:** The dissertation bibliography contains the BITRE, ABS, Green Vehicle Guide/FCAI, RACQ and CarExpert sources. This exhibit summarises their calibration roles; its source labels do not replace formal citations in the thesis.
-
-## Table 2 - Technical-pricing candidate ladder
-
+## Table 2 — Technical-pricing candidates
 ```{r table-technical-candidate-ladder}
 table_02_technical_candidates <- tribble(
-  ~Candidate, ~Frequency_specification, ~Severity_specification,
-  "Benchmark",
-  "Linear age, licence years and log annual km; prior claims, State and Remoteness Area",
-  "Log vehicle value, excess factor and vehicle segment",
-  "Flexible",
-  "Spline age, licence years and log annual km; prior claims, State, Remoteness Area and vehicle segment",
-  "Spline log vehicle value and vehicle age; excess factor and vehicle segment",
-  "+ motive power",
-  "Flexible specification plus motive power",
-  "Flexible specification plus motive power",
-  "+ physical specifications",
-  "Adds transmission, engine capacity, cylinders, power, torque and unladen weight",
-  "Adds transmission, engine capacity, cylinders, power, torque and unladen weight"
+ ~Candidate,~Frequency_specification,~Severity_specification,
+ "Benchmark","Linear age, licence years and log annual km; prior claims, State and Remoteness Area","Log vehicle value, excess factor and vehicle segment",
+ "Flexible","Spline age, licence years and log annual km; prior claims, State, Remoteness Area and vehicle segment","Spline log vehicle value and vehicle age; excess factor and vehicle segment",
+ "+ motive power","Flexible specification plus motive power","Flexible specification plus motive power",
+ "+ physical specifications","Adds transmission, engine capacity, cylinders, power, torque and unladen weight","Adds transmission, engine capacity, cylinders, power, torque and unladen weight"
 )
-
-save_table(
-  table_02_technical_candidates,
-  "table_02_technical_pricing_candidate_ladder",
-  "Candidate technical-pricing specifications considered on the 2024 validation cohort.",
-  longtable = TRUE
-)
-
+save_table(table_02_technical_candidates,"table_02_technical_pricing_candidate_ladder",
+ "Candidate technical-pricing specifications considered on the 2024 validation cohort.",TRUE)
 knitr::kable(table_02_technical_candidates)
 ```
 
-## Table 3 - Conversion-model sequence
-
+## Table 3 — Conversion model sequence
 ```{r table-conversion-model-sequence}
 table_03_conversion_sequence <- tribble(
-  ~Model, ~Incremental_information,
-  "Technical-only GLM", "Customer, vehicle and technical-risk information",
-  "Own-price GLM", "Adds reference insurer premium relative to technical premium",
-  "Rank GLM", "Own-price variables plus reference insurer rank percentile",
-  "Relative-price GLM", "Own-price variables plus reference insurer price relative to cheapest competitor",
-  "Market-position GLM", "Adds the full competitive-position information set",
-  "Market-position GAM", "Uses the same broad market information with nonlinear smooth effects"
+ ~Model,~Incremental_information,
+ "Technical-only GLM","Customer, vehicle and technical-risk information",
+ "Own-price GLM","Adds reference insurer premium relative to technical premium",
+ "Rank GLM","Own-price variables plus reference insurer rank percentile",
+ "Relative-price GLM","Own-price variables plus reference insurer price relative to cheapest competitor",
+ "Market-position GLM","Adds the full competitive-position information set",
+ "Market-position GAM","Uses the same broad market information with nonlinear smooth effects"
 )
-
-save_table(
-  table_03_conversion_sequence,
-  "table_03_conversion_model_sequence",
-  "Conversion-model information sets: rank and relative-price models are parallel extensions of own-price."
-)
-
+save_table(table_03_conversion_sequence,"table_03_conversion_model_sequence",
+ "Conversion-model information sets: rank and relative-price models are parallel extensions of own-price.")
 knitr::kable(table_03_conversion_sequence)
 ```
 
-## Table 4 - Pricing constraints
-
+## Table 4 — Constraints
 ```{r table-pricing-constraints}
 table_04_pricing_constraints <- tribble(
-  ~Constraint, ~Requirement, ~Purpose,
-  "Candidate multiplier support", "0.95 to 1.05 in 0.01 increments",
-  "Limit counterfactual extrapolation away from technical premium",
-  "Aggregate quoted rate level", "99.5% to 100.5%",
-  "Require approximately rate-neutral targeted pricing",
-  "Portfolio contribution retention", "At least 100% of benchmark",
-  "Preserve expected contribution after claims",
-  "Segment contribution retention", "At least 90% of segment benchmark",
-  "Limit deterioration in individual segments",
-  "Expected claims ratio", "At most 80%",
-  "Retain an explicit claims-adequacy ceiling",
-  "Expected conversion", "At least benchmark",
-  "Prevent a reduction in expected conversion"
+ ~Constraint,~Requirement,~Purpose,
+ "Candidate multiplier support","0.95 to 1.05 in 0.01 increments","Limit counterfactual extrapolation away from technical premium",
+ "Aggregate quoted rate level","99.5% to 100.5%","Require approximately rate-neutral targeted pricing",
+ "Portfolio expected profit retention","At least 100% of benchmark","Preserve expected pre-expense underwriting profit",
+ "Segment expected profit retention","At least 90% of segment benchmark","Limit deterioration in individual segments",
+ "Expected claims ratio","At most 80%","Retain an explicit claims-adequacy ceiling",
+ "Expected conversion","At least benchmark","Prevent a reduction in expected conversion"
 )
-
-save_table(
-  table_04_pricing_constraints,
-  "table_04_pricing_constraints",
-  "Actuarial and commercial constraints applied to targeted pricing optimisation."
-)
-
+save_table(table_04_pricing_constraints,"table_04_pricing_constraints",
+ "Actuarial and commercial constraints applied to targeted pricing optimisation.")
 knitr::kable(table_04_pricing_constraints)
 ```
 
-## Table 5 - Robustness framework
-
+## Table 5 — Robustness methods
 ```{r table-robustness-framework}
 table_05_robustness <- tribble(
-  ~Procedure, ~What_changes, ~Uncertainty_addressed,
-  "Structural sensitivity", "Market, demand or pricing assumptions", "Structural uncertainty",
-  "Monte Carlo regeneration", "Random synthetic realisation", "Simulation / seed uncertainty",
-  "Paired bootstrap", "Independent test-sample composition", "Finite evaluation-sample uncertainty"
+ ~Procedure,~What_changes,~Uncertainty_addressed,
+ "Structural sensitivity","Market, demand or pricing assumptions","Structural uncertainty",
+ "Monte Carlo regeneration","Random synthetic realisation","Simulation / seed uncertainty",
+ "Paired bootstrap","Independent test-sample composition","Finite evaluation-sample uncertainty"
 )
-
-save_table(
-  table_05_robustness,
-  "table_05_robustness_framework",
-  "Complementary robustness procedures used in the study."
-)
-
+save_table(table_05_robustness,"table_05_robustness_framework",
+ "Complementary robustness procedures used in the study.")
 knitr::kable(table_05_robustness)
 ```
 
-## Table 6 - Technical-pricing validation
-
+## Table 6 — Technical validation
 ```{r table-technical-validation}
 table_06_technical_validation <- tibble(
-  Measure = c(
-    "Selected frequency model",
-    "Selected severity model",
-    "Frequency dispersion",
-    "Severity dispersion",
-    "2025 paid-claim frequency O/E",
-    "2025 paid-claim severity O/E",
-    "2025 claims-cost O/E",
-    "Underlying claims-cost Spearman correlation",
-    "Mean fitted / underlying expected claims cost",
-    "Claims-cost RMSE",
-    "Claims-cost MAE"
-  ),
-  Value = c(
-    metric_value(technical_summary, "Selected frequency model", numeric = FALSE),
-    metric_value(technical_summary, "Selected severity model", numeric = FALSE),
-    fmt_num(metric_value(technical_summary, "Frequency dispersion"), 3),
-    fmt_num(metric_value(technical_summary, "Severity dispersion"), 3),
-    fmt_num(metric_value(technical_summary, "2025 out-of-time test positive-paid frequency O/E"), 3),
-    fmt_num(metric_value(technical_summary, "2025 out-of-time test positive-paid severity O/E"), 3),
-    fmt_num(metric_value(technical_summary, "2025 out-of-time test loss-cost O/E"), 3),
-    fmt_num(metric_value(
-      technical_truth_summary,
-      "2025 test Spearman correlation: estimated vs true annual loss cost"
-    ), 3),
-    fmt_num(metric_value(
-      technical_truth_summary,
-      "2025 test mean estimated / true annual loss cost"
-    ), 3),
-    fmt_currency(metric_value(
-      technical_truth_summary,
-      "2025 test RMSE: estimated vs true annual loss cost"
-    ), 0),
-    fmt_currency(metric_value(
-      technical_truth_summary,
-      "2025 test MAE: estimated vs true annual loss cost"
-    ), 0)
-  )
-)
-
-save_table(
-  table_06_technical_validation,
-  "table_06_technical_pricing_validation",
-  "Selected technical-pricing models and independent 2025 evaluation diagnostics."
-)
-
+ Measure=c("Selected frequency model","Selected severity model","Frequency dispersion",
+ "Severity dispersion","2025 paid-claim frequency O/E","2025 paid-claim severity O/E",
+ "2025 claims-cost O/E","Underlying claims-cost Spearman correlation",
+ "Mean fitted / underlying expected claims cost","Claims-cost RMSE","Claims-cost MAE"),
+ Value=c(
+ metric_value(technical_summary,"Selected frequency model",FALSE),
+ metric_value(technical_summary,"Selected severity model",FALSE),
+ fmt_num(metric_value(technical_summary,"Frequency dispersion"),3),
+ fmt_num(metric_value(technical_summary,"Severity dispersion"),3),
+ fmt_num(metric_value(technical_summary,"2025 out-of-time test positive-paid frequency O/E"),3),
+ fmt_num(metric_value(technical_summary,"2025 out-of-time test positive-paid severity O/E"),3),
+ fmt_num(metric_value(technical_summary,"2025 out-of-time test loss-cost O/E"),3),
+ fmt_num(metric_value(technical_truth_summary,"2025 test Spearman correlation: estimated vs true annual loss cost"),3),
+ fmt_num(metric_value(technical_truth_summary,"2025 test mean estimated / true annual loss cost"),3),
+ fmt_currency(metric_value(technical_truth_summary,"2025 test RMSE: estimated vs true annual loss cost"),0),
+ fmt_currency(metric_value(technical_truth_summary,"2025 test MAE: estimated vs true annual loss cost"),0)
+ ))
+save_table(table_06_technical_validation,"table_06_technical_pricing_validation",
+ "Selected technical-pricing models and independent 2025 evaluation diagnostics.")
 knitr::kable(table_06_technical_validation)
 ```
 
-## Table 7 - Baseline quote-market characteristics
-
+## Table 7 — Quote market
 ```{r table-quote-market}
-q <- quote_summary[1, ]
-
+q <- quote_summary[1,]
 table_07_quote_market <- tibble(
-  Measure = c(
-    "Customer profiles",
-    "Mean returned competitors",
-    "Mean technical premium",
-    "Mean reference insurer quotation",
-    "Mean competing insurer quotation",
-    "Median reference insurer rank",
-    "Mean reference insurer rank",
-    "Reference insurer cheapest",
-    "Reference insurer within 5% of cheapest",
-    "Median reference insurer relative price",
-    "Mean gap above cheapest",
-    "Mean competitor quote CV"
-  ),
-  Value = c(
-    format(q$profiles, big.mark = ","),
-    fmt_num(q$mean_returned_competitors, 2),
-    fmt_currency(q$mean_technical_premium, 2),
-    fmt_currency(q$mean_focal_quote, 2),
-    fmt_currency(q$mean_competitor_quote, 2),
-    fmt_num(q$median_focal_rank, 0),
-    fmt_num(q$mean_focal_rank, 2),
-    fmt_pct(q$focal_cheapest_share),
-    fmt_pct(q$focal_within_5pct_cheapest_share),
-    fmt_num(q$median_relative_price_to_cheapest, 4),
-    fmt_pct(q$mean_percentage_gap_to_cheapest),
-    fmt_pct(q$mean_competitor_quote_cv)
-  )
-)
-
-save_table(
-  table_07_quote_market,
-  "table_07_quote_market_characteristics",
-  "Baseline synthetic quote-market characteristics for the 2025 cohort."
-)
-
+ Measure=c("Customer profiles","Mean returned competitors","Mean technical premium",
+ "Mean reference insurer quotation","Mean competing insurer quotation",
+ "Median reference insurer rank","Mean reference insurer rank",
+ "Reference insurer cheapest","Reference insurer within 5% of cheapest",
+ "Median reference insurer relative price","Mean gap above cheapest","Mean competitor quote CV"),
+ Value=c(format(q$profiles,big.mark=","),fmt_num(q$mean_returned_competitors,2),
+ fmt_currency(q$mean_technical_premium,2),fmt_currency(q$mean_focal_quote,2),
+ fmt_currency(q$mean_competitor_quote,2),fmt_num(q$median_focal_rank,0),
+ fmt_num(q$mean_focal_rank,2),fmt_pct(q$focal_cheapest_share),
+ fmt_pct(q$focal_within_5pct_cheapest_share),fmt_num(q$median_relative_price_to_cheapest,4),
+ fmt_pct(q$mean_percentage_gap_to_cheapest),fmt_pct(q$mean_competitor_quote_cv)))
+save_table(table_07_quote_market,"table_07_quote_market_characteristics",
+ "Baseline synthetic quote-market characteristics for the 2025 cohort.")
 knitr::kable(table_07_quote_market)
 ```
 
-## Table 8 - Conversion-model performance
-
+## Table 8 — Conversion model performance
 ```{r table-conversion-performance}
-model_order <- c(
-  "Technical-only GLM",
-  "Own-price GLM",
-  "Rank GLM",
-  "Relative-price GLM",
-  "Market-position GLM",
-  "Market-position GAM"
-)
-
-table_08_conversion_performance <- validation_metrics %>%
-  select(
-    model,
-    log_loss,
-    auc,
-    calibration_slope
-  ) %>%
-  left_join(
-    truth_recovery %>%
-      select(
-        model,
-        probability_spearman_correlation,
-        probability_mae,
-        probability_rmse
-      ),
-    by = "model"
-  ) %>%
-  mutate(
-    model = factor(model, levels = model_order)
-  ) %>%
-  arrange(model) %>%
-  transmute(
-    Model = as.character(model),
-    `Validation log loss` = sprintf("%.4f", log_loss),
-    `Validation AUC` = sprintf("%.3f", auc),
-    `Validation calibration slope` = sprintf("%.3f", calibration_slope),
-    `Test underlying Spearman` = sprintf("%.3f", probability_spearman_correlation),
-    `Test probability MAE` = sprintf("%.4f", probability_mae)
-  )
-
-save_table(
-  table_08_conversion_performance,
-  "table_08_conversion_model_performance",
-  "Validation performance and independent test-sample recovery of underlying conversion probabilities."
-)
-
+model_order <- c("Technical-only GLM","Own-price GLM","Rank GLM",
+ "Relative-price GLM","Market-position GLM","Market-position GAM")
+validation_final <- validation_metrics
+if("data_split" %in% names(validation_final))
+ validation_final <- filter(validation_final,data_split=="validation")
+validate_cols(validation_final,c("model","log_loss","auc","calibration_slope"),"Validation model metrics")
+validate_cols(truth_recovery,c("model","probability_spearman_correlation","probability_mae","probability_rmse"),"Truth recovery")
+table_08_conversion_performance <- validation_final %>%
+ select(model,log_loss,auc,calibration_slope) %>%
+ left_join(truth_recovery %>% select(model,probability_spearman_correlation,
+                                  probability_mae,probability_rmse),by="model") %>%
+ mutate(model=factor(model,levels=model_order)) %>% arrange(model) %>%
+ transmute(Model=as.character(model),
+ `Validation log loss`=sprintf("%.4f",log_loss),
+ `Validation AUC`=sprintf("%.3f",auc),
+ `Validation calibration slope`=sprintf("%.3f",calibration_slope),
+ `Test underlying Spearman`=sprintf("%.3f",probability_spearman_correlation),
+ `Test probability MAE`=sprintf("%.4f",probability_mae))
+save_table(table_08_conversion_performance,"table_08_conversion_model_performance",
+ "Validation performance and independent test-sample recovery of underlying conversion probabilities.")
 knitr::kable(table_08_conversion_performance)
 ```
 
-## Table 9 - Leading targeted segmentation candidates
-
+## Table 9 — Targeted segmentation
 ```{r table-target-candidates}
 table_09_target_candidates <- target_comparison %>%
-  arrange(validation_rank) %>%
-  slice_head(n = 5) %>%
-  transmute(
-    `Targeting basis` = segmentation_name,
-    `Relative conversion uplift` = fmt_pct(validation_relative_conversion_uplift),
-    `Contribution retention` = fmt_pct(selected_portfolio_margin_retention),
-    `Expected claims ratio` = fmt_pct(selected_model_expected_claim_ratio),
-    `Aggregate quoted rate level` = fmt_pct(selected_rate_level)
-  )
-
-save_table(
-  table_09_target_candidates,
-  "table_09_targeting_candidates",
-  "Leading admissible targeting bases on the conversion validation sample."
-)
-
+ arrange(validation_rank) %>% slice_head(n=5) %>%
+ transmute(`Targeting basis`=segmentation_name,
+ `Relative conversion uplift`=fmt_pct(validation_relative_conversion_uplift),
+ `Expected profit retention`=fmt_pct(selected_portfolio_margin_retention),
+ `Expected claims ratio`=fmt_pct(selected_model_expected_claim_ratio),
+ `Aggregate quoted rate level`=fmt_pct(selected_rate_level))
+save_table(table_09_target_candidates,"table_09_targeting_candidates",
+ "Leading admissible targeting bases on the conversion validation sample.")
 knitr::kable(table_09_target_candidates)
 ```
 
-## Table 10 - Independent test-sample pricing comparison
-
+## Table 10 — Independent test strategies (both original orientations)
 ```{r table-test-pricing}
-strategy_keep <- c(
-  "Technical-pricing benchmark",
-  "Market-position targeted strategy"
-)
-
-table_10_test_pricing <- test_strategy %>%
-  filter(strategy %in% strategy_keep) %>%
-  mutate(
-    Strategy = recode(
-      strategy,
-      "Technical-pricing benchmark" = "Technical benchmark",
-      "Market-position targeted strategy" = "Targeted strategy"
-    )
-  ) %>%
-  transmute(
-    Strategy,
-    `Aggregate quoted rate level` = fmt_pct(aggregate_rate_level),
-    `Underlying expected conversion` = fmt_pct(true_expected_conversion_rate),
-    `Relative conversion uplift` = ifelse(
-      abs(true_relative_conversion_uplift) < 1e-12,
-      "-",
-      fmt_pct(true_relative_conversion_uplift)
-    ),
-    `Expected contribution after claims` = fmt_currency(true_expected_underwriting_margin, 0),
-    `Contribution retention` = fmt_pct(true_margin_retention),
-    `Expected claims ratio` = fmt_pct(true_expected_claim_ratio)
-  )
-
-save_table(
-  table_10_test_pricing,
-  "table_10_frozen_test_pricing_comparison",
-  "Independent test-sample comparison of technical and targeted pricing (unrounded source values)."
-)
-
-# A second non-longtable orientation matches the dissertation's Table 9,
-# avoiding a manual retyping of the values and column headings.
+strategy_keep <- c("Technical-pricing benchmark","Market-position targeted strategy")
+validate_cols(test_strategy,c("strategy","aggregate_rate_level","true_expected_conversion_rate",
+ "true_relative_conversion_uplift","true_expected_underwriting_margin","true_margin_retention",
+ "true_expected_claim_ratio"),"Frozen test strategies")
+strategy_rows <- test_strategy %>% filter(strategy %in% strategy_keep)
+if(nrow(strategy_rows)!=2 || anyDuplicated(strategy_rows$strategy))
+ stop("Expected exactly one frozen test summary per technical/targeted strategy.")
+table_10_test_pricing <- strategy_rows %>%
+ mutate(Strategy=recode(strategy,
+ "Technical-pricing benchmark"="Technical benchmark",
+ "Market-position targeted strategy"="Targeted strategy")) %>%
+ transmute(Strategy,
+ `Aggregate quoted rate level`=fmt_pct(aggregate_rate_level),
+ `Underlying expected conversion`=fmt_pct(true_expected_conversion_rate),
+ `Relative conversion uplift`=ifelse(abs(true_relative_conversion_uplift)<1e-12,
+  "-",fmt_pct(true_relative_conversion_uplift)),
+ `Expected pre-expense underwriting profit`=fmt_currency(true_expected_underwriting_margin,0),
+ `Expected profit retention`=fmt_pct(true_margin_retention),
+ `Expected claims ratio`=fmt_pct(true_expected_claim_ratio))
+save_table(table_10_test_pricing,"table_10_frozen_test_pricing_comparison",
+ "Independent test-sample comparison of technical and targeted pricing (unrounded source values).")
 table_10_test_pricing_wide <- table_10_test_pricing %>%
-  tidyr::pivot_longer(
-    cols = -Strategy, names_to = "Measure", values_to = "Value"
-  ) %>%
-  tidyr::pivot_wider(names_from = Strategy, values_from = Value) %>%
-  mutate(Measure = factor(Measure, levels = c(
-    "Aggregate quoted rate level", "Underlying expected conversion",
-    "Relative conversion uplift", "Expected contribution after claims",
-    "Contribution retention", "Expected claims ratio"
-  ))) %>%
-  arrange(Measure) %>%
-  mutate(Measure = as.character(Measure)) %>%
-  select(Measure, `Technical benchmark`, `Targeted strategy`)
-
-save_table(
-  table_10_test_pricing_wide,
-  "table_10_frozen_test_pricing_comparison_wide",
-  "Independent test comparison of technical and targeted pricing; relative uplift uses unrounded data."
-)
-
+ pivot_longer(cols=-Strategy,names_to="Measure",values_to="Value") %>%
+ pivot_wider(names_from=Strategy,values_from=Value) %>%
+ mutate(Measure=factor(Measure,levels=c("Aggregate quoted rate level",
+ "Underlying expected conversion","Relative conversion uplift",
+ "Expected pre-expense underwriting profit","Expected profit retention","Expected claims ratio"))) %>%
+ arrange(Measure) %>% mutate(Measure=as.character(Measure)) %>%
+ select(Measure,`Technical benchmark`,`Targeted strategy`)
+save_table(table_10_test_pricing_wide,"table_10_frozen_test_pricing_comparison_wide",
+ "Independent test comparison of technical and targeted pricing; uplift uses unrounded data.")
 knitr::kable(table_10_test_pricing_wide)
-
-# Display percentages are rounded independently: interpret relative uplift
-# using the underlying unrounded outputs rather than displayed percentages.
 ```
 
-## Table 11 - Structural sensitivity
-
+## Table 11 — Sensitivity
 ```{r table-sensitivity}
 scenario_labels <- c(
-  baseline = "Baseline",
-  market_high_competition = "High competition",
-  market_low_competition = "Low competition",
-  market_fragmented = "Fragmented market",
-  demand_low_price_sensitivity = "Low price sensitivity",
-  demand_agentic = "Agent-mediated demand",
-  demand_threshold = "Threshold demand",
-  pricing_narrow_support = "Narrow pricing support",
-  pricing_strict_adequacy = "Strict adequacy",
-  pricing_wide_stress = "Wide pricing stress"
-)
-
+ baseline="Baseline", market_high_competition="High competition",
+ market_low_competition="Low competition",market_fragmented="Fragmented market",
+ demand_low_price_sensitivity="Low price sensitivity",
+ demand_agentic="Agent-mediated demand",demand_threshold="Stronger price thresholds",
+ pricing_narrow_support="Narrow pricing support",
+ pricing_strict_adequacy="Strict adequacy",pricing_wide_stress="Wide pricing stress")
 table_11_sensitivity <- sensitivity %>%
-  mutate(
-    Scenario = recode(case_id, !!!scenario_labels, .default = case_id)
-  ) %>%
-  arrange(case_order) %>%
-  transmute(
-    Scenario,
-    `Selected model` = selected_conversion_model,
-    `Targeting basis` = selected_targeting_segmentation_name,
-    `DGP relative conversion uplift` = fmt_pct(targeted_true_relative_conversion_uplift),
-    `Contribution retention` = fmt_pct(targeted_true_margin_retention),
-    `Expected claims ratio` = fmt_pct(targeted_true_claim_ratio),
-    `Pricing criterion retained` = fmt_yes_no(pricing_conclusion_stable)
-  )
-
-save_table(
-  table_11_sensitivity,
-  "table_11_structural_sensitivity",
-  "Structural sensitivity of the selected conversion model and targeted pricing result.",
-  longtable = TRUE
-)
-
+ mutate(Scenario=recode(case_id,!!!scenario_labels,.default=case_id)) %>%
+ arrange(case_order) %>%
+ transmute(Scenario,`Selected model`=selected_conversion_model,
+ `Targeting basis`=selected_targeting_segmentation_name,
+ `DGP relative conversion uplift`=fmt_pct(targeted_true_relative_conversion_uplift),
+ `Expected profit retention`=fmt_pct(targeted_true_margin_retention),
+ `Expected claims ratio`=fmt_pct(targeted_true_claim_ratio),
+ `Pricing criterion retained`=fmt_yes_no(pricing_conclusion_stable))
+save_table(table_11_sensitivity,"table_11_structural_sensitivity",
+ "Structural sensitivity of selected conversion model and targeted pricing result.",TRUE)
 knitr::kable(table_11_sensitivity)
 ```
 
-## Table 12 - Paired test-sample bootstrap
-
+## Table 12 — Bootstrap
 ```{r table-bootstrap}
-bootstrap_label <- c(
-  absolute_true_conversion_uplift = "Absolute conversion uplift",
-  relative_true_conversion_uplift = "Relative conversion uplift",
-  true_margin_retention = "Contribution retention",
-  targeted_true_expected_claim_ratio = "Targeted expected claims ratio",
-  targeted_aggregate_rate_level = "Aggregate quoted rate level"
-)
-
+if (!is.null(bootstrap_summary)) {
+bootstrap_label <- c(absolute_true_conversion_uplift="Absolute conversion uplift",
+ relative_true_conversion_uplift="Relative conversion uplift",
+ true_margin_retention="Expected profit retention",
+ targeted_true_expected_claim_ratio="Targeted expected claims ratio",
+ targeted_aggregate_rate_level="Aggregate quoted rate level")
 table_12_bootstrap <- bootstrap_summary %>%
-  filter(metric %in% names(bootstrap_label)) %>%
-  mutate(
-    Measure = recode(metric, !!!bootstrap_label),
-    Point = case_when(
-      metric == "absolute_true_conversion_uplift" ~ fmt_pp(point_estimate),
-      TRUE ~ fmt_pct(point_estimate)
-    ),
-    Interval = case_when(
-      metric == "absolute_true_conversion_uplift" ~
-        paste0(fmt_pp(lower_95), " to ", fmt_pp(upper_95)),
-      TRUE ~ paste0(fmt_pct(lower_95), " to ", fmt_pct(upper_95))
-    )
-  ) %>%
-  select(Measure, `Point estimate` = Point, `95% bootstrap interval` = Interval)
-
-save_table(
-  table_12_bootstrap,
-  "table_12_paired_test_bootstrap",
-  "Paired-bootstrap uncertainty for the fixed test-sample targeted-pricing comparison."
-)
-
+ filter(metric %in% names(bootstrap_label)) %>%
+ mutate(Measure=recode(metric,!!!bootstrap_label),
+ Point=if_else(metric=="absolute_true_conversion_uplift",fmt_pp(point_estimate),fmt_pct(point_estimate)),
+ Interval=if_else(metric=="absolute_true_conversion_uplift",
+  paste0(fmt_pp(lower_95)," to ",fmt_pp(upper_95)),
+  paste0(fmt_pct(lower_95)," to ",fmt_pct(upper_95)))) %>%
+ select(Measure,`Point estimate`=Point,`95% bootstrap interval`=Interval)
+save_table(table_12_bootstrap,"table_12_paired_test_bootstrap",
+ "Paired-bootstrap uncertainty for the fixed test-sample targeted-pricing comparison.")
 knitr::kable(table_12_bootstrap)
+} else {
+  message("Paired bootstrap table skipped: rerun Module 06B on 10,000 profiles.")
+}
+
 ```
 
-# Appendix/supporting tables
+# Supporting tables
 
-## Table A1 - Monte Carlo stability summary
-
+## A1 — Monte Carlo summary
 ```{r table-monte-carlo-summary}
 mc_summary <- tibble(
-  Measure = c(
-    "Selected market-model log-loss improvement vs Own-price GLM",
-    "DGP probability Spearman gain vs Own-price GLM",
-    "Relative conversion uplift under simulated demand",
-    "Contribution retention",
-    "Aggregate quoted rate level",
-    "Targeted expected claims ratio"
-  ),
-  Minimum = c(
-    min(monte_carlo$selected_relative_log_loss_improvement_vs_own_price, na.rm = TRUE),
-    min(monte_carlo$truth_recovery_spearman_gain, na.rm = TRUE),
-    min(monte_carlo$targeted_true_relative_conversion_uplift, na.rm = TRUE),
-    min(monte_carlo$targeted_true_margin_retention, na.rm = TRUE),
-    min(monte_carlo$targeted_test_rate_level, na.rm = TRUE),
-    min(monte_carlo$targeted_true_claim_ratio, na.rm = TRUE)
-  ),
-  Mean = c(
-    mean(monte_carlo$selected_relative_log_loss_improvement_vs_own_price, na.rm = TRUE),
-    mean(monte_carlo$truth_recovery_spearman_gain, na.rm = TRUE),
-    mean(monte_carlo$targeted_true_relative_conversion_uplift, na.rm = TRUE),
-    mean(monte_carlo$targeted_true_margin_retention, na.rm = TRUE),
-    mean(monte_carlo$targeted_test_rate_level, na.rm = TRUE),
-    mean(monte_carlo$targeted_true_claim_ratio, na.rm = TRUE)
-  ),
-  Maximum = c(
-    max(monte_carlo$selected_relative_log_loss_improvement_vs_own_price, na.rm = TRUE),
-    max(monte_carlo$truth_recovery_spearman_gain, na.rm = TRUE),
-    max(monte_carlo$targeted_true_relative_conversion_uplift, na.rm = TRUE),
-    max(monte_carlo$targeted_true_margin_retention, na.rm = TRUE),
-    max(monte_carlo$targeted_test_rate_level, na.rm = TRUE),
-    max(monte_carlo$targeted_true_claim_ratio, na.rm = TRUE)
-  ),
-  format_type = c("pct", "raw", "pct", "pct", "pct", "pct")
-) %>%
-  rowwise() %>%
-  mutate(
-    Minimum = ifelse(
-      format_type == "raw",
-      sprintf("%.3f", Minimum),
-      fmt_pct(Minimum)
-    ),
-    Mean = ifelse(
-      format_type == "raw",
-      sprintf("%.3f", Mean),
-      fmt_pct(Mean)
-    ),
-    Maximum = ifelse(
-      format_type == "raw",
-      sprintf("%.3f", Maximum),
-      fmt_pct(Maximum)
-    )
-  ) %>%
-  ungroup() %>%
-  select(-format_type)
-
-save_table(
-  mc_summary,
-  "table_A1_monte_carlo_stability_summary",
-  "Range and mean of principal outcomes across ten Monte Carlo replications."
-)
-
+ Measure=c("Selected market-model log-loss improvement vs Own-price GLM",
+ "DGP probability Spearman gain vs Own-price GLM",
+ "Relative conversion uplift under simulated demand",
+ "Expected profit retention","Aggregate quoted rate level","Targeted expected claims ratio"),
+ minimum=c(min(monte_carlo$selected_relative_log_loss_improvement_vs_own_price,na.rm=TRUE),
+ min(monte_carlo$truth_recovery_spearman_gain,na.rm=TRUE),
+ min(monte_carlo$targeted_true_relative_conversion_uplift,na.rm=TRUE),
+ min(monte_carlo$targeted_true_margin_retention,na.rm=TRUE),
+ min(monte_carlo$targeted_test_rate_level,na.rm=TRUE),
+ min(monte_carlo$targeted_true_claim_ratio,na.rm=TRUE)),
+ average=c(mean(monte_carlo$selected_relative_log_loss_improvement_vs_own_price,na.rm=TRUE),
+ mean(monte_carlo$truth_recovery_spearman_gain,na.rm=TRUE),
+ mean(monte_carlo$targeted_true_relative_conversion_uplift,na.rm=TRUE),
+ mean(monte_carlo$targeted_true_margin_retention,na.rm=TRUE),
+ mean(monte_carlo$targeted_test_rate_level,na.rm=TRUE),
+ mean(monte_carlo$targeted_true_claim_ratio,na.rm=TRUE)),
+ maximum=c(max(monte_carlo$selected_relative_log_loss_improvement_vs_own_price,na.rm=TRUE),
+ max(monte_carlo$truth_recovery_spearman_gain,na.rm=TRUE),
+ max(monte_carlo$targeted_true_relative_conversion_uplift,na.rm=TRUE),
+ max(monte_carlo$targeted_true_margin_retention,na.rm=TRUE),
+ max(monte_carlo$targeted_test_rate_level,na.rm=TRUE),
+ max(monte_carlo$targeted_true_claim_ratio,na.rm=TRUE)),
+ format_type=c("pct","raw","pct","pct","pct","pct")) %>%
+ rowwise() %>% mutate(
+ Minimum=if_else(format_type=="raw",sprintf("%.3f",minimum),fmt_pct(minimum)),
+ Mean=if_else(format_type=="raw",sprintf("%.3f",average),fmt_pct(average)),
+ Maximum=if_else(format_type=="raw",sprintf("%.3f",maximum),fmt_pct(maximum))) %>%
+ ungroup() %>% select(Measure,Minimum,Mean,Maximum)
+save_table(mc_summary,"table_A1_monte_carlo_stability_summary",
+ "Range and mean of principal outcomes across ten Monte Carlo replications.")
 knitr::kable(mc_summary)
 ```
 
-## Table A2 - Selected segment multipliers
-
+## A2 — Selected multipliers
 ```{r table-selected-multipliers}
 table_A2_multipliers <- selected_multipliers %>%
-  transmute(
-    Segment = pricing_segment,
-    Profiles = development_profiles,
-    `Selected multiplier` = sprintf("%.2f", selected_multiplier),
-    `Expected conversion` = fmt_pct(development_model_expected_conversion_rate),
-    `Segment contribution retention` = fmt_pct(development_segment_margin_retention),
-    `Expected claims ratio` = fmt_pct(development_model_expected_claim_ratio)
-  )
-
-save_table(
-  table_A2_multipliers,
-  "table_A2_selected_segment_multipliers",
-  "Selected validation multipliers and segment-level diagnostics for the vehicle-value targeting strategy."
-)
-
+ transmute(Segment=pricing_segment,Profiles=development_profiles,
+ `Selected multiplier`=sprintf("%.2f",selected_multiplier),
+ `Expected conversion`=fmt_pct(development_model_expected_conversion_rate),
+ `Segment expected profit retention`=fmt_pct(development_segment_margin_retention),
+ `Expected claims ratio`=fmt_pct(development_model_expected_claim_ratio))
+save_table(table_A2_multipliers,"table_A2_selected_segment_multipliers",
+ "Selected validation multipliers and segment-level diagnostics for vehicle-value targeting.")
 knitr::kable(table_A2_multipliers)
 ```
 
-# Figures
+# Figures (existing save basenames retained)
 
-## Figure 1 - End-to-end experimental architecture
+## Figure 1 — Study architecture
 
-```{r figure-architecture, fig.show='hold', fig.width=10.5, fig.height=4.2}
-# ---- Layout constants -------------------------------------------------------
-box_half_w <- 0.43
-box_ymin   <- 1.86
-box_ymax   <- 2.14
-stage_y    <- (box_ymin + box_ymax) / 2
-truth_y    <- 1.60
-bracket_y  <- 2.27
-
-stage_df <- tibble(
-  x = 1:6,
-  y = stage_y,
-  label = c(
-    "Synthetic\nportfolio + claims",
-    "Technical\npricing",
-    "Competitive\nquote market",
-    "Conversion\nmodelling",
-    "Constrained\npricing",
-    "Frozen-decision\nDGP evaluation"
+```{r figure-architecture, fig.width=11, fig.height=3.6}
+architecture_nodes <- tibble::tibble(
+  stage = c(
+    "calibration", "policies", "profiles", "technical", "market",
+    "purchase", "conversion", "repricing", "evaluation", "robustness"
   ),
-  role = c(rep("development", 5), "evaluation"),
-  xmin = x - box_half_w,
-  xmax = x + box_half_w,
-  ymin = box_ymin,
-  ymax = box_ymax
-)
-
-flow_df <- tibble(
-  x    = stage_df$xmax[-6] + 0.03,
-  xend = stage_df$xmin[-1] - 0.03,
-  y    = stage_y,
-  yend = stage_y
-)
-
-bracket_df <- tibble(
-  x     = c(1 - box_half_w, 4 - box_half_w),
-  xend  = c(2 + box_half_w, 4 + box_half_w),
+  x = c(1.10, 3.55, 4.65, 5.75, 7.95, 10.00, 12.05, 14.00, 15.95, 15.95),
+  y = c(2.45, 3.15, 1.75, 3.15, 2.45, 2.45, 2.45, 2.45, 2.45, 0.95),
+  half_width = c(.96, .84, .84, .78, .95, .86, .88, .72, .80, 1.15),
+  half_height = c(.42, .43, .43, .43, .48, .48, .48, .48, .48, .39),
   label = c(
-    "2021–2023 training | 2024 validation | 2025 cohort",
-    "2025 conversion split:\n6,000 training | 2,000 validation | 2,000 test"
+    "Australian public
+calibration inputs",
+    "Synthetic policies
+and claims",
+    "2025 customer
+profiles",
+    "Technical
+pricing",
+    "Competitive market:
+Reference insurer
++ Competitors",
+    "Simulate customer
+purchase outcomes",
+    "Fit conversion
+models",
+    "Repricing",
+    "Independent
+evaluation",
+    "Sensitivity and
+robustness testing"
+  ),
+  role = c(
+    "data", "data", "data", "model", "market",
+    "market", "conversion", "decision", "evaluation", "evaluation"
   )
-)
-
-bracket_ticks <- tibble(
-  x = c(bracket_df$x, bracket_df$xend),
-  y = bracket_y, yend = bracket_y - 0.035
-)
-
-truth_path <- tibble(
-  x = c(1, 1, 6, 6),
-  y = c(box_ymin, truth_y, truth_y, box_ymin)
-)
-
-workflow_expr <- paste(
-  'italic("construct truth") %->% italic("hide truth") %->% italic("estimate")',
-  '%->% italic("select") %->% italic("decide") %->% italic("reveal truth")'
-)
-
-ink  <- "grey20"
-rule <- "grey55"
-dark <- "grey25"
-
-p_architecture <- ggplot() +
-  geom_path(
-    data = truth_path, aes(x, y),
-    linetype = "22", colour = rule, linewidth = 0.45,
-    arrow = arrow(length = unit(0.09, "inches"), type = "closed", ends = "last")
-  ) +
-  annotate(
-    "rect", xmin = 2.62, xmax = 4.38, ymin = truth_y - 0.1, ymax = truth_y + 0.1,
-    fill = "white", colour = rule, linewidth = 0.35, linetype = "22"
-  ) +
-  annotate(
-    "text", x = 3.5, y = truth_y,
-    label = "Latent claims and demand truth\nwithheld from model development",
-    family = "serif", size = 3, colour = ink, lineheight = 0.95
-  ) +
-  geom_rect(
-    data = stage_df,
-    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = role),
-    colour = dark, linewidth = 0.35
-  ) +
-  geom_text(
-    data = stage_df,
-    aes(x = x, y = y, label = label, colour = role),
-    family = "serif", size = 3.1, lineheight = 0.95
-  ) +
-  scale_fill_manual(values = c(development = "white", evaluation = dark), guide = "none") +
-  scale_colour_manual(values = c(development = ink, evaluation = "white"), guide = "none") +
-  geom_segment(
-    data = flow_df, aes(x = x, xend = xend, y = y, yend = yend),
-    colour = dark, linewidth = 0.45,
-    arrow = arrow(length = unit(0.07, "inches"), type = "closed")
-  ) +
-  annotate(
-    "rect", xmin = -0.62, xmax = 0.27, ymin = stage_y - 0.1, ymax = stage_y + 0.1,
-    fill = "grey95", colour = rule, linewidth = 0.35
-  ) +
-  annotate(
-    "text", x = -0.175, y = stage_y,
-    label = "Australian public\ncalibration inputs",
-    family = "serif", size = 3, colour = ink, lineheight = 0.95
-  ) +
-  annotate(
-    "segment", x = 0.30, xend = 1 - box_half_w - 0.03, y = stage_y, yend = stage_y,
-    colour = dark, linewidth = 0.45,
-    arrow = arrow(length = unit(0.07, "inches"), type = "closed")
-  ) +
-  geom_segment(
-    data = bracket_df, aes(x = x, xend = xend, y = bracket_y, yend = bracket_y),
-    colour = rule, linewidth = 0.35
-  ) +
-  geom_segment(
-    data = bracket_ticks, aes(x = x, xend = x, y = y, yend = yend),
-    colour = rule, linewidth = 0.35
-  ) +
-  geom_text(
-    data = bracket_df,
-    aes(x = (x + xend) / 2, y = bracket_y + 0.035, label = label),
-    vjust = 0, family = "serif", size = 2.8, colour = ink, lineheight = 0.95
-  ) +
-  annotate(
-    "text", x = 2.9, y = 2.55, label = workflow_expr, parse = TRUE,
-    family = "serif", size = 3.2, colour = ink
-  ) +
-  coord_cartesian(xlim = c(-0.68, 6.5), ylim = c(1.45, 2.60), expand = FALSE, clip = "off") +
-  theme_void(base_family = "serif") +
-  theme(
-    plot.margin = margin(10, 14, 10, 14),
-    plot.background = element_rect(fill = "white", colour = NA)
+) %>%
+  dplyr::mutate(
+    fill_colour = dplyr::case_when(
+      role == "evaluation" ~ "#E4F2F0",
+      role %in% c("decision", "conversion") ~ "#EAF3F2",
+      role == "market" ~ "#F2F7F9",
+      TRUE ~ "#FFFFFF"
+    ),
+    outline_colour = ifelse(
+      role %in% c("conversion", "decision", "evaluation"),
+      figure_colours[["teal"]], figure_colours[["navy"]]
+    )
   )
 
-save_figure(
-  p_architecture,
-  "fig_01_experimental_architecture",
-  width = 10.5,
-  height = 4.2
+architecture_route <- function(xs, ys, channel="main") {
+  stopifnot(length(xs) == length(ys), length(xs) >= 2L)
+  n <- length(xs) - 1L
+  tibble::tibble(
+    x = xs[seq_len(n)], y = ys[seq_len(n)],
+    xend = xs[seq_len(n) + 1L], yend = ys[seq_len(n) + 1L],
+    channel = channel,
+    final_segment = seq_len(n) == n
+  )
+}
+
+architecture_main_routes <- dplyr::bind_rows(
+  architecture_route(c(2.06, 2.32, 2.32, 2.71), c(2.45, 2.45, 3.15, 3.15)),
+  architecture_route(c(2.06, 2.32, 2.32, 3.81), c(2.45, 2.45, 1.75, 1.75)),
+  architecture_route(c(4.39, 4.98), c(3.15, 3.15)),
+  architecture_route(c(6.53, 6.53, 7.00), c(3.15, 2.66, 2.66)),
+  architecture_route(c(5.49, 6.20, 6.20, 7.00), c(1.75, 1.75, 2.24, 2.24)),
+  architecture_route(c(8.90, 9.14), c(2.45, 2.45)),
+  architecture_route(c(10.86, 11.17), c(2.45, 2.45)),
+  architecture_route(c(12.93, 13.28), c(2.45, 2.45)),
+  architecture_route(c(14.72, 15.15), c(2.45, 2.45)),
+  architecture_route(c(15.95, 15.95), c(1.97, 1.34), "evaluation")
 )
 
-p_architecture
+architecture_truth_routes <- dplyr::bind_rows(
+  architecture_route(c(3.55, 3.55, 6.35), c(3.58, 4.31, 4.31), "withheld"),
+  architecture_route(c(10.00, 10.00), c(2.93, 3.92), "withheld"),
+  architecture_route(c(11.65, 15.95, 15.95), c(4.31, 4.31, 2.93), "withheld")
+)
+
+architecture <- ggplot2::ggplot() +
+  ggplot2::annotate(
+    "rect", xmin=6.35, xmax=11.65, ymin=3.92, ymax=4.70,
+    fill="#F4F7F8", colour=figure_colours[["grey"]],
+    linetype="dashed", linewidth=.72
+  ) +
+  ggplot2::annotate(
+    "text", x=9.00, y=4.31,
+    label="Underlying claims costs and purchase probabilities
+used only for independent evaluation",
+    size=3.70, family="serif", lineheight=1.06,
+    colour=figure_colours[["charcoal"]]
+  ) +
+  ggplot2::geom_segment(
+    data=dplyr::filter(architecture_truth_routes, !final_segment),
+    ggplot2::aes(x=x, y=y, xend=xend, yend=yend),
+    colour=figure_colours[["grey"]], linetype="dashed", linewidth=.57
+  ) +
+  ggplot2::geom_segment(
+    data=dplyr::filter(architecture_truth_routes, final_segment),
+    ggplot2::aes(x=x, y=y, xend=xend, yend=yend),
+    colour=figure_colours[["grey"]], linetype="dashed", linewidth=.57,
+    arrow=grid::arrow(type="closed", length=grid::unit(.065, "in"))
+  ) +
+  ggplot2::geom_segment(
+    data=dplyr::filter(architecture_main_routes, !final_segment),
+    ggplot2::aes(x=x, y=y, xend=xend, yend=yend),
+    colour=figure_colours[["navy"]], linewidth=.74, lineend="round"
+  ) +
+  ggplot2::geom_segment(
+    data=dplyr::filter(architecture_main_routes, final_segment, channel == "main"),
+    ggplot2::aes(x=x, y=y, xend=xend, yend=yend),
+    colour=figure_colours[["navy"]], linewidth=.74, lineend="round",
+    arrow=grid::arrow(type="closed", length=grid::unit(.067, "in"))
+  ) +
+  ggplot2::geom_segment(
+    data=dplyr::filter(architecture_main_routes, final_segment, channel == "evaluation"),
+    ggplot2::aes(x=x, y=y, xend=xend, yend=yend),
+    colour=figure_colours[["teal"]], linewidth=.83, lineend="round",
+    arrow=grid::arrow(type="closed", length=grid::unit(.08, "in"))
+  ) +
+  ggplot2::geom_rect(
+    data=architecture_nodes,
+    ggplot2::aes(
+      xmin=x-half_width, xmax=x+half_width,
+      ymin=y-half_height, ymax=y+half_height,
+      fill=fill_colour, colour=outline_colour
+    ),
+    linewidth=.86, show.legend=FALSE
+  ) +
+  ggplot2::scale_fill_identity() +
+  ggplot2::scale_colour_identity() +
+  ggplot2::geom_text(
+    data=architecture_nodes,
+    ggplot2::aes(x=x, y=y, label=label),
+    colour=figure_colours[["charcoal"]],
+    size=3.68, family="serif", lineheight=1.04
+  ) +
+  ggplot2::coord_cartesian(
+    xlim=c(.00, 17.10), ylim=c(.30, 5.00), clip="off",
+    expand=FALSE
+  ) +
+  ggplot2::theme_void(base_family="serif") +
+  ggplot2::theme(
+    plot.background=ggplot2::element_rect(fill="white", colour=NA),
+    plot.margin=ggplot2::margin(8, 12, 8, 12)
+  )
+
+save_figure(architecture, "fig_01_experimental_architecture", 14.0, 4.5)
+architecture
 ```
 
-
-## Figure 2 - Technical-pricing recovery of latent risk
-
+## Figure 2 — Claims-cost truth recovery
 ```{r figure-technical-truth}
-technical_truth_available <- !is.na(paths$truth_rds) && file.exists(paths$truth_rds)
-
-if (technical_truth_available) {
-  truth_data <- readRDS(paths$truth_rds)
-
-  truth_plot_data <- technical_profiles %>%
-    filter(policy_year == 2025) %>%
-    select(policy_id, estimated_expected_claim_cost) %>%
-    inner_join(
-      truth_data %>%
-        filter(policy_year == 2025) %>%
-        select(policy_id, true_annual_loss_cost),
-      by = "policy_id"
-    ) %>%
-    filter(
-      is.finite(estimated_expected_claim_cost),
-      is.finite(true_annual_loss_cost),
-      estimated_expected_claim_cost > 0,
-      true_annual_loss_cost > 0
-    )
-
-  p_technical_truth <- ggplot(
-    truth_plot_data,
-    aes(x = true_annual_loss_cost, y = estimated_expected_claim_cost)
-  ) +
-    geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.5) +
-    geom_point(alpha = 0.18, size = 0.8) +
-    scale_x_log10(labels = scales::dollar_format(accuracy = 1)) +
-    scale_y_log10(labels = scales::dollar_format(accuracy = 1)) +
-    labs(
-      x = "Underlying expected annual claims cost (log scale)",
-      y = "Fitted expected annual claims cost (log scale)",
-      caption = "Dashed line denotes equality; underlying claims costs are withheld during technical model development."
-    ) +
-    theme_dissertation()
-
-  save_figure(
-    p_technical_truth,
-    "fig_02_technical_truth_recovery",
-    width = 7.2,
-    height = 5.3
-  )
-
-  p_technical_truth
+if (!is.na(paths$truth_rds) && file.exists(paths$truth_rds)) {
+ truth_data <- readRDS(paths$truth_rds)
+ truth_plot_data <- technical_profiles %>% filter(policy_year==2025) %>%
+  select(policy_id,estimated_expected_claim_cost) %>%
+  inner_join(truth_data %>% filter(policy_year==2025) %>%
+    select(policy_id,true_annual_loss_cost),by="policy_id") %>%
+  filter(is.finite(estimated_expected_claim_cost),is.finite(true_annual_loss_cost),
+         estimated_expected_claim_cost>0,true_annual_loss_cost>0)
+ p_technical_truth <- ggplot(truth_plot_data,
+  aes(x=true_annual_loss_cost,y=estimated_expected_claim_cost)) +
+  geom_abline(slope=1,intercept=0,linetype="longdash",linewidth=.7,
+              colour=figure_colours[["orange"]]) +
+  geom_point(alpha=.13,size=.66,colour=figure_colours[["navy"]]) +
+  scale_x_log10(labels=label_dollar(accuracy=1)) +
+  scale_y_log10(labels=label_dollar(accuracy=1)) +
+  labs(x="Underlying annual expected claims cost ($, log scale)",
+       y="Fitted annual expected claims cost ($, log scale)") +
+  theme_dissertation()
+ save_figure(p_technical_truth,"fig_02_technical_truth_recovery",7.3,5.3)
+ p_technical_truth
 } else {
-  message(
-    "Figure 2 skipped: synthetic_motor_full_truth.rds was not found. ",
-    "Run/freeze Module 1 in the standard outputs directory before generating exhibits."
-  )
+ warning("Figure 2 skipped: optional truth RDS missing at its canonical location.")
 }
 ```
 
-## Figure 3 - Conversion by reference insurer quote rank
-
+## Figure 3 — Expected and realised conversion by rank
 ```{r figure-conversion-rank}
 rank_long <- conversion_by_rank %>%
-  select(
-    focal_rank,
-    profiles,
-    expected_focal_conversion_rate,
-    observed_focal_conversion_rate
-  ) %>%
-  pivot_longer(
-    cols = c(expected_focal_conversion_rate, observed_focal_conversion_rate),
-    names_to = "series",
-    values_to = "conversion_rate"
-  ) %>%
-  mutate(
-    series = recode(
-      series,
-      expected_focal_conversion_rate = "DGP-expected",
-      observed_focal_conversion_rate = "Realised"
-    )
-  )
-
-p_rank <- ggplot(
-  rank_long,
-  aes(
-    x = focal_rank,
-    y = conversion_rate,
-    linetype = series,
-    shape = series,
-    group = series
-  )
-) +
-  geom_line(linewidth = 0.65) +
-  geom_point(size = 2.3) +
-  scale_x_continuous(breaks = sort(unique(rank_long$focal_rank))) +
-  scale_y_continuous(
-    labels = scales::percent_format(accuracy = 1),
-    expand = expansion(mult = c(0.02, 0.08))
-  ) +
-  labs(
-    x = "Reference insurer quote rank (1 = cheapest)",
-    y = "Reference insurer conversion rate",
-    caption = "The relationship is generated by the synthetic DGP and is not an empirical estimate of Australian customer behaviour."
-  ) +
-  theme_dissertation()
-
-save_figure(
-  p_rank,
-  "fig_03_conversion_by_rank",
-  width = 7.2,
-  height = 4.8
-)
-
+ select(focal_rank,profiles,expected_focal_conversion_rate,observed_focal_conversion_rate) %>%
+ pivot_longer(cols=c(expected_focal_conversion_rate,observed_focal_conversion_rate),
+  names_to="series",values_to="conversion_rate") %>%
+ mutate(series=recode(series,expected_focal_conversion_rate="Underlying expected",
+                            observed_focal_conversion_rate="Realised"),
+        series=factor(series,levels=c("Underlying expected","Realised")))
+p_rank <- ggplot(rank_long,aes(x=focal_rank,y=conversion_rate,colour=series,
+                               linetype=series,shape=series,group=series)) +
+ geom_line(linewidth=.9) + geom_point(size=2.9) +
+ scale_colour_manual(values=c("Underlying expected"=figure_colours[["navy"]],
+                              "Realised"=figure_colours[["orange"]])) +
+ scale_linetype_manual(values=c("Underlying expected"="solid","Realised"="dashed")) +
+ scale_shape_manual(values=c("Underlying expected"=16,"Realised"=17)) +
+ scale_x_continuous(breaks=sort(unique(rank_long$focal_rank))) +
+ scale_y_continuous(labels=label_percent(accuracy=1),expand=expansion(mult=c(.05,.09))) +
+ labs(x="Reference insurer quote rank (1 = cheapest)",
+      y="Reference insurer conversion rate") + theme_dissertation()
+save_figure(p_rank,"fig_03_conversion_by_rank",7.3,4.8)
 p_rank
 ```
 
-## Figure 4 - Information value versus model flexibility
-
+## Figure 4 — Information versus flexibility
 ```{r figure-model-performance}
-plot_model_metrics <- validation_metrics %>%
-  select(model, log_loss) %>%
-  left_join(
-    truth_recovery %>%
-      select(model, probability_spearman_correlation),
-    by = "model"
-  ) %>%
-  mutate(
-    model = factor(model, levels = model_order)
-  ) %>%
-  pivot_longer(
-    cols = c(log_loss, probability_spearman_correlation),
-    names_to = "metric",
-    values_to = "value"
-  ) %>%
-  mutate(
-    metric = recode(
-      metric,
-      log_loss = "Validation log loss (lower is better)",
-      probability_spearman_correlation =
-        "Test correlation with underlying probability (higher is better)"
-    )
-  )
-
-p_model_performance <- ggplot(
-  plot_model_metrics,
-  aes(x = value, y = model)
-) +
-  geom_segment(
-    aes(x = 0, xend = value, yend = model),
-    linewidth = 0.45
-  ) +
-  geom_point(size = 2.3) +
-  facet_wrap(~ metric, scales = "free_x", ncol = 2) +
-  labs(
-    x = NULL,
-    y = NULL
-  ) +
-  theme_dissertation() +
-  theme(
-    panel.grid.major.y = element_blank(),
-    strip.text = element_text(face = "bold", size = 9.2)
-  )
-
-save_figure(
-  p_model_performance,
-  "fig_04_conversion_model_information_value",
-  width = 10.0,
-  height = 4.7
-)
-
+required_models <- model_order
+plot_values <- validation_final %>% select(model,log_loss) %>%
+ inner_join(truth_recovery %>% select(model,probability_spearman_correlation),by="model")
+if(nrow(plot_values)!=6 || anyDuplicated(plot_values$model) ||
+   !setequal(plot_values$model,required_models) ||
+   anyNA(plot_values[,c("log_loss","probability_spearman_correlation")]))
+ stop("Figure 4 requires exactly six matching complete model outputs.")
+plot_model_metrics <- plot_values %>%
+ mutate(model=factor(model,levels=rev(required_models))) %>%
+ pivot_longer(cols=c(log_loss,probability_spearman_correlation),
+  names_to="metric",values_to="value") %>%
+ mutate(metric=factor(metric,
+  levels=c("probability_spearman_correlation","log_loss"),
+  labels=c("Test underlying probability correlation (higher is better)",
+           "Validation log loss (lower is better)")),
+ value_label=if_else(grepl("log loss",metric),sprintf("%.4f",value),sprintf("%.3f",value)))
+p_model_performance <- ggplot(plot_model_metrics,aes(x=value,y=model)) +
+ geom_segment(aes(x=if_else(grepl("log loss",metric),.425,0),xend=value,yend=model),
+  linewidth=.52,colour=figure_colours[["light"]]) +
+ geom_point(size=2.7,colour=figure_colours[["navy"]]) +
+ geom_text(aes(label=value_label),nudge_y=0.24,hjust=0.5,size=3.0,
+           family="serif",colour=figure_colours[["charcoal"]]) +
+ facet_wrap(~metric,scales="free_x",ncol=2) +
+ scale_x_continuous(expand=expansion(mult=c(.12,.27))) +
+ labs(x=NULL,y=NULL) + theme_dissertation(11) +
+ theme(panel.grid.major.y=element_blank(),strip.text=element_text(size=9.5,face="bold"))
+save_figure(p_model_performance,"fig_04_conversion_model_information_value",10,4.8)
 p_model_performance
 ```
 
-## Figure 5 - Selected targeted multipliers (appendix/supporting)
-
+## Figure 5 — Selected vehicle-value multipliers (supporting appendix)
 ```{r figure-target-multipliers}
 multiplier_plot_data <- selected_multipliers %>%
-  mutate(
-    pricing_segment = factor(
-      pricing_segment,
-      levels = pricing_segment
-    ),
-    multiplier_pct = 100 * selected_multiplier
-  )
-
-p_multipliers <- ggplot(
-  multiplier_plot_data,
-  aes(x = pricing_segment, y = multiplier_pct)
-) +
-  geom_hline(yintercept = 100, linetype = 2, linewidth = 0.5) +
-  geom_segment(
-    aes(xend = pricing_segment, y = 100, yend = multiplier_pct),
-    linewidth = 0.8, colour = "grey40"
-  ) +
-  geom_point(size = 3.1) +
-  geom_text(
-    aes(label = sprintf("%.0f%%", multiplier_pct)),
-    vjust = ifelse(multiplier_plot_data$multiplier_pct >= 100, -0.75, 1.7),
-    size = 3.4, family = "serif"
-  ) +
-  coord_cartesian(ylim = c(93.8, 102.5)) +
-  labs(x = "Vehicle-value quartile", y = "Technical-premium multiplier") +
-  scale_y_continuous(labels = function(x) paste0(x, "%")) +
-  theme_dissertation()
-
-save_figure(
-  p_multipliers,
-  "fig_05_selected_targeted_multipliers",
-  width = 7.2,
-  height = 4.6
-)
-
+ mutate(pricing_segment=factor(pricing_segment,levels=pricing_segment),
+        multiplier_pct=100*selected_multiplier)
+p_multipliers <- ggplot(multiplier_plot_data,
+ aes(x=pricing_segment,y=multiplier_pct)) +
+ geom_hline(yintercept=100,linetype="longdash",linewidth=.6,
+            colour=figure_colours[["grey"]]) +
+ geom_segment(aes(xend=pricing_segment,y=100,yend=multiplier_pct),
+  linewidth=.9,colour=figure_colours[["light"]]) +
+ geom_point(size=3.7,colour=figure_colours[["teal"]]) +
+ geom_text(aes(label=sprintf("%.0f%%",multiplier_pct)),
+  vjust=ifelse(multiplier_plot_data$multiplier_pct>=100,-.85,1.7),
+  size=3.6,family="serif") +
+ coord_cartesian(ylim=c(93.5,102.8)) +
+ scale_y_continuous(labels=function(x)paste0(x,"%")) +
+ labs(x="Vehicle-value quartile",y="Technical-premium multiplier") +
+ theme_dissertation()
+save_figure(p_multipliers,"fig_05_selected_targeted_multipliers",7.3,4.7)
 p_multipliers
 ```
 
-## Figure 6 - Structural sensitivity decision map
-
+## Figure 6 source — Structural sensitivity (Figure 7 in report after pricing comparison)
 ```{r figure-sensitivity-map}
 sensitivity_plot <- sensitivity %>%
   mutate(
     Scenario = recode(case_id, !!!scenario_labels, .default = case_id),
-    conversion_uplift_pct = 100 * targeted_true_relative_conversion_uplift,
-    margin_retention_pct = 100 * targeted_true_margin_retention
+    uplift_pct = 100 * targeted_true_relative_conversion_uplift,
+    retention_pct = 100 * targeted_true_margin_retention
   )
 
-p_sensitivity <- ggplot(
-  sensitivity_plot,
-  aes(
-    x = conversion_uplift_pct,
-    y = margin_retention_pct,
-    shape = pricing_conclusion_stable
-  )
-) +
-  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.45) +
-  geom_hline(yintercept = 100, linetype = 2, linewidth = 0.45) +
-  geom_point(size = 2.7) +
-  scale_shape_manual(
-    values = c(`TRUE` = 16, `FALSE` = 4),
-    labels = c(`TRUE` = "Pricing criterion retained", `FALSE` = "Pricing criterion not retained")
-  ) +
-  labs(
-    x = "Relative conversion uplift under simulated demand (%)",
-    y = "Contribution retention under simulated demand (%)"
-  ) +
-  theme_dissertation()
-
-if (requireNamespace("ggrepel", quietly = TRUE)) {
-  p_sensitivity <- p_sensitivity +
-    ggrepel::geom_text_repel(
-      aes(label = Scenario),
-      size = 2.7,
-      family = "serif",
-      box.padding = 0.25,
-      point.padding = 0.15,
-      max.overlaps = Inf,
-      show.legend = FALSE
-    )
-} else {
-  p_sensitivity <- p_sensitivity +
-    geom_text(
-      aes(label = Scenario),
-      size = 2.5,
-      family = "serif",
-      nudge_y = 0.7,
-      check_overlap = TRUE,
-      show.legend = FALSE
-    )
-}
-
-save_figure(
-  p_sensitivity,
-  "fig_06_sensitivity_decision_map",
-  width = 8.4,
-  height = 5.6
+# Baseline and strict adequacy have identical coordinates in the 250,000-policy
+# experiment. Use one shared label to avoid two labels competing for one point.
+baseline_point <- sensitivity_plot %>% filter(case_id == "baseline")
+strict_point <- sensitivity_plot %>% filter(case_id == "pricing_strict_adequacy")
+coincident_baseline_strict <- (
+  nrow(baseline_point) == 1L && nrow(strict_point) == 1L &&
+  abs(baseline_point$uplift_pct - strict_point$uplift_pct) < 1e-8 &&
+  abs(baseline_point$retention_pct - strict_point$retention_pct) < 1e-8
 )
 
+# Fixed text offsets are deliberate: this avoids automatic label repulsion
+# placing text on the horizontal 100% benchmark or overlapping close points.
+# The plotted coordinates, scenario results and benchmark lines are unchanged.
+sensitivity_labels <- sensitivity_plot %>%
+  mutate(
+    display_label = case_when(
+      case_id == "baseline" & coincident_baseline_strict ~
+        "Baseline /\nStrict adequacy",
+      case_id == "pricing_strict_adequacy" & coincident_baseline_strict ~
+        NA_character_,
+      TRUE ~ Scenario
+    ),
+    dx = case_when(
+      case_id == "baseline" ~ 3.25,
+      case_id == "pricing_strict_adequacy" ~ -2.0,
+      case_id == "market_high_competition" ~ -0.9,
+      case_id == "market_low_competition" ~ 1.6,
+      case_id == "market_fragmented" ~ -1.5,
+      case_id == "demand_low_price_sensitivity" ~ 2.2,
+      case_id == "demand_agentic" ~ -2.0,
+      case_id == "demand_threshold" ~ -1.2,
+      case_id == "pricing_narrow_support" ~ 0.7,
+      case_id == "pricing_wide_stress" ~ 2.2,
+      TRUE ~ 0.8
+    ),
+    dy = case_when(
+      case_id == "baseline" ~ -0.78,
+      case_id == "pricing_strict_adequacy" ~ -1.05,
+      case_id == "market_high_competition" ~ 0.75,
+      case_id == "market_low_competition" ~ 0.84,
+      case_id == "market_fragmented" ~ -0.72,
+      case_id == "demand_low_price_sensitivity" ~ 0.92,
+      case_id == "demand_agentic" ~ -0.70,
+      case_id == "demand_threshold" ~ 0.62,
+      case_id == "pricing_narrow_support" ~ -1.13,
+      case_id == "pricing_wide_stress" ~ 0.45,
+      TRUE ~ 0.6
+    ),
+    label_x = uplift_pct + dx,
+    label_y = retention_pct + dy
+  ) %>%
+  filter(!is.na(display_label))
+
+p_sensitivity <- ggplot(sensitivity_plot, aes(x = uplift_pct, y = retention_pct)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = .6,
+             colour = figure_colours[["grey"]]) +
+  geom_hline(yintercept = 100, linetype = "dashed", linewidth = .6,
+             colour = figure_colours[["grey"]]) +
+  # Draw fine leader lines first, so points and text remain unobstructed.
+  geom_segment(
+    data = sensitivity_labels,
+    aes(x = uplift_pct, y = retention_pct, xend = label_x, yend = label_y),
+    inherit.aes = FALSE, linewidth = .33,
+    colour = "#9DAFB9"
+  ) +
+  geom_point(aes(shape = pricing_conclusion_stable,
+                 colour = pricing_conclusion_stable), size = 3.3, stroke = .8) +
+  # White, borderless backgrounds prevent dashed grid/reference lines from
+  # running through the labels (particularly Low price sensitivity).
+  geom_label(
+    data = sensitivity_labels,
+    aes(x = label_x, y = label_y, label = display_label),
+    inherit.aes = FALSE, size = 3.25, family = "serif",
+    colour = figure_colours[["charcoal"]], fill = "white",
+    label.size = 0, label.padding = grid::unit(.09, "lines")
+  ) +
+  scale_colour_manual(
+    values = c(`TRUE` = figure_colours[["teal"]],
+               `FALSE` = figure_colours[["orange"]]), guide = "none"
+  ) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 4), guide = "none") +
+  scale_x_continuous(breaks = seq(0, 35, 5)) +
+  scale_y_continuous(breaks = seq(100, 112, 2)) +
+  coord_cartesian(xlim = c(-1.5, 35.0), ylim = c(99.1, 112.1)) +
+  labs(x = "Relative conversion uplift under simulated demand (%)",
+       y = "Expected profit retention under simulated demand (%)") +
+  theme_dissertation()
+
+save_figure(p_sensitivity, "fig_06_sensitivity_decision_map", 9.1, 6.2)
 p_sensitivity
 ```
 
-## Figure 7 - Monte Carlo stability
-
+## Figure 7 source — Monte Carlo stability (Figure 8 in report after pricing comparison)
 ```{r figure-monte-carlo}
 mc_long <- monte_carlo %>%
-  transmute(
-    replication_id,
-    model_family = toupper(selected_conversion_model_type),
-    `Relative conversion uplift` =
-      100 * targeted_true_relative_conversion_uplift,
-    `Contribution retention` =
-      100 * targeted_true_margin_retention
-  ) %>%
-  pivot_longer(
-    cols = c(`Relative conversion uplift`, `Contribution retention`),
-    names_to = "metric",
-    values_to = "value"
-  )
-
-mc_reference <- tibble(
-  metric = c("Relative conversion uplift", "Contribution retention"),
-  reference = c(0, 100)
-)
-
-p_mc <- ggplot(
-  mc_long,
-  aes(
-    x = replication_id,
-    y = value,
-    shape = model_family
-  )
-) +
-  geom_hline(
-    data = mc_reference,
-    aes(yintercept = reference),
-    linetype = 2,
-    linewidth = 0.45,
-    inherit.aes = FALSE
-  ) +
-  geom_line(aes(group = metric), linewidth = 0.45) +
-  geom_point(size = 2.4) +
-  facet_wrap(~ metric, scales = "free_y", ncol = 1) +
-  scale_x_continuous(breaks = sort(unique(mc_long$replication_id))) +
-  labs(
-    x = "Monte Carlo replication",
-    y = "Percent"
-  ) +
-  theme_dissertation()
-
-save_figure(
-  p_mc,
-  "fig_07_monte_carlo_stability",
-  width = 8.0,
-  height = 6.3
-)
-
+ transmute(replication_id,
+ model_family=toupper(selected_conversion_model_type),
+ `Relative conversion uplift`=100*targeted_true_relative_conversion_uplift,
+ `Expected profit retention`=100*targeted_true_margin_retention) %>%
+ pivot_longer(cols=c(`Relative conversion uplift`,`Expected profit retention`),
+             names_to="metric",values_to="value")
+mc_reference <- tibble(metric=c("Relative conversion uplift","Expected profit retention"),
+                       reference=c(0,100))
+p_mc <- ggplot(mc_long,aes(x=replication_id,y=value,shape=model_family,colour=model_family)) +
+ geom_hline(data=mc_reference,aes(yintercept=reference),inherit.aes=FALSE,
+            linetype="dashed",linewidth=.6,colour=figure_colours[["grey"]]) +
+ geom_point(size=3.0) +
+ facet_wrap(~metric,scales="free_y",ncol=1) +
+ scale_colour_manual(values=c(GLM=figure_colours[["navy"]],
+                              GAM=figure_colours[["orange"]])) +
+ scale_shape_manual(values=c(GLM=16,GAM=17)) +
+ scale_x_continuous(breaks=sort(unique(mc_long$replication_id))) +
+  labs(x="Independent Monte Carlo replication",y="Percent") +
+  theme_dissertation() +
+  theme(legend.position = "none")
+save_figure(p_mc,"fig_07_monte_carlo_stability",8.3,6.4)
 p_mc
 ```
 
-## Figure 8 - Paired-bootstrap conversion uplift (appendix/supporting)
-
+## Figure 8 — Paired bootstrap (appendix)
 ```{r figure-bootstrap}
-if (!is.null(bootstrap_replications)) {
-  point_uplift <- bootstrap_summary %>%
-    filter(metric == "absolute_true_conversion_uplift") %>%
-    pull(point_estimate) * 100
+if(!is.null(bootstrap_replications)) {
+ point_uplift <- bootstrap_summary %>% filter(metric=="absolute_true_conversion_uplift") %>% pull(point_estimate)*100
+ lower_uplift <- bootstrap_summary %>% filter(metric=="absolute_true_conversion_uplift") %>% pull(lower_95)*100
+ upper_uplift <- bootstrap_summary %>% filter(metric=="absolute_true_conversion_uplift") %>% pull(upper_95)*100
+ p_bootstrap <- bootstrap_replications %>%
+  mutate(absolute_uplift_pp=100*absolute_true_conversion_uplift) %>%
+  ggplot(aes(x=absolute_uplift_pp)) +
+  geom_histogram(bins=45,fill=figure_colours[["navy"]],colour="white",linewidth=.23) +
+  geom_vline(xintercept=point_uplift,linewidth=.9,colour=figure_colours[["orange"]]) +
+  geom_vline(xintercept=c(lower_uplift,upper_uplift),linetype="longdash",
+             linewidth=.8,colour=figure_colours[["teal"]]) +
+  labs(x="Absolute expected conversion uplift (percentage points)",
+       y="Bootstrap resamples") + theme_dissertation()
+ save_figure(p_bootstrap,"fig_08_bootstrap_conversion_uplift",7.3,4.9)
+ p_bootstrap
+} else message("Paired-bootstrap figure skipped until new 10,000-profile results are available.")
+```
 
-  lower_uplift <- bootstrap_summary %>%
-    filter(metric == "absolute_true_conversion_uplift") %>%
-    pull(lower_95) * 100
+## Figure 9 — Independent-test expected policies and underwriting profit
+```{r figure-pricing-comparison}
+pricing_baseline <- strategy_rows %>% dplyr::filter(strategy == "Technical-pricing benchmark")
+pricing_targeted <- strategy_rows %>% dplyr::filter(strategy == "Market-position targeted strategy")
+if (nrow(pricing_baseline) != 1L || nrow(pricing_targeted) != 1L) {
+  stop("Figure 9 requires exactly one technical benchmark and targeted strategy.")
+}
 
-  upper_uplift <- bootstrap_summary %>%
-    filter(metric == "absolute_true_conversion_uplift") %>%
-    pull(upper_95) * 100
+plot_data <- tibble::tibble(
+  measure = rep(c("Expected policies written", "Expected pre-expense underwriting profit"), each=2),
+  strategy = rep(c("Technical benchmark", "Targeted strategy"), times=2),
+  value = c(pricing_baseline$true_expected_new_business,
+            pricing_targeted$true_expected_new_business,
+            pricing_baseline$true_expected_underwriting_margin,
+            pricing_targeted$true_expected_underwriting_margin)
+)
 
-  p_bootstrap <- bootstrap_replications %>%
+plot_data <- plot_data %>%
+  mutate(strategy = factor(strategy,
+    levels = c("Technical benchmark", "Targeted strategy"))) %>% 
+  dplyr::mutate(label = dplyr::if_else(measure=="Expected policies written",
+                                       formatC(value, format="f", digits=0, big.mark=","),
+                                       paste0("$",formatC(value,format="f",digits=0,big.mark=","))))
+changes <- plot_data %>% dplyr::group_by(measure) %>%
+  dplyr::summarise(delta=value[strategy=="Targeted strategy"] -
+                     value[strategy=="Technical benchmark"], .groups="drop")
+p_pricing <- ggplot2::ggplot(plot_data,
+                             ggplot2::aes(x=strategy,y=value,fill=strategy)) +
+  ggplot2::geom_col(width=.55) +
+  ggplot2::geom_text(ggplot2::aes(label=label),vjust=-.45,size=3.6,family="serif") +
+  ggplot2::facet_wrap(~measure, scales="free_y", ncol=2) +
+  ggplot2::scale_fill_manual(values=c("Technical benchmark"=figure_colours[["navy"]],
+                                      "Targeted strategy"=figure_colours[["teal"]])) +
+  ggplot2::scale_y_continuous(labels = function(x) {
+    if (max(abs(x), na.rm = TRUE) > 10000) {
+      ifelse(x == 0, "$0", paste0("$", scales::comma(x / 1000), "k"))
+    } else {scales::comma(x)}},
+  expand = ggplot2::expansion(mult = c(0, .22))) +
+  ggplot2::labs(x=NULL,y=NULL) + theme_dissertation(11) +
+  ggplot2::theme(axis.text.x=ggplot2::element_text(size=9),
+                 legend.position="none", panel.grid.major.y=ggplot2::element_line(colour="#E5EBEF"))
+save_figure(p_pricing, "fig_09_test_pricing_comparison", 9.2, 4.1)
+p_pricing
+```
+
+## Figure 10 — NEW (optional): Seven-insurer initial quote market
+```{r figure-seven-insurers}
+truth_path <- resolve_file("outputs/conversion_generation/conversion_truth.rds", FALSE)
+alt_path <- resolve_file("outputs/conversion_generation/conversion_alternative_truth.rds", FALSE)
+if (!is.na(truth_path) && !is.na(alt_path)) {
+  profile_truth <- readRDS(truth_path)
+  alternative_truth <- readRDS(alt_path)
+  validate_cols(profile_truth,
+                c("policy_id", "quote_profile_id", "true_market_purchase_probability"),
+                "Conversion truth")
+  validate_cols(alternative_truth,
+                c("policy_id", "quote_profile_id", "alternative_id",
+                  "alternative_quote", "true_conditional_choice_probability", "is_focal"),
+                "Alternative truth")
+
+  profiles <- profile_truth %>%
+    distinct(policy_id, quote_profile_id, .keep_all = TRUE) %>%
+    select(policy_id, quote_profile_id, true_market_purchase_probability)
+  n_profiles <- nrow(profiles)
+
+  choices <- alternative_truth %>%
+    inner_join(profiles, by = c("policy_id", "quote_profile_id")) %>%
     mutate(
-      absolute_uplift_pp = 100 * absolute_true_conversion_uplift
+      insurer = if_else(as.logical(is_focal), "Reference insurer",
+                        paste0("Competitor ", alternative_id)),
+      kind = if_else(as.logical(is_focal), "Reference insurer", "Competitors"),
+      unconditional_purchase = true_market_purchase_probability *
+        true_conditional_choice_probability
+    )
+
+  prob_check <- choices %>%
+    group_by(policy_id, quote_profile_id) %>%
+    summarise(prob = sum(true_conditional_choice_probability), .groups = "drop")
+  if (nrow(prob_check) != n_profiles || any(abs(prob_check$prob - 1) > 1e-8)) {
+    stop("Seven-insurer conditional choice probabilities do not reconcile.")
+  }
+
+  summary_insurer <- choices %>%
+    group_by(insurer, kind) %>%
+    summarise(
+      returned_quotes = n(),
+      q10 = as.numeric(quantile(alternative_quote, 0.10)),
+      q25 = as.numeric(quantile(alternative_quote, 0.25)),
+      median_quote = median(alternative_quote),
+      q75 = as.numeric(quantile(alternative_quote, 0.75)),
+      q90 = as.numeric(quantile(alternative_quote, 0.90)),
+      expected_purchase_share = sum(unconditional_purchase) / n_profiles,
+      .groups = "drop"
     ) %>%
-    ggplot(aes(x = absolute_uplift_pp)) +
-    geom_histogram(bins = 45, boundary = 0, linewidth = 0.2) +
-    geom_vline(
-      xintercept = point_uplift,
-      linewidth = 0.7
-    ) +
-    geom_vline(
-      xintercept = c(lower_uplift, upper_uplift),
-      linetype = 2,
-      linewidth = 0.55
-    ) +
-    labs(
-      x = "Absolute expected conversion uplift (percentage points)",
-      y = "Bootstrap replications",
-      caption = "Solid line: point estimate. Dashed lines: 95% percentile interval."
-    ) +
-    theme_dissertation()
+    arrange(desc(kind == "Reference insurer"), insurer) %>%
+    mutate(insurer = factor(insurer, levels = insurer),
+           is_reference = kind == "Reference insurer")
 
-  save_figure(
-    p_bootstrap,
-    "fig_08_bootstrap_conversion_uplift",
-    width = 7.2,
-    height = 4.8
+  if (nrow(summary_insurer) != 7 ||
+      abs(sum(summary_insurer$expected_purchase_share) -
+          mean(profiles$true_market_purchase_probability)) > 1e-8) {
+    stop("Seven-insurer participation reconciliation failed.")
+  }
+
+  readr::write_csv(summary_insurer,
+                   file.path(figure_dir, "fig_10_seven_insurer_summary.csv"))
+
+  insurer_palette <- c(
+    "Reference insurer" = figure_colours[["navy"]],
+    "Competitors" = "#9AAAB8"
   )
+  insurer_labels <- function(x) {
+    ifelse(x == "Reference insurer", "Reference\ninsurer",
+           sub("^Competitor ", "Competitor\n", x))
+  }
 
-  p_bootstrap
+  summary_insurer <- summary_insurer %>%
+    mutate(median_label_y = median_quote + pmin(
+      0.38 * (q75 - median_quote), 0.18 * (q75 - q25)
+    ))
+  pa <- ggplot(summary_insurer, aes(x = insurer, fill = kind)) +
+    geom_boxplot(
+      aes(ymin = q10, lower = q25, middle = median_quote,
+          upper = q75, ymax = q90),
+      stat = "identity", width = .58, linewidth = .65,
+      colour = figure_colours[["charcoal"]], alpha = .70,
+      show.legend = FALSE
+    ) +
+    geom_label(aes(y = median_label_y,
+                   label = scales::dollar(median_quote, accuracy = 1)),
+               size = 2.55, family = "serif", fontface = "plain",
+               fill = "NA", alpha = .96,
+               label.size = 0, label.padding = grid::unit(.035, "lines"),
+               colour = figure_colours[["charcoal"]], show.legend = FALSE) +
+    scale_fill_manual(values = insurer_palette) +
+    scale_x_discrete(labels = insurer_labels) +
+    scale_y_continuous(labels = scales::label_dollar(accuracy = 1),
+                       breaks = scales::breaks_pretty(n = 4),
+                       expand = expansion(mult = c(.04, .06))) +
+    labs(x = NULL, y = "Quoted premium ($)") +
+    theme_dissertation(11.0) +
+    theme(axis.text.x = element_text(angle = 0, hjust = .5,
+                                     lineheight = .94, size = 8.35),
+          axis.title.y = element_text(margin = margin(r = 8)),
+          legend.position = "none",
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank())
+
+  pb <- ggplot(summary_insurer,
+               aes(x = insurer, y = expected_purchase_share, fill = kind)) +
+    geom_col(width = .61, show.legend = FALSE) +
+    geom_text(aes(label = scales::percent(expected_purchase_share,
+                                         accuracy = .1)),
+              vjust = -.5, size = 3.0, family = "serif",
+              colour = figure_colours[["charcoal"]], show.legend = FALSE) +
+    scale_fill_manual(values = insurer_palette) +
+    scale_x_discrete(labels = insurer_labels) +
+    scale_y_continuous(labels = scales::label_percent(accuracy = 1),
+                       expand = expansion(mult = c(0, .22))) +
+    labs(x = NULL, y = "Expected purchase share (%)") +
+    theme_dissertation(11.0) +
+    theme(axis.text.x = element_text(angle = 0, hjust = .5,
+                                     lineheight = .94, size = 8.35),
+          axis.title.y = element_text(margin = margin(r = 8)),
+          legend.position = "none",
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank())
+
+  if (requireNamespace("patchwork", quietly = TRUE)) {
+    p_insurer <- pa / pb + patchwork::plot_layout(heights = c(1, 1))
+    save_figure(p_insurer, "fig_10_seven_insurer_comparison", 7.8, 5.3)
+    p_insurer
+  } else {
+    warning("Figure 10 requires optional package patchwork; no files were written.")
+  }
 } else {
-  message(
-    "Figure 8 skipped: paired_bootstrap_replications.csv was not found. ",
-    "The bootstrap summary table was still generated."
-  )
+  warning("Figure 10 skipped: optional Module 04 alternative-truth RDS files unavailable.")
 }
 ```
 
-# Exhibit manifests
-
-```{r manifests}
-figure_manifest <- tribble(
-  ~file_stub, ~recommended_placement, ~purpose,
-  "fig_01_experimental_architecture", "Main text - Method opening",
-  "Explain the full information flow, sample roles and truth-withholding design.",
-  "fig_02_technical_truth_recovery", "Main text - Results 4.1.1",
-  "Compare fitted and underlying expected claims costs on the independent 2025 cohort.",
-  "fig_03_conversion_by_rank", "Main text - Results 4.1.2",
-  "Visualise the synthetic demand signal created by competitive rank.",
-  "fig_04_conversion_model_information_value", "Main text - Results 4.2",
-  "Show that the large gain comes from competitive information rather than the final increase in flexibility.",
-  "fig_05_selected_targeted_multipliers", "Appendix or Results 4.3 if space permits",
-  "Show the validation-selected price multipliers for vehicle-value segments.",
-  "fig_06_sensitivity_decision_map", "Main text - Results 4.4.1",
-  "Show robustness and the low-price-sensitivity boundary condition.",
-  "fig_07_monte_carlo_stability", "Main text - Results 4.4.2",
-  "Show stability across complete independent synthetic regenerations.",
-  "fig_08_bootstrap_conversion_uplift", "Appendix",
-  "Show finite test-sample uncertainty; exact values remain in the main bootstrap table."
-)
-
-table_manifest <- tribble(
-  ~file_stub, ~recommended_placement,
-  "table_01_empirical_calibration_sources", "Method 3.1",
-  "table_02_technical_pricing_candidate_ladder", "Method 3.3 or Appendix",
-  "table_03_conversion_model_sequence", "Method 3.5",
-  "table_04_pricing_constraints", "Method 3.6",
-  "table_05_robustness_framework", "Method 3.7",
-  "table_06_technical_pricing_validation", "Results 4.1.1",
-  "table_07_quote_market_characteristics", "Results 4.1.2",
-  "table_08_conversion_model_performance", "Results 4.2",
-  "table_09_targeting_candidates", "Results 4.3.1",
-  "table_10_frozen_test_pricing_comparison", "Results 4.3.2 (compact strategy rows)",
-  "table_10_frozen_test_pricing_comparison_wide", "Results 4.3.2 (matches thesis Table 9)",
-  "table_11_structural_sensitivity", "Results 4.4.1 or Appendix if Figure 6 is retained",
-  "table_12_paired_test_bootstrap", "Results 4.4.3",
-  "table_A1_monte_carlo_stability_summary", "Appendix",
-  "table_A2_selected_segment_multipliers", "Appendix"
-)
-
-write_csv(
-  figure_manifest,
-  file.path(exhibit_dir, "figure_manifest.csv")
-)
-
-write_csv(
-  table_manifest,
-  file.path(exhibit_dir, "table_manifest.csv")
-)
-
-knitr::kable(figure_manifest)
-knitr::kable(table_manifest)
+## Figure 11 — NEW (optional): Fitted technical-pricing relativities for Appendix C
+```{r figure-fitted-relativities}
+freq_path <- resolve_file("outputs/technical_pricing/final_frequency_model.rds",FALSE)
+sev_path <- resolve_file("outputs/technical_pricing/final_severity_model.rds",FALSE)
+modelling_path <- resolve_file("outputs/synthetic_generator_multiyear/synthetic_motor_modelling.csv",FALSE)
+if(!is.na(freq_path) && !is.na(sev_path) && !is.na(modelling_path)) {
+ freq_model <- readRDS(freq_path)
+ sev_model <- readRDS(sev_path)
+ raw <- read_csv_safe(modelling_path) %>% filter(policy_year<=2024)
+ validate_cols(raw,c("driver_age","licence_years","annual_km","vehicle_value","vehicle_age",
+  "voluntary_excess","prior_claims_5yr","exposure"),"Technical model development data")
+ raw <- raw %>% mutate(
+  prior_claims_band=factor(case_when(prior_claims_5yr<=0~"0",prior_claims_5yr==1~"1",
+   prior_claims_5yr==2~"2",prior_claims_5yr==3~"3",TRUE~"4+"),
+   levels=c("0","1","2","3","4+")),
+  excess_factor=factor(voluntary_excess),
+  log_annual_km=log(pmax(annual_km,1)),
+  log_vehicle_value=log(pmax(vehicle_value,1)))
+ for(k in c("state","remoteness_area","vehicle_segment","motive_power","transmission"))
+  if(k %in% names(raw)) raw[[k]] <- factor(raw[[k]])
+ anchor <- raw %>% filter(complete.cases(driver_age,licence_years,annual_km,
+                          vehicle_value,vehicle_age)) %>%
+  mutate(distance=abs(driver_age-median(driver_age))/25+
+    abs(log_annual_km-median(log_annual_km))+
+    abs(log_vehicle_value-median(log_vehicle_value))) %>%
+  arrange(distance) %>% slice(1) %>% select(-distance)
+ if(nrow(anchor)!=1) stop("No valid representative technical-pricing profile available")
+ for(k in names(freq_model$xlevels))
+  if(k %in% names(anchor)) anchor[[k]] <- factor(as.character(anchor[[k]]),
+                                                levels=freq_model$xlevels[[k]])
+ for(k in names(sev_model$xlevels))
+  if(k %in% names(anchor)) anchor[[k]] <- factor(as.character(anchor[[k]]),
+                                                levels=sev_model$xlevels[[k]])
+ make_effect <- function(model,variable,values,outcome,label) {
+  pred <- function(v) {
+   newdata <- anchor[rep(1,length(v)),,drop=FALSE]
+   newdata[[variable]] <- v
+   if(variable=="annual_km") newdata$log_annual_km <- log(pmax(v,1))
+   if(variable=="vehicle_value") newdata$log_vehicle_value <- log(pmax(v,1))
+   as.numeric(predict(model,newdata=newdata,type="response"))
+  }
+  ref <- pred(anchor[[variable]])[[1]]
+  tibble(metric=label,x=values,relativity=pred(values)/ref,
+         outcome=outcome,reference_value=as.numeric(anchor[[variable]]))
+ }
+ qseq <- function(x) seq(as.numeric(quantile(x,.05,na.rm=TRUE)),
+                          as.numeric(quantile(x,.95,na.rm=TRUE)),length.out=55)
+ relative_effects <- bind_rows(
+  make_effect(freq_model,"driver_age",qseq(raw$driver_age),"Paid-claim frequency","Driver age (years)"),
+  make_effect(freq_model,"annual_km",qseq(raw$annual_km),"Paid-claim frequency","Annual kilometres (km)"),
+  make_effect(sev_model,"vehicle_value",qseq(raw$vehicle_value),"Paid-claim severity","Vehicle value ($)"))
+ if(any(!is.finite(relative_effects$relativity))) stop("Invalid fitted relativities")
+ readr::write_csv(relative_effects,file.path(figure_dir,"fig_11_fitted_relativities_data.csv"))
+ readr::write_csv(anchor,file.path(figure_dir,"fig_11_fitted_relativities_reference_profile.csv"))
+ p_effects <- ggplot(relative_effects,aes(x=x,y=relativity,colour=outcome)) +
+  geom_hline(yintercept=1,linetype="dashed",linewidth=.6,
+             colour=figure_colours[["grey"]]) +
+  geom_line(linewidth=1.15) +
+  facet_wrap(~metric,scales="free_x",ncol=2) +
+  scale_colour_manual(values=c("Paid-claim frequency"=figure_colours[["navy"]],
+                               "Paid-claim severity"=figure_colours[["orange"]])) +
+  labs(x="Rating characteristic (panel-specific units)",
+       y="Fitted relativity (reference profile = 1.00)") + theme_dissertation()
+ save_figure(p_effects,"fig_11_fitted_technical_relativities",9.3,7.5)
+ p_effects
+} else warning("Figure 11 skipped: saved technical model objects or development file missing.")
 ```
 
-# Recommended main-text exhibit set
-
-For the final dissertation, the preferred main-text set is:
-
-1. **Figure 1:** experimental architecture.
-2. **Table 1:** empirical calibration sources.
-3. **Table 3:** conversion-model sequence.
-4. **Table 4:** pricing constraints.
-5. **Table 5:** robustness framework.
-6. **Figure 2:** technical-pricing truth recovery.
-7. **Figure 3:** conversion by rank.
-8. **Table 8 + Figure 4:** conversion-model performance and information value.
-9. **Table 9:** leading targeting candidates.
-10. **Table 10:** independent test pricing comparison.
-11. **Figure 6:** structural sensitivity decision map.
-12. **Figure 7:** Monte Carlo stability.
-13. **Table 12:** paired-bootstrap uncertainty.
-
-To avoid visual duplication, **Table 11** (full structural sensitivity), **Figure 5** (selected multipliers), **Figure 8** (bootstrap distribution), **Table A1**, and **Table A2** are better placed in the appendices unless space permits.
-
-# Example insertion code for the dissertation
-
-Figures should be inserted from the generated PDF files so that they remain vector graphics in the final dissertation:
-
-````
-```{r fig-architecture, echo=FALSE, out.width='100%', fig.cap='End-to-end experimental architecture and information controls.'}
-knitr::include_graphics(
-  "outputs/dissertation_exhibits/figures/fig_01_experimental_architecture.pdf"
-)
+# Export inventory
+```{r exhibit-inventory}
+figure_files <- list.files(figure_dir,pattern="^fig_.*\\.(pdf|png)$",full.names=TRUE)
+table_files <- list.files(table_dir,pattern="^table_.*\\.(csv|tex)$",full.names=TRUE)
+cat("Figures: ",length(figure_files)," exported files\n",sep="")
+cat("Tables:  ",length(table_files)," exported files\n",sep="")
+cat("Figure directory: ",figure_dir,"\n",sep="")
+cat("Table directory: ",table_dir,"\n",sep="")
 ```
-````
-
-Generated LaTeX tables can be inserted as raw LaTeX:
-
-````
-```{r tab-model-performance, echo=FALSE, results='asis'}
-cat(
-  readLines(
-    "outputs/dissertation_exhibits/tables/table_08_conversion_model_performance.tex"
-  ),
-  sep = "\n"
-)
-```
-````
-
-

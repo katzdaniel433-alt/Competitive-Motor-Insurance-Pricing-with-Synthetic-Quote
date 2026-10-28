@@ -24,8 +24,8 @@ config <- list( seed = 20260817L,
   truth_file = "conversion_truth.rds", 
   market_scenario_id = "baseline",
    demand_scenario_id = "baseline",
-  expected_policy_year = 2025L, expected_profiles = 10000L, expected_conversion_train_rows = 6000L,
-  expected_conversion_validation_rows = 2000L, expected_conversion_test_rows = 2000L, probability_clip = 1e-6,
+  expected_policy_year = 2025L, expected_profiles = 50000L, expected_conversion_train_rows = 30000L,
+  expected_conversion_validation_rows = 10000L, expected_conversion_test_rows = 10000L, probability_clip = 1e-6,
   calibration_bins = 10L, minimum_training_events = 300L, minimum_validation_events = 75L,
   minimum_test_events = 75L,
   # The nonlinear GAM is selected only if its validation improvement over the
@@ -762,7 +762,7 @@ final_selected_test_predictions <- final_prediction_long %>% filter( model == se
     conversion_data_split == "test" ) %>% arrange( quote_profile_id )
 if ( nrow( final_selected_test_predictions ) != config$expected_conversion_test_rows
 ) {
-  stop( "Selected final-model TEST prediction table must contain exactly 2,000 rows." )
+  stop( "Selected final-model TEST prediction table must contain exactly 10,000 rows." )
 }
 ```
 

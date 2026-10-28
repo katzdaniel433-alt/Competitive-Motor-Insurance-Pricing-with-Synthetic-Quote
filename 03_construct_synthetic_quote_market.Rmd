@@ -18,7 +18,7 @@ config <- list( input_file = file.path( "outputs", "technical_pricing", "technic
   output_dir = file.path("outputs", "quote_market"),
   scenarios_to_run = c("baseline"),
   # Frozen Module 2 -> Module 3 handoff.
-  expected_policy_year = 2025L, expected_profiles = 10000L,
+  expected_policy_year = 2025L, expected_profiles = 50000L,
   # Independent split for downstream conversion-model development.
   conversion_split_seed = 20260909L, conversion_train_share = 0.60, conversion_validation_share = 0.20,
   conversion_test_share = 0.20, focal_seed = 20260817L, competitor_seed_base = 20260900L,

@@ -14,7 +14,7 @@ config <- list( input_file = file.path( "outputs", "synthetic_generator_multiyea
   output_dir = file.path("outputs", "technical_pricing"),
   # Frozen out-of-time development structure inherited from Module 1.
   training_years = 2021:2023, validation_year = 2024L, test_year = 2025L, cost_basis_year = 2025L,
-  expected_policies_per_year = 10000L,
+  expected_policies_per_year = 50000L,
   # Transparent scenario assumption. A 30% loading corresponds to an indicative
   # technical loss ratio of 1 / 1.30 = 76.9%. It is not calibrated to Module 1 truth.
   technical_loading = 0.30,
@@ -556,7 +556,7 @@ if (file.exists(config$truth_file)) {
 # 15. VALIDATION CHECKS --------------------------------------------------------
 technical_pricing_validation_checks <- tribble(
   ~check_name, ~observed_value, ~lower_bound, ~upper_bound, ~required_for_progress,
-  "Input policy rows", nrow(modelling_data), 50000, 50000, TRUE,
+  "Input policy rows", nrow(modelling_data), 250000, 250000, TRUE,
   "Unique policy IDs", n_distinct(modelling_data$policy_id), nrow(modelling_data), nrow(modelling_data), TRUE,
   "Policy years 2021-2025 present",
     as.numeric(setequal(sort(unique(modelling_data$policy_year)), 2021:2025)), 1, 1, TRUE,

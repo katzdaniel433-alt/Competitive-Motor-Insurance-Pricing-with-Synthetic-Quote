@@ -21,7 +21,7 @@ module1_output_contract <- c( "synthetic_motor_modelling.csv", "synthetic_motor_
   "synthetic_motor_claims.rds", "module1_validation_checks.csv", "portfolio_summary.csv",
   "cohort_year_summary.csv", "claims_cost_onlevel_audit.csv", "vehicle_specification_simulation_audit.csv",
   "module1_freeze_manifest.csv" )
-config <- list( seed = 20260806, n_policies = 50000L, cohort_years = 2021:2025, n_policies_per_cohort = 10000L,
+config <- list( seed = 20260806, n_policies = 250000L, cohort_years = 2021:2025, n_policies_per_cohort = 50000L,
   calibrated_input_dir = file.path("inputs", "calibrated_multiyear"),
   output_dir = file.path("outputs", "synthetic_generator_multiyear"),
   # Empirical Module 0 inputs
@@ -408,7 +408,7 @@ n <- config$n_policies
 if (config$n_policies_per_cohort * length(config$cohort_years) != n) {
   stop("n_policies must equal n_policies_per_cohort x number of cohort years.")
 }
-# Exactly 10,000 independent new-business quote opportunities are generated for
+# Exactly 50,000 independent new-business quote opportunities are generated for
 # each annual cohort. The rows are shuffled after assigning policy year so policy
 # IDs do not encode calendar year.
 policy_year_vector <- rep(config$cohort_years, each = config$n_policies_per_cohort)

@@ -18,8 +18,8 @@ config <- list(
   output_dir = file.path("outputs", "conversion_generation"),
   demand_scenarios_to_run = c("baseline"),
   # Frozen downstream handoff from revised Module 3.
-  expected_policy_year = 2025L, expected_profiles = 10000L, expected_conversion_train_rows = 6000L,
-  expected_conversion_validation_rows = 2000L, expected_conversion_test_rows = 2000L,
+  expected_policy_year = 2025L, expected_profiles = 50000L, expected_conversion_train_rows = 30000L,
+  expected_conversion_validation_rows = 10000L, expected_conversion_test_rows = 10000L,
   # Common random numbers.
   # These fixed seeds mean that alternative demand scenarios are compared using
   # the same underlying profile heterogeneity, latent tastes and outcome draws.

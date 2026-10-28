@@ -14,7 +14,7 @@ suppressPackageStartupMessages( library( tidyverse ) )
 options( dplyr.summarise.inform = FALSE )
 config <- list( input_dir = file.path( "outputs", "pricing_simulation" ), output_dir = file.path( "outputs",
       "pricing_bootstrap_uncertainty" ), n_bootstrap = 5000L, bootstrap_seed = 20260918L, confidence_level = 0.95,
-  expected_test_profiles = 2000L, benchmark_strategy = "Technical-pricing benchmark", targeted_strategy =
+  expected_test_profiles = 10000L, benchmark_strategy = "Technical-pricing benchmark", targeted_strategy =
     "Market-position targeted strategy", minimum_margin_retention = 1.00 )
 dir.create(
   config$output_dir, recursive = TRUE, showWarnings = FALSE )
